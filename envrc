@@ -1,0 +1,116 @@
+#
+# By: Edward Pilatowicz (edp@eng)
+#
+#ident	"%Z%%M%	%I%	%E%"
+
+# ---------------------------------------------------------------------
+# Help debug the madness that's about to begin
+# ---------------------------------------------------------------------
+debug_envrc=${debug_envrc:-0}; export debug_envrc
+[ $debug_envrc -ne 0 ] && echo "envrc start"
+
+# ---------------------------------------------------------------------
+# We'll set PATH later, but sanity check it now
+# ---------------------------------------------------------------------
+path_is_sane=1
+type awk >/dev/null 2>&1 || path_is_sane=0
+type grep >/dev/null 2>&1 || path_is_sane=0
+type sed >/dev/null 2>&1 || path_is_sane=0
+type uname >/dev/null 2>&1 || path_is_sane=0
+type getent >/dev/null 2>&1 || path_is_sane=0
+if [ $path_is_sane != 1 ]; then
+	# PATH is screwed up, sanitize it a little
+	PATH=/bin:/usr/bin:/sbin:/usr/sbin:$PATH
+	unset envrc_stamp_old
+fi
+
+erc_dir=env/dotfiles
+
+# ---------------------------------------------------------------------
+# Get a pointer to my home directory so we can find the additional
+# envrc files.
+# ---------------------------------------------------------------------
+unset p
+if [  \! -f "$EDPHOME/$erc_dir/envrc" -a -n "$BASH" ]; then
+	# bash specific method to find the file we're sourcing
+	p="${BASH_ARGV[0]}"
+	echo "$p" | grep '^/' >/dev/null
+	[ $? != 0 ] && p="`pwd`/$p"
+elif [  \! -f "$EDPHOME/$erc_dir/envrc" -a -n "$ZSH_NAME" ]; then
+	# zsh specific method to find the file we're sourcing
+	p=`print -P '%N' 2>/dev/null`
+	[ $p = "%N" ] && p=$0
+	[ $p = "zsh" ] && unset p
+fi
+
+# follow symlinks
+if [ -n "$p" ]; then
+	while [ -h "$p" ]; do
+		p_new=`ls -l $p | sed 's:^.* -> ::'`
+		echo "$p_new" | grep '^/' >/dev/null
+		if [ $? = 0 ]; then
+			p="$p_new"
+		else
+			p="`dirname $p`/$p_new"
+		fi
+	done
+	EDPHOME=`echo $p | sed "s:/$erc_dir/envrc::"`
+	EDPHOME=`(unalias cd 2>/dev/null;
+		cd "$EDPHOME" 2>/dev/null && /bin/pwd 2>/dev/null)`
+fi
+
+# fallback to other hacks to find my home directory (for sh, ksh, ksh93, etc)
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] && EDPHOME=$HOME
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] && EDPHOME=$HOME/../edp
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] &&
+	EDPHOME=`getent passwd edp 2>/dev/null | awk -F: '{print $6}'`
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] && EDPHOME=/export/home/edp
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] && EDPHOME=/home/edp
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] && EDPHOME=/Users/edp
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] &&
+	EDPHOME=`set | grep '/envrc' | grep '/edp/' | head -1 |
+	    sed 's:^[^/]*\(/[0-9A-Za-z/_-]*\)/envrc.*$:\1:'`
+if [ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ]; then
+	unset EDPHOME
+else
+	EDPHOME=`(unalias cd 2>/dev/null;
+		cd "$EDPHOME" 2>/dev/null && /bin/pwd 2>/dev/null)`
+	export EDPHOME
+fi
+if [ -n "$EDPHOME" ]; then
+	ENVRC=$EDPHOME/$erc_dir/envrc
+	export ENVRC
+fi
+
+# ---------------------------------------------------------------------
+# Try not to source envrc files more than necessary
+# ---------------------------------------------------------------------
+if [ -z "$EDPHOME" ]; then
+	printf "envrc error: unable to set EDPHOME, aborting\n" >&2
+elif [ -f "$ENVRC" ]; then
+	ls_gnu=0
+	ls --version 2>&1 | grep '(coreutils)' >/dev/null
+	[ $? = 0 ] && ls_gnu=1
+
+	if [ $ls_gnu = 0 ]; then
+		ls -e /etc >/dev/null 2>&1 &&
+			envrc_stamp=`ls -lL -e $ENVRC |
+				awk '{print $6"_"$7"_"$8"_"$9}'`
+	else
+		envrc_stamp=`ls -lL --time-style='+%h %d %H:%M:%S %Y' $ENVRC |
+			awk '{print $6"_"$7"_"$8"_"$9}'`
+	fi
+
+	[ -z "$envrc_stamp_old" -o "$envrc_stamp_old" != "$envrc_stamp" ] &&
+		. ${ENVRC}.main
+
+	envrc_stamp_old=$envrc_stamp
+
+	unset ls_gnu
+fi
+
+# ---------------------------------------------------------------------
+# We're done.
+# ---------------------------------------------------------------------
+unset erc_dir
+[ $debug_envrc -ne 0 ] && echo "envrc end"

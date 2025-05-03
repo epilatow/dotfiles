@@ -1,0 +1,33 @@
+# ---------------------------------------------------------------------
+# Setup command aliases
+# ---------------------------------------------------------------------
+type vim >/dev/null 2>&1
+[ $? != 0 ] && alias vim=vi
+
+# fix common typos
+alias su-="su -"
+alias us="su"
+
+alias typea="type_alias"
+
+# restore sanity to a screwed up terminal
+alias termreset="echo ; stty sane; tput reset; tput rmso"
+
+# misc aliases
+alias new_locale="unset LC_FIXED; set_locale"
+
+# command aliases
+alias ls="ls -F"
+
+# wrapper aliases
+if [ -z "$NO_LABEL" -a -n "$TTY" -a -n "$TTY_DEV" -a -n "$TERM" ]; then
+	alias su="su_wrap"
+
+	type screen >/dev/null 2>&1 &&
+	    alias screen="screen_wrap"
+
+	for cmd in cd ssh; do
+		type $cmd >/dev/null 2>&1 &&
+		    alias $cmd="cmd_wrap $cmd"
+	done
+fi

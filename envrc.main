@@ -1,0 +1,606 @@
+# ---------------------------------------------------------------------
+# Figure out where we are
+# ---------------------------------------------------------------------
+erc_host=`(scutil --get HostName) 2>/dev/null`
+[ -z "$erc_host" ] && erc_host=`(uname -n | cut -f 1 -d .) 2>/dev/null`
+
+erc_uname=`id 2>/dev/null | sed 's/uid=[0-9]*(\([^)]*\)).*/\1/'`
+erc_os=`uname -s`
+erc_os_rev=`uname -r`
+erc_plat=`uname -m` # Was -p
+
+if [ -z "$LOCATION" ]; then
+	LOCATION=external;			export LOCATION
+	domainname 2>/dev/null | egrep -i "sun.com$" >/dev/null
+	[ $? = 0 -a "$erc_host" != squee ] && LOCATION=oracle
+	domainname 2>/dev/null | egrep -i "oracle.com$" >/dev/null
+	[ $? = 0 -a "$erc_host" != squee ] && LOCATION=oracle
+fi
+
+ENVRC_WORK=$EDPHOME/work/.envrc
+ENVRC_ORACLE=$EDPHOME/work.oracle/.envrc
+if [ $LOCATION = oracle ]; then
+	ENVRC_WORK=$ENVRC_ORACLE
+fi
+
+# ---------------------------------------------------------------------
+# if alias is a shell builtin the nuke any existing aliases
+# ---------------------------------------------------------------------
+type alias 2>&1 | grep builtin >/dev/null 2>&1
+if [ $? = 0 ]; then
+	for a in `alias | sed 's/^alias[ ]*//' | sed 's/=.*$//'`; do
+		# skip some important aliases
+		[ "$a" = envrc ] && continue;
+		[ "$a" = type ] && continue;
+		unalias -- $a
+	done
+	unset a
+fi
+
+# ---------------------------------------------------------------------
+# get alsolute paths for basic commands.  these will be used by shell
+# functions later to avoid having to search the path.
+# ---------------------------------------------------------------------
+printf=""
+for cmd in printf basename; do
+	for d in /bin /usr/bin; do
+		[ \! -f $d/$cmd ] && continue
+		eval $cmd=$d/$cmd
+	done
+	unset d
+	[ -z "`eval echo \\$$cmd`" ] && eval $cmd=$cmd
+done
+unset cmd
+
+# ---------------------------------------------------------------------
+# shells don't explicitly set SHELL when they are run, so if we've
+# exec'd a new shell, SHELL may be incorrect.  so if SHELL is set, check
+# what the current process is and update SHELL if necessary.
+# ---------------------------------------------------------------------
+unset SHELL_BNAME erc_shell erc_shell_bname
+erc_shell=`LD_PRELOAD="" ps -p $$ -o comm | tail -1 | sed 's/^-//'`
+erc_shell_bname=`$basename $erc_shell`
+case "$erc_shell_bname" in
+	sh | ksh | ksh88 | ksh93 | bash | zsh )
+		SHELL=$erc_shell; export SHELL
+		SHELL_BNAME=$erc_shell_bname; export SHELL_BNAME
+esac
+unset erc_shell erc_shell_bname
+
+# ---------------------------------------------------------------------
+# Shell specific config
+# ---------------------------------------------------------------------
+if [ "$SHELL_BNAME" = sh ]; then
+	# old sh builtin test(1) doesn't support -L
+	if [ -f /usr/bin/test ]; then
+		test() { /usr/bin/test; }
+	elif [ -f /bin/test ]; then
+		test() { /bin/test; }
+	fi
+fi
+
+if [ "$SHELL_BNAME" = ksh -o "$SHELL_BNAME" = bash ]; then
+	set -o vi
+fi
+
+if [ "$SHELL_BNAME" = bash ]; then
+	unset PROMPT_COMMAND
+	if [ -z "$NO_LABEL" ]; then
+		# used by ksh and bash
+		# don't export it since stripe() is a shell function
+		PROMPT_COMMAND="stripe"
+	fi
+fi
+
+if [ "$SHELL_BNAME" = zsh ]; then
+	setopt shwordsplit autolist
+	bindkey -d # Delete all existing keymaps and reset to defaults
+	bindkey -v # Select keymap  `viins'
+
+	# don't do automatic menu completion after three or more tabs
+	unsetopt AUTO_MENU MENU_COMPLETE 2>/dev/null
+
+	# in case of zsh >= 4.x, tell it not to interpret % in the prompt
+	unsetopt PROMPT_PERCENT 2>/dev/null
+
+	# disable terminal paste hilighting
+	unset zle_bracketed_paste 2>/dev/null
+
+	if [ -z "$NO_LABEL" ]; then
+		precmd() { stripe; }
+	fi
+fi
+
+# ---------------------------------------------------------------------
+# Workaround temporary brokeness
+# ---------------------------------------------------------------------
+#
+# if .envrc.workaround exists, and NO_ENVRC_WORKAROUND is not set, then
+# source .envrc.workaround.  it is used to set NO_* variables to
+# workaround temporary networking problems.
+
+if [ -z "$NO_ENVRC_WORKAROUND" -a -z "$NO_ALL" ]; then
+	# always source the master workaround file if it exists
+	[ -f ${ENVRC}.workaround.all ] &&
+		. ${ENVRC}.workaround.all
+
+	#
+	# give priority to a host specific workaround file over the
+	# general workaround file
+	#
+	if [ -f ${ENVRC}.workaround.$erc_host ]; then
+		. ${ENVRC}.workaround.$erc_host
+	elif [ -f ${ENVRC}.workaround ]; then
+		. ${ENVRC}.workaround
+	fi
+
+	# only source .envrc.workaround once
+	NO_ENVRC_WORKAROUND=1; export NO_ENVRC_WORKAROUND
+fi
+
+#
+# The following variables are currently supported.  This list is
+# augmented by the scripts that are sourced below.
+#
+envrc_workarounds="
+	NO_ALIASES
+	NO_ALL
+	NO_DEBUG
+	NO_EVAL
+	NO_HOME
+	NO_LABEL
+	NO_LOCALE
+	NO_MSG
+	NO_NFS
+	NO_PERL
+	NO_PYTHON
+	NO_TERM
+	NO_TOOLS
+"
+erc_f=${ENVRC}.debug.workarounds.$erc_os; [ -f $erc_f ] && . $erc_f
+erc_f=${ENVRC_WORK}.workarounds; [ -f $erc_f ] && . $erc_f
+
+# some workarounds imply other workarounds
+if [ -n "$NO_ALL" ]; then
+	for var in `echo $envrc_workarounds`; do
+		eval $var=1
+	done
+	unset var
+fi
+
+# display what's disabled
+for var in `echo $envrc_workarounds` LC_FIXED; do
+	eval export $var
+	eval [ -n \"\$$var\" ]
+	if [ $? != 0 ]; then
+		unset $var
+		continue
+	fi
+	[ -z "$NO_MSG" -a -z "$NO_ALL" ] &&
+		echo envrc workaround: $var
+done
+unset var
+
+# convience function to disable all workarounds
+envrc_noworkarounds()
+{
+	for var in `echo $envrc_workarounds`; do
+		unset $var
+	done
+	unset var
+}
+
+# we always clear some workarounds when setting up the environment
+unset NO_DEBUG_SUBSHELL
+
+# ---------------------------------------------------------------------
+# Source in functions
+# ---------------------------------------------------------------------
+erc_f=${ENVRC}.functions; [ -f $erc_f ] && . $erc_f
+erc_f=${ENVRC}.functions.$erc_os; [ -f $erc_f ] && . $erc_f
+
+# ---------------------------------------------------------------------
+# Source application debugging support
+# ---------------------------------------------------------------------
+if [ -z "$NO_DEBUG" ]; then
+	erc_f=${ENVRC}.debug.$erc_os; [ -f $erc_f ] && . $erc_f
+fi
+
+# ---------------------------------------------------------------------
+# Explicity clear important environment variables
+# ---------------------------------------------------------------------
+unset LD_LIBRARY_PATH LD_LIBRARY_PATH_32 LD_LIBRARY_PATH_64
+unset LD_PRELOAD LD_PRELOAD_32 LD_PRELOAD_64
+
+# ---------------------------------------------------------------------
+# Explicity set and export important environment variables
+# ---------------------------------------------------------------------
+unset PATH MANPATH INFOPATH CLASSPATH PYTHONPATH
+export PATH MANPATH INFOPATH
+
+# bootsrtap PATH so that it contains test(1)
+PATH=/bin:/usr/bin
+path_base=""
+append_dir_to_var path_base /bin
+append_dir_to_var path_base /usr/bin
+PATH=$path_base
+unset path_base
+
+# add other basic paths
+append_dir_to_var PATH /sbin
+append_dir_to_var PATH /usr/sbin
+#append_dir_to_var PATH /usr/lib
+append_dir_to_var MANPATH /usr/man
+append_dir_to_var MANPATH /usr/share/man
+append_dir_to_var INFOPATH /usr/share/info
+
+#
+# Set PATH
+# Note that ON builds require that /usr/ccs/bin be present in the path AND
+# that it come before /usr/xpg4/bin because there are utilities with the
+# same name in both directories which have different default output formats.
+#
+append_dir_to_var PATH /usr/ccs/bin
+append_subdirs_to_pathvars /usr/sfw
+append_subdirs_to_pathvars /usr/gnu
+#append_dir_to_var PATH /usr/xpg4/bin
+append_dir_to_var PATH /usr/sadm/bin
+append_dir_to_var PATH /usr/sadm/admin/bin
+append_dir_to_var PATH /usr/lib/inet
+append_dir_to_var PATH /usr/lib/xen/bin
+type pmap >/dev/null 2>&1 ||
+	append_dir_to_var PATH /usr/proc/bin
+type java >/dev/null 2>&1 &&
+	prepend_subdirs_to_pathvars /usr/java linkok
+
+[ -z "$NO_PERL" ] &&
+	append_subdirs_to_pathvars /usr/perl5
+
+# add local tools
+append_subdirs_to_pathvars /usr/local
+
+#
+# Add X11 Tools
+# Note that we dont' set the legacy variables: X11HOME, OPENWINHOME
+#
+append_subdirs_to_pathvars /usr/openwin
+append_subdirs_to_pathvars /usr/dt
+append_subdirs_to_pathvars /usr/X11R6
+append_subdirs_to_pathvars /usr/X11
+append_subdirs_to_pathvars /usr/X
+append_dir_to_var PATH /opt/X11/bin
+append_dir_to_var MANPATH /opt/X11/share/man
+
+# fvwm
+append_subdirs_to_pathvars /usr/local/fvwm linkok
+
+# clustering
+append_subdirs_to_pathvars /usr/cluster
+
+# macOS developer tools
+append_dir_to_var MANPATH /Applications/Xcode.app/Contents/Developer/usr/share/man
+append_dir_to_var MANPATH /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/share/man
+append_dir_to_var MANPATH /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/share/man
+append_dir_to_var MANPATH /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/share/man
+
+# vmware tools
+append_dir_to_var PATH "/Applications/VMware Fusion.app/Contents/Library"
+
+# ---------------------------------------------------------------------
+# Rust
+# ---------------------------------------------------------------------
+append_dir_to_var  PATH "$EDPHOME/.cargo/bin"
+
+# ---------------------------------------------------------------------
+# Python config
+# Default to MacPorts version of python, if it's installed
+# ---------------------------------------------------------------------
+if [ -z "$NO_PYTHON" ]; then
+	# figure out what version of python is installed
+	erc_pyver=""
+	[ -z "$NO_HOME" ] && type python >/dev/null 2>&1 &&
+		erc_pyver=`python --version 2>&1 |
+		    awk '{print $2}' | cut -d. -f -2`
+
+	# optionally setup PYTHONPATH
+	if [ -d $EDPHOME/python${erc_pyver} ]; then
+		export PYTHONPATH
+		PYTHONPATH=$EDPHOME/python${erc_pyver}
+		append_dir_to_var PATH $EDPHOME/python${erc_pyver}/bin linkok
+	fi
+
+	# add macports python pip binaries to $PATH
+	erc_pydir=$EDPHOME/Library/Python/3.12
+	append_dir_to_var PATH $erc_pydir/bin
+
+	# cleanup
+	unset erc_pyver erc_pydir
+fi
+
+# ---------------------------------------------------------------------
+# Java config
+# ---------------------------------------------------------------------
+unset JAVA_HOME
+(/usr/libexec/java_home) >/dev/null 2>&1
+if [ $? = 0 ]; then
+	JAVA_HOME=`/usr/libexec/java_home`;		export JAVA_HOME
+fi
+
+# ---------------------------------------------------------------------
+# Perl config
+# ---------------------------------------------------------------------
+unset PERL5LIB
+
+# ---------------------------------------------------------------------
+# Prepend build tools
+# Add tools to PATH and MANPATH
+# ---------------------------------------------------------------------
+if [ -z "$NO_TOOLS" ]; then
+	erc_f=${ENVRC_WORK}.tools; [ -f $erc_f ] && . $erc_f
+fi
+
+# Add JDS build tools
+append_dir_to_var PATH /opt/dtbld/bin
+
+# ---------------------------------------------------------------------
+# Prepend personal tools
+# ---------------------------------------------------------------------
+if [ -z "$NO_HOME" ]; then
+	# Personal tools go at the beginning of the path
+	prepend_subdirs_to_pathvars $EDPHOME/home/plat.$erc_os.$erc_plat
+	prepend_subdirs_to_pathvars $EDPHOME/home/plat.$erc_os
+	prepend_subdirs_to_pathvars $EDPHOME/home linkok
+	prepend_subdirs_to_pathvars $EDPHOME/common/plat.$erc_os.$erc_plat
+	prepend_subdirs_to_pathvars $EDPHOME/common/plat.$erc_os
+	prepend_subdirs_to_pathvars $EDPHOME/common linkok
+	prepend_subdirs_to_pathvars $EDPHOME/env linkok
+fi
+
+# ---------------------------------------------------------------------
+# setup amazon ec2 tools
+# ---------------------------------------------------------------------
+EC2_HOME=$EDPHOME/common/ec2-api-tools-1.6.12.0
+
+# setup ec2 login keys
+EC2_PRIVATE_KEY=`(echo $EDPHOME/common/.aws/pk-*.pem) 2>/dev/null`
+EC2_CERT=`(echo $EDPHOME/common/.aws/cert-*.pem) 2>/dev/null`
+
+# setup ec2 region, listed via ec2-describe-regions
+EC2_URL=https://ec2.us-west-1.amazonaws.com
+
+# append to path, or cleanup
+if [ -d "$EC2_HOME" -a -f "$EC2_PRIVATE_KEY" -a -f "$EC2_CERT" ]; then
+	export EC2_HOME EC2_PRIVATE_KEY EC2_CERT EC2_URL
+	append_subdirs_to_pathvars $EC2_HOME
+else
+	unset EC2_HOME EC2_PRIVATE_KEY EC2_CERT EC2_URL
+fi
+
+# ---------------------------------------------------------------------
+# Append misc junk to PATH
+# ---------------------------------------------------------------------
+
+# Android SDK
+erc_adt=""
+if [ "$erc_os" = Linux ]; then
+    erc_adt=adt-bundle-linux-x86_64-20130729
+elif [ "$erc_os" = Darwin ]; then
+    erc_adt=adt-bundle-mac-x86_64-20130729
+    erc_adt=android-sdk-macosx.20150828
+    erc_adt=android-sdk-macosx.26.0.0
+fi
+if [ -n "$erc_adt" ]; then
+	for d in \
+	    $EDPHOME/Development/bin \
+	    $EDPHOME/Development/$erc_adt/sdk/tools \
+	    $EDPHOME/Development/$erc_adt/eclipse \
+	    $EDPHOME/Development/$erc_adt/platform-tools \
+	    $EDPHOME/Development/$erc_adt/sdk/platform-tools \
+	    $EDPHOME/Development/$erc_adt/sdk/build-tools/android-4.3 \
+	; do
+		[ \! -d "$d" ] && continue
+		append_dir_to_var PATH $d
+	done
+fi
+unset erc_adt
+
+# MacPorts
+append_subdirs_to_pathvars /opt/local
+
+# Fink
+#export CLASSPATH
+#append_subdirs_to_pathvars /opt/fink
+#append_dir_to_var CLASSPATH /opt/fink/share/java/classpath
+#er_perlversion=`/usr/bin/perl -e 'printf("%vd\n", $^V)'`
+#append_dir_to_var MANPATH /opt/fink/lib/perl5/$er_perlversion/man
+#unset er_perlversion
+
+# Add netbeans
+append_dir_to_var PATH /usr/netbeans/bin
+
+# now that PATH is set, update SHELL to be a full path (if it isn't already)
+if [ -n "$SHELL" ]; then
+	echo $SHELL | grep '^/' >/dev/null 2>&1 ||
+		SHELL=`path_search $SHELL`
+fi
+
+# ---------------------------------------------------------------------
+# Setup other environment variables
+# ---------------------------------------------------------------------
+umask 027
+
+erc_ps_token="\$"
+[ "$erc_uname" = "root" ] && erc_ps_token="#"
+PS1_ALTUSER=""; export PS1_ALTUSER
+[ "$LOGNAME" != "$erc_uname" ] &&
+	PS1_ALTUSER="{${erc_uname}}"
+PS1="${LOGNAME}${PS1_ALTUSER}${PS1_TAG}@${erc_host}${erc_ps_token} "; export PS1
+PS4='[${LINENO}] ';					export PS4
+
+HOSTNAME=$erc_host;					export HOSTNAME
+
+# EMAIL is required by mercurial
+if [ "$LOGNAME" = edp ]; then
+	EMAIL=edp@drymartini.org
+else
+	EMAIL=$LOGNAME
+fi
+export EMAIL
+
+# configure wx so that i can pipe the output of "wx *diffs" to gpatch
+WXDIFFCMD='gdiff -Naur';			export WXDIFFCMD
+
+PAGER=more;					export PAGER
+type less >/dev/null 2>&1
+[ $? = 0 ] && PAGER=less
+
+EDITOR=vi;					export EDITOR
+type vim >/dev/null 2>&1
+if [ $? = 0 ]; then
+	EDITOR=vim_xlabel
+
+	#
+	# VIEWER is used by cscope and overrides EDITOR
+	# vim_R is a simple wrapper script that runs "vim -R"
+	#
+	VIEWER="vim_R";				export VIEWER
+fi
+
+MAILSPOOL=$EDPHOME/mail/incomming.spool;	export MAILSPOOL
+
+# go configuration, needed for vim-go
+unset GOBIN
+dir="$EDPHOME/common/go.$erc_os.$erc_plat"
+if [ -d "$dir" ]; then
+	if [ -z "$GOPATH" ]; then
+		GOPATH=$dir; export GOPATH
+	fi
+	GOBIN=$dir/bin; export GOBIN
+	# update PATH with GOBIN
+	prepend_dir_to_var PATH $GOBIN
+fi
+
+erc_go_versions="$GO_VERSION 1.7 1.8"
+unset GO_VERSION GOROOT
+for erc_go_version in $erc_go_versions; do
+	dir=/usr/lib/golang/$erc_go_version
+	[ \! -d $dir ] && continue
+
+	# set GO variables
+	GO_VERSION=$erc_go_version; export GO_VERSION
+	GOROOT=$dir; export GOROOT
+
+	# update PATH with go and tools
+	dir=/usr/lib/gocode/$GO_VERSION
+	[ -d $dir ] && prepend_dir_to_var PATH $dir
+	prepend_dir_to_var PATH $GOROOT/bin
+	break
+done
+unset erc_go_versions erc_go_version
+if [ -z "$GOROOT" ]; then
+	erc_goroot=$(go env GOROOT 2>/dev/null)
+	if [ -n "$erc_goroot" ]; then
+		GOROOT=$erc_goroot; export GOROOT
+	fi
+	unset erc_goroot
+fi
+if [ -z "$GO_VERSION" ]; then
+	erc_go_version=`go version 2>&1`
+	erc_go_version=${erc_go_version#go version go}
+	erc_go_version=$(echo $erc_go_version | cut -f 1-2 -d.)
+	if [ -n "$erc_go_version" ]; then
+		GO_VERSION=$erc_go_version; export GO_VERSION
+	fi
+	unset erc_go_version
+fi
+
+# ---------------------------------------------------------------------
+# terminal configuration
+# ---------------------------------------------------------------------
+#
+# set a variable to point to out tty
+#
+TTY=`tty`;						export TTY
+if [ "$TTY" = "not a tty" ]; then
+	TTY=""
+elif [ "$TTY" = /dev/console ]; then
+	# If we logged in on the console, then set some stuff up.
+	[ -z "$NO_MSG" ] && stty rows 24 cols 80
+else
+	# set the erase character
+	[ -z "$NO_MSG" ] && stty erase '^H'
+	# disable flow control (can be re-enabled with "stty ixany")
+	stty -ixon
+fi
+TTY_DEV=`echo $TTY | sed 's/^\/dev\///'`;		export TTY_DEV
+
+# set TERM and TERMINFO
+if [ -z "$NO_TERM" ]; then
+	# vt100 is our default fallback
+	terms="$TERM vt100"
+
+	# we almost always connect to consoles within xterms.
+	if [ "$TERM" = "sun-color" ]; then
+		TERM=xterm
+	fi
+
+	#
+	# If the current TERM is an xterm variant, add our prefered
+	# xterm compatabile variants to our preferences list.
+	#
+	echo "$TERM" | egrep "rxvt|xterm" >/dev/null &&
+		terms="rxvt xtermc xterm-color xterm $terms"
+
+	unset TERM
+	set_terminfo
+	for t in $(echo $terms); do
+		( TERM=$t tput longname >/dev/null 2>&1 ) || continue;
+		TERM=$t;				export TERM
+		break;
+	done
+
+	# If we couldn't find valid term settings, clear TERMINFO and TERM
+	[ -z "$TERM" ] &&
+		unset TERMINFO TERM
+
+	#
+	# If we're not dealing with a terminal that supports auto
+	# resizing, attempt resize the terminal now.
+	#
+	echo "$TERM" | egrep "rxvt|xterm|dtterm" >/dev/null
+	[ $? != 0 ] && resize >/dev/null 2>&1
+fi
+
+# ---------------------------------------------------------------------
+# Setup command aliases
+# ---------------------------------------------------------------------
+[ -z "$NO_ALIASES" ] &&
+	. ${ENVRC}.aliases
+
+# ---------------------------------------------------------------------
+# Run misc functions
+# ---------------------------------------------------------------------
+[ -z "$NO_LOCALE" ] &&
+	set_locale
+
+# initialize the terminal title bar
+[ -z "$NO_LABEL" -a -n "$TTY" -a -n "$TTY_DEV" -a -n "$TERM" ] &&
+	stripe
+
+# load any SSH authorization keys
+ssh_agent_env_init
+
+# save screen files locally
+SCREENDIR=/tmp/screen.$LOGNAME; export SCREENDIR
+mkdir $SCREENDIR 2>/dev/null
+chmod 0700 $SCREENDIR 2>/dev/null || unset SCREENDIR
+
+erc_f=${ENVRC}.main.$erc_os; [ -f $erc_f ] && . $erc_f
+erc_f=${ENVRC_WORK}.main; [ -f $erc_f ] && . $erc_f
+
+# ---------------------------------------------------------------------
+# evaluate any extra config
+# ---------------------------------------------------------------------
+[ -z "$NO_EVAL" -a -n "$ENVRC_EVAL" ] &&
+	eval $ENVRC_EVAL
+unset ENVRC_EVAL

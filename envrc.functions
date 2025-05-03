@@ -1,0 +1,681 @@
+# ---------------------------------------------------------------------
+# Functions
+# ---------------------------------------------------------------------
+envrc()
+{
+	# convience function to re-source environment files
+	unset envrc_stamp_old
+	. ${ENVRC}
+}
+
+envrc_basename()
+{
+	echo ${1##*/}
+}
+
+append_to_var()
+{
+	atv_var="$1"
+	atv_dir="$2"
+	atv_sep="$3"
+	[ -z "$atv_sep" ] && atv_sep=:
+	if eval [ -z \"\$$atv_var\" ]; then
+		eval $atv_var=\"$atv_dir\"
+	else
+		eval $atv_var=\"\$$atv_var$atv_sep$atv_dir\"
+	fi
+	unset atv_var atv_dir atv_sep
+}
+
+prepend_to_var()
+{
+	ptv_var="$1"
+	ptv_dir="$2"
+	ptv_sep="$3"
+	[ -z "$ptv_sep" ] && ptv_sep=:
+	if eval [ -z \"\$$ptv_var\" ]; then
+		eval $ptv_var=\"$ptv_dir\"
+	else
+		eval $ptv_var=\"$ptv_dir$ptv_sep\$$ptv_var\"
+	fi
+	unset ptv_var ptv_dir ptv_sep
+}
+
+append_dir_to_var()
+{
+	adtv_var="$1"
+	adtv_dir="$2"
+	adtv_linkok="$3"
+	adtv_sep="$4"
+
+	if [ -z "$adtv_linkok" ]; then
+		# old sh builtin test(1) doesn't support -L
+		test -L "$adtv_dir" -o \! -d "$adtv_dir" && return
+	else
+		[ \! -d "$adtv_dir" ] && return
+	fi
+	append_to_var "$adtv_var" "$adtv_dir" "$adtv_sep"
+	unset adtv_var adtv_dir adtv_linkok adtv_sep
+}
+
+prepend_dir_to_var()
+{
+	pdtv_var="$1"
+	pdtv_dir="$2"
+	pdtv_linkok="$3"
+	pdtv_sep="$4"
+
+	if [ -z "$pdtv_linkok" ]; then
+		# old sh builtin test(1) doesn't support -L
+		test -L "$pdtv_dir" -o \! -d "$pdtv_dir" && return
+	else
+		[ \! -d "$pdtv_dir" ] && return
+	fi
+	prepend_to_var "$pdtv_var" "$pdtv_dir" "$pdtv_sep"
+	unset pdtv_var pdtv_dir pdtv_linkok pdtv_sep
+}
+
+append_subdirs_to_pathvars()
+{
+	astPM_dir="$1"
+	astPM_linkok="$2"
+	if [ -z "$astPM_linkok" ]; then
+		# old sh builtin test(1) doesn't support -L
+		test -L "$astPM_dir" -o \! -d "$astPM_dir" && return
+	else
+		[ \! -d "$astPM_dir" ] && return
+	fi
+
+	append_dir_to_var PATH "$astPM_dir/bin" linkok
+	append_dir_to_var PATH "$astPM_dir/bin/$erc_plat" linkok
+	append_dir_to_var PATH "$astPM_dir/bin/plat.$erc_os.$erc_plat" linkok
+	append_dir_to_var PATH "$astPM_dir/sbin" linkok
+	append_dir_to_var PATH "$astPM_dir/sbin/$erc_plat" linkok
+	append_dir_to_var MANPATH "$astPM_dir/man" linkok
+	append_dir_to_var MANPATH "$astPM_dir/share/man" linkok
+	append_dir_to_var INFOPATH "$astPM_dir/info" linkok
+	append_dir_to_var INFOPATH "$astPM_dir/share/info" linkok
+	unset astPM_dir astPM_linkok
+}
+
+prepend_subdirs_to_pathvars()
+{
+	pstPM_dir="$1"
+	pstPM_linkok="$2"
+	if [ -z "$pstPM_linkok" ]; then
+		# old sh builtin test(1) doesn't support -L
+		test -L "$pstPM_dir" -o \! -d "$pstPM_dir" && return
+	else
+		[ \! -d "$pstPM_dir" ] && return
+	fi
+
+	prepend_dir_to_var PATH "$pstPM_dir/sbin/$erc_plat" linkok
+	prepend_dir_to_var PATH "$pstPM_dir/sbin" linkok
+	prepend_dir_to_var PATH "$pstPM_dir/bin/plat.$erc_os.$erc_plat" linkok
+	prepend_dir_to_var PATH "$pstPM_dir/bin/$erc_plat" linkok
+	prepend_dir_to_var PATH "$pstPM_dir/bin" linkok
+	prepend_dir_to_var MANPATH "$pstPM_dir/share/man" linkok
+	prepend_dir_to_var MANPATH "$pstPM_dir/man" linkok
+	prepend_dir_to_var INFOPATH "$pstPM_dir/share/info" linkok
+	prepend_dir_to_var INFOPATH "$pstPM_dir/info" linkok
+	unset pstPM_dir pstPM_linkok
+}
+
+xauth_get_display()
+{
+	if [ -z "$DISPLAY" ]; then
+		echo ".envrc\`xauth_get_display() error:" \
+		    "DISPLAY not set" >&2
+		return 1
+	fi
+
+	(
+		echo $DISPLAY | egrep "^:|^localhost:" >/dev/null
+		if [ $? != 0 ]; then
+			echo $DISPLAY
+		else
+			xgd_host=$erc_host
+			session=`echo $DISPLAY |
+				sed 's/^[^:]*://' | sed 's/\.[0-9]*$//'`
+			echo $xgd_host/unix:$session
+		fi
+	)
+	return 0
+}
+
+xauth_get_cookie()
+{
+	if [ -z "$1" ]; then
+		echo ".envrc\`xauth_get_cookie() error:" \
+		    "no file specified" >&2
+		return 1
+	fi
+	if [ -z "$DISPLAY" ]; then
+		echo ".envrc\`xauth_get_cookie() error:" \
+		    "DISPLAY not set" >&2
+		return 1
+	fi
+
+	xgc_file=$1
+	(
+		xauth_display=`xauth_get_display`
+		xauth extract - $xauth_display > $xgc_file
+		return $?
+	)
+	if [ $? != 0 ]; then
+		rm -f $xgc_file
+		return 1
+	fi
+	return 0
+}
+
+dirname_absolute()
+{
+	(cd "$1" && /bin/pwd) 2>/dev/null
+}
+
+path_search_next()
+{
+	if [ -z "$1" ]; then
+		echo ".envrc\`path_search_next() error:" \
+			"no executable specified" >&2
+		return 1
+	fi
+
+	psn_path="$1"
+	psn_bname=`basename $1`
+	psn_dname=`dirname $1`
+
+	psn_found_dname=0
+	if [ "$psn_dname" = "." ]; then
+		psn_dname=""
+		psn_found_dname=1
+	else
+		# remove symlinks from the directory path
+		psn_dname=`dirname_absolute "$psn_dname"`
+	fi
+
+	psn_i=1
+	while :; do
+		# extract a directory from the path
+		psn_dir=`echo $PATH |
+		    sed -e 's/^://' -e 's/::*/:/g' |
+		    cut -f$psn_i -d:`
+		psn_i=`expr $psn_i + 1`
+
+		# check for an empty path component
+		[ -z "$psn_dir" ] && break
+
+		# remove symlinks from the PATH directory
+		psn_dir=`dirname_absolute "$psn_dir"`
+
+		# see if the PATH directory matches the binary path
+		# directory passed to this function.
+		if [ "$psn_dir" = "$psn_dname" ]; then
+			psn_found_dname=1
+			continue
+		fi
+
+		# if we didn't match the path that was passed in, keep
+		# looking
+		[ $psn_found_dname = 0 ] && continue
+
+		# we found the next version of this binary in the PATH
+		if [ -x "$psn_dir/$psn_bname" ]; then
+			echo $psn_dir/$psn_bname
+			return 0
+		fi
+	done
+	echo $psn_bname not found >&2
+	return 1
+}
+
+path_search()
+{
+	if [ -z "$1" ]; then
+		echo ".envrc\`path_search() error:" \
+			"no executable specified" >&2
+		return 1
+	fi
+
+	ps_arg="$1"
+	if [ -x "$ps_arg" ]; then
+		echo "$ps_arg"
+		return 0
+	fi
+	path_search_next "$1"
+	return $?
+}
+
+xlabel()
+{
+	[ -n "$NO_LABEL" -o -z "$TTY" -o -z "$TERM" ] &&
+		return 1
+	[ \! -w /dev/tty -o \! -w "$TTY" ] &&
+		return 1
+
+	[ -z "$printf" ] &&
+		printf=printf
+
+	case $TERM in
+	sun-cmd)
+		$printf -- "ESC]l%sESC\\" "$*" >> /dev/tty
+		return $?
+		;;
+	dtterm | xterm* | rxvt )
+		# Codes: 0=Title&Icon, 1=Icon, 2=Title, 4,6=LogFile
+		$printf -- "\033]0;%s\007" "$*" >> /dev/tty
+		return $?
+		;;
+	esac
+	return 1
+}
+
+stripe()
+{
+	if [ -n "$*" ]; then
+		i_stripe="$*"
+	elif [ "$SHELL_BNAME" = sh ]; then
+		#
+		# If the shell is sh then we should not include the directory
+		# in the title bar.  This is because aliases do not work
+		# in sh and when the user changes directories, the title
+		# bar won't be updated.
+		#
+		i_stripe="${PS1}($TTY_DEV)"
+	else
+		#stripe_dir=`/bin/pwd 2>/dev/null || pwd 2>/dev/null`
+		stripe_dir=`pwd 2>/dev/null`
+		i_stripe="${PS1}($TTY_DEV): $stripe_dir"
+	fi
+	xlabel $i_stripe
+}
+
+cmd_wrap()
+{
+	cmd_wrap_cmd=$1; shift
+	cmd_wrap_label=${cmd_wrap_label:-$cmd_wrap_cmd "$@"}
+	xlabel "$cmd_wrap_label"
+	unset cmd_wrap_label
+
+	$cmd_wrap_cmd "$@"; cmd_wrap_rv=$?
+	stripe
+
+	return $cmd_wrap_rv
+}
+
+screen_wrap()
+{
+	(
+		unalias screen 2>/dev/null
+
+		if [ "$TERM" = screen ]; then
+			echo "don't run in a screen session" >&2
+			return 1
+		fi
+
+		echo "$TERM" | egrep "rxvt|xterm" >/dev/null
+		[ $? = 0 ] && TERM=xterm
+
+		cmd_wrap screen "$@"
+		return $?
+	)
+	return $?
+}
+
+unset_terminfo()
+{
+	#
+	# we invoke this function when we're going to call su.  su will
+	# unset TERMINFO, which may render our TERM setting invalid.
+	#
+	# if the termcap file for our current TERM setting is not in the
+	# default termcap file search path.  try to fall back to
+	# something that is.
+	#
+	unset TERMINFO
+	[ -z "$TERM" ] && return
+	[ "$TERM" = screen ] && return
+
+	tput longname >/dev/null 2>&1 && return
+
+	# try resetting to xterm
+	echo $TERM | egrep "rxvt|xterm" >/dev/null
+	if [ $? = 0 ]; then
+		TERM=xterm
+		tput longname >/dev/null 2>&1 && return
+	fi
+
+	# try falling back to vt100
+	TERM=vt100
+	tput longname >/dev/null 2>&1 && return
+
+	# fail
+	unset TERM
+}
+
+sux()
+{
+	(
+		unalias su 2>/dev/null
+		unset_terminfo
+
+		if [ -z "$DISPLAY" -o "$1" != "-" -o $# -gt 2 ]; then
+			cmd_wrap su "$@"
+			return $?
+		fi
+
+		user=$2
+		[ -z "$user" ] && user=root
+
+		xauth=`path_search xauth`
+		xauth_display=`xauth_get_display`
+		xauth_file=/tmp/$SHELL_BNAME.xauth.$$
+		xauth_get_cookie $xauth_file
+
+		cmd_wrap_label="sux - $user"
+		eval cmd_wrap su - $user -c \" '
+			DISPLAY=$DISPLAY; export DISPLAY;
+			echo DISPLAY=$DISPLAY;
+
+			# delete any old xauth cookie;
+			$xauth remove $xauth_display >/dev/null 2>&1;
+
+			# install the new cookie;
+			echo installing xauth cookie;
+			$xauth merge $xauth_file;
+			rm -f $xauth_file;
+
+			( \$SHELL ); rv=$?
+
+			# after we are done, remove the cookie;
+			echo removing xauth cookie;
+			$xauth remove $xauth_display > /dev/null;
+			exit $rv;
+		' \"
+		return $?
+	)
+	return $?
+}
+
+su_wrap()
+{
+	(
+		unalias su 2>/dev/null
+		unset_terminfo
+
+		cmd_wrap su "$@"
+		return $?
+	)
+	return $?
+}
+
+ssh_agent_env_check()
+{
+	# if SSH_AUTH_SOCK isn't set we're done
+	[ -z "$SSH_AUTH_SOCK" ] && return 1
+
+	# try to list keys that the agent has
+	ssh-add -l >/dev/null 2>&1
+	return $?
+}
+
+ssh_agent_env_check_old()
+{
+	# if SSH_AUTH_SOCK isn't set we're done
+	[ -z "$SSH_AUTH_SOCK" ] && return 1
+
+	# check if SSH_AGENT_PID points to a ssh-agent process
+	sa_pid=""
+	[ -n "$SSH_AGENT_PID" ] &&
+		sa_pid=`ps -o comm -p $SSH_AGENT_PID 2>/dev/null |
+		    grep -v COMMAND | xargs basename`
+	[ "$sa_pid" != "ssh-agent" ] &&
+		unset SSH_AGENT_PID
+
+	# check if GNOME_KEYRING_PID points to a gnome-keyring-daemon process
+	sa_pid=""
+	[ -n "$GNOME_KEYRING_PID" ] &&
+		sa_pid=`ps -o comm -p $GNOME_KEYRING_PID 2>/dev/null |
+		    grep -v COMMAND | xargs basename`
+	[ "$sa_pid" != "gnome-keyring-daemon" ] &&
+		unset GNOME_KEYRING_PID
+
+	# check if SSH_AUTH_SOCK points to a ssh authentication socket
+	[ -z "$SSH_AUTH_SOCK" -o \! -w "$SSH_AUTH_SOCK" ] &&
+		unset SSH_AUTH_SOCK
+
+	unset sa_pid
+	return 0
+}
+
+ssh_agentrc_check()
+{
+	sac_file=$1
+
+	# check agentrc file
+	(. "$sac_file"; ssh_agent_env_check)
+	if [ $? = 0 ]; then
+		unset sac_file
+		return 0
+		fi
+
+	# delete bogus agentrc file
+	rm -f "$sac_file" 2>/dev/null
+	unset sac_file
+	return 1
+}
+
+ssh_agent_cmd()
+{
+	sac_sock=$1
+
+	# find the pid associated with the agent
+	sac_pid=`echo $sac_sock | \
+	    sed -n 's:^.*/agent\.\([0-9][0-9]*\)$:\1:p'`
+	[ -z "$sac_pid" ] && sac_pid=$SSH_AGENT_PID
+
+	if [ -z "$sac_pid" ]; then
+		unset sac_sock sac_pid
+		return
+	fi
+
+	sac_cmd=`ps -o comm -p $sac_pid | grep -v COMMAND`
+	[ -n "$sac_cmd" ] && basename "$sac_cmd"
+	unset sac_sock sac_pid sac_cmd
+}
+
+ssh_agent_env_init()
+{
+	saei_base="$HOME"/.ssh/agentrc.$erc_host
+	saei_save=""
+
+	# sanity check the current settings
+	ssh_agent_env_check
+	if [ $? = 0 ]; then
+		saei_agent_cmd=`ssh_agent_cmd "$SSH_AUTH_SOCK"`
+		[ "$saei_agent_cmd" != "sshd" ] &&
+		    saei_save=$SSH_AUTH_SOCK
+		unset saei_agent_cmd
+	else
+		unset SSH_AUTH_SOCK
+		unset SSH_AUTH_PID
+	fi
+
+	# sanity check all agentrc files for this host
+	saei_files=`(/bin/ls "$saei_base".*) 2>/dev/null`
+
+	for saei_rcfile in $saei_files; do
+		ssh_agentrc_check "$saei_rcfile" || continue
+
+		# this agentrc is good, so if we don't already have an
+		# agent selected, use this one
+		[ -z "$SSH_AUTH_SOCK" ] && . "$saei_rcfile"
+
+		# see if this agentrc file matches our initial settings
+		[ -z "$saei_save" ] && continue
+		egrep "=$saei_save" "$saei_rcfile" >/dev/null && \
+		    saei_save=""
+	done
+
+	# check if we should save the current agent info into an agentrc
+	if [ -n "$saei_save" ]; then
+		ts=`date +%Y%m%d_%H%M%S`
+		echo "SSH_AUTH_SOCK=$saei_save; export SSH_AUTH_SOCK" \
+		    > "$saei_base".$ts
+	fi
+
+	unset saei_base saei_save
+
+	# we found an ssh agent
+	[ -n "$SSH_AUTH_SOCK" ] && return 0
+
+	# no valid ssh-agent config found
+	return 1
+
+}
+
+ssha()
+{
+	if [ \! -f $HOME/.ssh/id_rsa ]; then
+		echo "ssha error: no private key found"
+		return 1
+	fi
+
+	# First try to access any ssh-agent already running
+	ssh_agent_env_init
+	if [ $? != 0 ]; then
+		# start ssh-agent and create a host specifc config file
+		mkdir -p $HOME/.ssh 2>/dev/null
+		sa_rcfile="$HOME/.ssh/agentrc.$erc_host.$$"
+		ssh-agent | grep -v "Agent pid " > $sa_rcfile
+		. $sa_rcfile
+		unset sa_rcfile
+	fi
+
+	# load any available keys into the agent
+	ssh-add
+	return 0
+}
+
+set_locale()
+{
+	# default to C
+	LANG="C";					export LANG
+
+	if [ -n "$1" ]; then
+		LANG=$1
+	elif [ -n "$LC_FIXED" ]; then
+		LANG=$LC_FIXED
+	else
+		sl_locale_dirs=""
+		sl_locale_prefs=""
+
+		# solaris locale directories
+		append_dir_to_var sl_locale_dirs /usr/lib/locale 1 " "
+
+		# OSX locale directories
+		append_dir_to_var sl_locale_dirs /usr/share/locale 1 " "
+
+		# fedora locale directories
+		append_dir_to_var sl_locale_dirs /usr/share/X11/locale 1 " "
+
+		# solaris locales
+		sl_locale_prefs="$sl_locale_prefs en_US.UTF-8"
+		sl_locale_prefs="$sl_locale_prefs en_US.ISO8859-1"
+		sl_locale_prefs="$sl_locale_prefs en_US.ISO8859-15"
+
+		# linux locales
+		sl_locale_prefs="$sl_locale_prefs en_US.iso88591"
+		sl_locale_prefs="$sl_locale_prefs en_US.iso885915"
+
+		# we avoid "locale -a" because it performs like shit
+		for sl_p in $sl_locale_prefs; do
+			for sl_d in $sl_locale_dirs; do
+				[ \! -d $sl_d/$sl_p ] && continue
+				LANG=$sl_p
+				break 2
+			done
+		done
+
+		unset sl_locale_dirs sl_locale_prefs sl_p sl_d
+	fi
+
+	LC_ALL=$LANG;					export LC_ALL
+	XTERM_LOCALE=$LANG;				export XTERM_LOCALE
+}
+
+set_terminfo()
+{
+	sti_terminfo_dirs=""
+
+	# try to preserve any current setting
+	append_dir_to_var sti_terminfo_dirs "$TERMINFO" 1 " "
+
+	# solaris
+	append_dir_to_var sti_terminfo_dirs /usr/gnu/share/terminfo 1 " "
+	append_dir_to_var sti_terminfo_dirs /usr/share/lib/terminfo 1 " "
+	append_dir_to_var sti_terminfo_dirs /opt/sfw/share/terminfo 1 " "
+
+	# osx and linux
+	append_dir_to_var sti_terminfo_dirs /usr/share/terminfo 1 " "
+
+	# FreeBSD (unless they use /usr/share/misc/termcap.db instead)
+	append_dir_to_var sti_terminfo_dirs /usr/share/misc/terminfo 1 " "
+
+        unset TERMINFO
+	for d in $sti_terminfo_dirs; do
+		append_dir_to_var TERMINFO $d
+	done
+	unset sti_terminfo_dirs
+	if [ -n "$TERMINFO" ]; then
+ 		export TERMINFO
+		return 0
+	fi
+	return 1
+}
+
+cmd_host_redirect()
+{
+	redirect_host=$1; shift
+	redirect_ssh_opt=$1; shift
+	redirect_cwd=`pwd`
+
+	[ $redirect_ssh_opt = "--" ] && redirect_ssh_opt=""
+
+	# try to switch to the same working directory
+	echo "redirecting command: $redirect_host:$redirect_cwd"
+	ssh -q $redirect_ssh_opt $redirect_host \
+		". ${ENVRC}; cd $redirect_cwd; $@; exit"
+}
+
+lsh()
+{
+	ls -Flh $* | grep -v ^total | awk '{printf("%-5.5s %s\n", $5, $9)}'
+}
+
+env_off()
+{
+	ENV=/dev/null
+	BASH_ENV=/dev/null
+	export ENV BASH_ENV
+	unset ZDOTDIR
+}
+
+# static
+is_localfs()
+{
+	[ -z "$1" ] && return 1
+	[ \! -d "$1" -a \! -h "$1" ] && return 1
+	[ `df -l "$1" >/dev/null 2>&1; echo $?` != 0 ] && return 1
+	return 0
+}
+
+type_alias()
+{
+	[ -z "$1" ] && return 0
+	type $1 || return $?
+	alias $1 | grep = >/dev/null || return 0
+	(unalias $1; type $1)
+	return $?
+}
