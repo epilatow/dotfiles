@@ -1,0 +1,35 @@
+" Update xterminal titles.
+if $CSCOPE_DB == ""
+    set title
+    set titleold=""
+endif
+
+" Key bindings - cscope/tags support
+map ^D :cscope find g <C-R>=expand("<cword>")^M^M " find definition
+map ^E :cscope find s <C-R>=expand("<cword>")^M^M " find C symbol
+map ^C :cscope find c <C-R>=expand("<cword>")^M^M " find callers
+map ^A :cscope find t <C-R>=expand("<cword>")^M^M " find assignments
+
+" cscope/tags support
+"set cscopeverbose      " verbose option for debugging
+"set cscopetag          " use :cstag instead of :tag for tags behavior
+if executable("cscope-fast")    " use cscope-fast instead of regular cscope
+    set cscopeprg=cscope-fast
+    if has('cscoperelative')
+        " prepend cscope db path to cscope file paths
+        set cscoperelative
+    endif
+    if $CSCOPE_DB != ""
+        " add database pointed to by environment
+        if (stridx($CSCOPE_DB, "/usr/src/uts/cscope.out") >= 0)
+            cscope add $CSCOPE_DB usr/src/uts
+        elseif (stridx($CSCOPE_DB, "/usr/src/cscope.out") >= 0)
+            cscope add $CSCOPE_DB usr/src
+        else
+            cscope add $CSCOPE_DB
+        endif
+    elseif filereadable("cscope.out")
+        " else add database in current directory
+        cscope add cscope.out
+    endif
+endif

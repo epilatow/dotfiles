@@ -1,0 +1,75 @@
+function Spaces(x)
+    let s:n = a:x
+    let s:r = ""
+    while s:n > 0
+        let s:r = s:r . " "
+        let s:n = s:n - 1
+    endwhile
+    return s:r
+endfun
+
+function Tabify()
+    let s:c_max = 120 " max number of virtual columns we will process
+
+    " cleanup trailing whitespace
+    :%s/[ \t][ \t]*$//e
+
+    " fix cut and paste GUI_showtabs cruft
+    :%s/¬/\t/eg
+    :%s/·//eg
+
+    " start processing at virtual column nunber 1
+    let s:c = 1
+    while s:c <= s:c_max
+
+        "
+        " replace any string of spaces with a tab iff:
+        "
+        " - the string is <= one tabstop in length and > two
+        "   spaces in length (we don't want to convert the two
+        "   spaces between sentences)
+        "
+        " - the string ends on a virtual column that is a multiple
+        "   of the tabstop length
+        "
+        let s:l = &ts
+        while s:l > 2
+            exec ':%s/' . Spaces(s:l) . '\%' . s:c . 'v/\t/e'
+            let s:l = s:l - 1
+        endwhile
+
+        "
+        " replace any string of spaces with a tab iff:
+        "
+        " - the string is <= two spaces in length
+        "
+        " - the string is followed by a tab which is in a virtual
+        "   column that is a multiple of the tabstop length
+        "
+        let s:l = 2
+        while s:l > 0
+            exec ':%s/' . Spaces(s:l) . '\t\%' . s:c . 'v/\t\t/e'
+            let s:l = s:l - 1
+        endwhile
+
+        " increment the virtual column pointer by one tabstop length
+        let s:c = s:c + &ts
+    endwhile
+endfun
+
+" Key bindings - Tabify spaces
+map [t :call Tabify()^M^M
+
+function! GUI_showtabs()
+"   set list listchars=tab:>-,trail:<
+    set list listchars=tab:¬·,trail:¿
+endfun
+
+" The list/listchars options cause the trailing spaces to be highlighted
+" as an inverted question mark with my preferred font.
+autocmd BufEnter *  call GUI_showtabs()
+autocmd BufNewFile *    call GUI_showtabs()
+autocmd BufRead *   call GUI_showtabs()
+
+" rust.vim configuration
+let g:rustfmt_autosave = 1
