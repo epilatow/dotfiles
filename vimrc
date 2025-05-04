@@ -277,10 +277,7 @@ autocmd BufEnter /tmp/mutt-* setlocal tw=72
 autocmd BufEnter *.cc,*.c,*.h setlocal tw=80 fo=croq cindent
 
 " For Python; use space based indentation
-autocmd BufEnter *.py setlocal expandtab tw=78
-
-" For Python; use space based indentation
-autocmd BufEnter *.java setlocal expandtab tw=78 ts=4
+autocmd FileType python setlocal expandtab shiftwidth=4 softtabstop=4 tw=88
 
 " Work around my bad vi habits to save files repeatedly
 cabbr w0 w
