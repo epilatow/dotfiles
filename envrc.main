@@ -459,15 +459,7 @@ type less >/dev/null 2>&1
 
 EDITOR=vi;					export EDITOR
 type vim >/dev/null 2>&1
-if [ $? = 0 ]; then
-	EDITOR=vim_xlabel
-
-	#
-	# VIEWER is used by cscope and overrides EDITOR
-	# vim_R is a simple wrapper script that runs "vim -R"
-	#
-	VIEWER="vim_R";				export VIEWER
-fi
+[ $? = 0 ] && EDITOR=vim
 
 MAILSPOOL=$EDPHOME/mail/incomming.spool;	export MAILSPOOL
 
