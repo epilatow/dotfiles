@@ -537,11 +537,6 @@ ssh_agent_env_init()
 
 ssha()
 {
-	if [ \! -f $HOME/.ssh/id_rsa ]; then
-		echo "ssha error: no private key found"
-		return 1
-	fi
-
 	# First try to access any ssh-agent already running
 	ssh_agent_env_init
 	if [ $? != 0 ]; then
