@@ -286,36 +286,11 @@ append_dir_to_var MANPATH /Applications/Xcode.app/Contents/Developer/Toolchains/
 # vmware tools
 append_dir_to_var PATH "/Applications/VMware Fusion.app/Contents/Library"
 
-# ---------------------------------------------------------------------
-# Rust
-# ---------------------------------------------------------------------
+# rust
 append_dir_to_var  PATH "$EDPHOME/.cargo/bin"
 
-# ---------------------------------------------------------------------
-# Python config
-# Default to MacPorts version of python, if it's installed
-# ---------------------------------------------------------------------
-if [ -z "$NO_PYTHON" ]; then
-	# figure out what version of python is installed
-	erc_pyver=""
-	[ -z "$NO_HOME" ] && type python >/dev/null 2>&1 &&
-		erc_pyver=`python --version 2>&1 |
-		    awk '{print $2}' | cut -d. -f -2`
-
-	# optionally setup PYTHONPATH
-	if [ -d $EDPHOME/python${erc_pyver} ]; then
-		export PYTHONPATH
-		PYTHONPATH=$EDPHOME/python${erc_pyver}
-		append_dir_to_var PATH $EDPHOME/python${erc_pyver}/bin linkok
-	fi
-
-	# add macports python pip binaries to $PATH
-	erc_pydir=$EDPHOME/Library/Python/3.12
-	append_dir_to_var PATH $erc_pydir/bin
-
-	# cleanup
-	unset erc_pyver erc_pydir
-fi
+# pipx
+append_dir_to_var  PATH "$EDPHOME/.local/bin"
 
 # ---------------------------------------------------------------------
 # Java config
@@ -383,6 +358,9 @@ fi
 # Append misc junk to PATH
 # ---------------------------------------------------------------------
 
+# MacPorts
+append_subdirs_to_pathvars /opt/local
+
 # Android SDK
 erc_adt=""
 if [ "$erc_os" = Linux ]; then
@@ -407,30 +385,16 @@ if [ -n "$erc_adt" ]; then
 fi
 unset erc_adt
 
-# MacPorts
-append_subdirs_to_pathvars /opt/local
-
-# Fink
-#export CLASSPATH
-#append_subdirs_to_pathvars /opt/fink
-#append_dir_to_var CLASSPATH /opt/fink/share/java/classpath
-#er_perlversion=`/usr/bin/perl -e 'printf("%vd\n", $^V)'`
-#append_dir_to_var MANPATH /opt/fink/lib/perl5/$er_perlversion/man
-#unset er_perlversion
-
-# Add netbeans
-append_dir_to_var PATH /usr/netbeans/bin
+# ---------------------------------------------------------------------
+# Setup other environment variables
+# ---------------------------------------------------------------------
+umask 027
 
 # now that PATH is set, update SHELL to be a full path (if it isn't already)
 if [ -n "$SHELL" ]; then
 	echo $SHELL | grep '^/' >/dev/null 2>&1 ||
 		SHELL=`path_search $SHELL`
 fi
-
-# ---------------------------------------------------------------------
-# Setup other environment variables
-# ---------------------------------------------------------------------
-umask 027
 
 erc_ps_token="\$"
 [ "$erc_uname" = "root" ] && erc_ps_token="#"
