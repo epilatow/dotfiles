@@ -1,12 +1,17 @@
 " Erase pre-existing autocmds.
 autocmd!
 
-" Use write in place (disable writing a new file and renaming)
-"filesystems Required for Cryptomator FUSE-T mounts
-set backupcopy=yes nowritebackup
+" Safer saves on FUSE/Cryptomator/Dropbox mounts
+set backup                 " keep a backup file
+set writebackup            " make a backup *during* every write
+set backupext=~            " foo.txt~ stays around
+set backupcopy=yes         " copy+overwrite (no rename trick)
+set fsync                  " call fsync() after writing
 
-" Write on buffer switch, write backup files to *~ files
-set autowrite backup backupext=~
+" Keep swap/undo OFF of Cryptomator mounts (use local disk)
+set directory=~/.vim/swap//
+set undofile
+set undodir=~/.vim/undo//
 
 " enable multibyte support
 set encoding=utf-8
