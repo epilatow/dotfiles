@@ -278,19 +278,18 @@ append_subdirs_to_pathvars /usr/local/fvwm linkok
 append_subdirs_to_pathvars /usr/cluster
 
 # macOS developer tools
-append_dir_to_var MANPATH /Applications/Xcode.app/Contents/Developer/usr/share/man
-append_dir_to_var MANPATH /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/share/man
-append_dir_to_var MANPATH /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/share/man
-append_dir_to_var MANPATH /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/share/man
+d=/Applications/Xcode.app/Contents/Developer
+append_dir_to_var MANPATH $d/usr/share/man
+append_dir_to_var MANPATH $d/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/share/man
+append_dir_to_var MANPATH $d/Platforms/MacOSX.platform/Developer/usr/share/man
+append_dir_to_var MANPATH $d/Toolchains/XcodeDefault.xctoolchain/usr/share/man
 
-# vmware tools
+# macOS apps
+append_dir_to_var PATH /Applications/UTM.app/Contents/MacOS
 append_dir_to_var PATH "/Applications/VMware Fusion.app/Contents/Library"
 
-# rust
-append_dir_to_var  PATH "$EDPHOME/.cargo/bin"
-
-# pipx
-append_dir_to_var  PATH "$EDPHOME/.local/bin"
+# MacPorts
+prepend_subdirs_to_pathvars /opt/local
 
 # ---------------------------------------------------------------------
 # Java config
@@ -321,6 +320,17 @@ append_dir_to_var PATH /opt/dtbld/bin
 # Prepend personal tools
 # ---------------------------------------------------------------------
 if [ -z "$NO_HOME" ]; then
+	prepend_dir_to_var PATH "$EDPHOME/.cargo/bin" # rust
+	prepend_subdirs_to_pathvars "$EDPHOME/.local" # pipx
+
+	# nvm (for node)
+	if [[ -d "$EDPHOME/.nvm" ]]; then
+	    NVM_DIR=$EDPHOME/.nvm; export NVM_DIR
+	    nvm() { (. $NVM_DIR/nvm.sh; nvm "$@" ) }
+	    NODE_DIR=$(dirname $(dirname $(nvm which node)))
+	    prepend_subdirs_to_pathvars $NODE_DIR
+	fi
+
 	# Personal tools go at the beginning of the path
 	prepend_subdirs_to_pathvars $EDPHOME/home/plat.$erc_os.$erc_plat
 	prepend_subdirs_to_pathvars $EDPHOME/home/plat.$erc_os
@@ -328,9 +338,6 @@ if [ -z "$NO_HOME" ]; then
 	prepend_subdirs_to_pathvars $EDPHOME/common/plat.$erc_os.$erc_plat
 	prepend_subdirs_to_pathvars $EDPHOME/common/plat.$erc_os
 	prepend_subdirs_to_pathvars $EDPHOME/common linkok
-	prepend_subdirs_to_pathvars $EDPHOME/unison/plat.$erc_os.$erc_plat
-	prepend_subdirs_to_pathvars $EDPHOME/unison/plat.$erc_os
-	prepend_subdirs_to_pathvars $EDPHOME/unison linkok
 	prepend_subdirs_to_pathvars $EDPHOME/env linkok
 fi
 
@@ -353,37 +360,6 @@ if [ -d "$EC2_HOME" -a -f "$EC2_PRIVATE_KEY" -a -f "$EC2_CERT" ]; then
 else
 	unset EC2_HOME EC2_PRIVATE_KEY EC2_CERT EC2_URL
 fi
-
-# ---------------------------------------------------------------------
-# Append misc junk to PATH
-# ---------------------------------------------------------------------
-
-# MacPorts
-append_subdirs_to_pathvars /opt/local
-
-# Android SDK
-erc_adt=""
-if [ "$erc_os" = Linux ]; then
-    erc_adt=adt-bundle-linux-x86_64-20130729
-elif [ "$erc_os" = Darwin ]; then
-    erc_adt=adt-bundle-mac-x86_64-20130729
-    erc_adt=android-sdk-macosx.20150828
-    erc_adt=android-sdk-macosx.26.0.0
-fi
-if [ -n "$erc_adt" ]; then
-	for d in \
-	    $EDPHOME/Development/bin \
-	    $EDPHOME/Development/$erc_adt/sdk/tools \
-	    $EDPHOME/Development/$erc_adt/eclipse \
-	    $EDPHOME/Development/$erc_adt/platform-tools \
-	    $EDPHOME/Development/$erc_adt/sdk/platform-tools \
-	    $EDPHOME/Development/$erc_adt/sdk/build-tools/android-4.3 \
-	; do
-		[ \! -d "$d" ] && continue
-		append_dir_to_var PATH $d
-	done
-fi
-unset erc_adt
 
 # ---------------------------------------------------------------------
 # Setup other environment variables
