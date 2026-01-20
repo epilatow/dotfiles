@@ -194,3 +194,11 @@ endif
 if has("eval") && filereadable(expand("~/.vimrc.eval"))
     source ~/.vimrc.eval
 endif
+
+" Make uv --script shebang files be treated as Python
+augroup uv_script_python
+  autocmd!
+  autocmd BufRead,BufNewFile * if getline(1) =~# '^#!/usr/bin/env\s\+-S\s\+uv\s\+run\s\+--script\>' |
+        \ setfiletype python |
+        \ endif
+augroup END

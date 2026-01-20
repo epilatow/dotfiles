@@ -58,8 +58,8 @@ unset cmd
 # what the current process is and update SHELL if necessary.
 # ---------------------------------------------------------------------
 unset SHELL_BNAME erc_shell erc_shell_bname
-erc_shell=`LD_PRELOAD="" ps -p $$ -o comm | tail -1 | sed 's/^-//'`
-erc_shell_bname=`$basename $erc_shell`
+erc_shell=`LD_PRELOAD="" ps -p $$ -o comm 2>/dev/null | tail -1 | sed 's/^-//'`
+erc_shell_bname=`$basename ${erc_shell:-none}`
 case "$erc_shell_bname" in
 	sh | ksh | ksh88 | ksh93 | bash | zsh )
 		SHELL=$erc_shell; export SHELL
@@ -105,6 +105,11 @@ if [ "$SHELL_BNAME" = zsh ]; then
 
 	# disable terminal paste hilighting
 	unset zle_bracketed_paste 2>/dev/null
+
+	# Frequently, when I try to do a command history search via "ESC, /",
+	# zsh treats it as a single Meta-/ keypress, which by default
+	# is bound to completion (complete-word). Disable that.
+	KEYTIMEOUT=10  # hundredths of a second; 40 by default
 
 	if [ -z "$NO_LABEL" ]; then
 		precmd() { stripe; }
@@ -285,10 +290,12 @@ append_dir_to_var MANPATH $d/Platforms/MacOSX.platform/Developer/usr/share/man
 append_dir_to_var MANPATH $d/Toolchains/XcodeDefault.xctoolchain/usr/share/man
 
 # macOS apps
+append_dir_to_var PATH /Applications/Docker.app/Contents/Resources/bin
 append_dir_to_var PATH /Applications/UTM.app/Contents/MacOS
 append_dir_to_var PATH "/Applications/VMware Fusion.app/Contents/Library"
 
 # MacPorts
+prepend_dir_to_var PATH /opt/local/libexec/git-core
 prepend_subdirs_to_pathvars /opt/local
 
 # ---------------------------------------------------------------------
