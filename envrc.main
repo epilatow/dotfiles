@@ -346,6 +346,7 @@ if [ -z "$NO_HOME" ]; then
 	prepend_subdirs_to_pathvars $EDPHOME/common/plat.$erc_os
 	prepend_subdirs_to_pathvars $EDPHOME/common linkok
 	prepend_subdirs_to_pathvars $EDPHOME/env linkok
+	prepend_subdirs_to_pathvars $EDPHOME/utils linkok
 fi
 
 # ---------------------------------------------------------------------

@@ -24,19 +24,17 @@ if [ $path_is_sane != 1 ]; then
 	unset envrc_stamp_old
 fi
 
-erc_dir=env/dotfiles
-
 # ---------------------------------------------------------------------
 # Get a pointer to my home directory so we can find the additional
 # envrc files.
 # ---------------------------------------------------------------------
 unset p
-if [  \! -f "$EDPHOME/$erc_dir/envrc" -a -n "$BASH" ]; then
+if [  \! -f "$EDPHOME/.envrc" -a -n "$BASH" ]; then
 	# bash specific method to find the file we're sourcing
 	p="${BASH_ARGV[0]}"
 	echo "$p" | grep '^/' >/dev/null
 	[ $? != 0 ] && p="`pwd`/$p"
-elif [  \! -f "$EDPHOME/$erc_dir/envrc" -a -n "$ZSH_NAME" ]; then
+elif [  \! -f "$EDPHOME/.envrc" -a -n "$ZSH_NAME" ]; then
 	# zsh specific method to find the file we're sourcing
 	p=`print -P '%N' 2>/dev/null`
 	[ $p = "%N" ] && p=$0
@@ -54,23 +52,23 @@ if [ -n "$p" ]; then
 			p="`dirname $p`/$p_new"
 		fi
 	done
-	EDPHOME=`echo $p | sed "s:/$erc_dir/envrc::"`
+	EDPHOME=`echo $p | sed "s:/\.envrc::"`
 	EDPHOME=`(unalias cd 2>/dev/null;
 		cd "$EDPHOME" 2>/dev/null && /bin/pwd 2>/dev/null)`
 fi
 
 # fallback to other hacks to find my home directory (for sh, ksh, ksh93, etc)
-[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] && EDPHOME=$HOME
-[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] && EDPHOME=$HOME/../edp
-[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] &&
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/.envrc" ] && EDPHOME=$HOME
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/.envrc" ] && EDPHOME=$HOME/../edp
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/.envrc" ] &&
 	EDPHOME=`getent passwd edp 2>/dev/null | awk -F: '{print $6}'`
-[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] && EDPHOME=/export/home/edp
-[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] && EDPHOME=/home/edp
-[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] && EDPHOME=/Users/edp
-[ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ] &&
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/.envrc" ] && EDPHOME=/export/home/edp
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/.envrc" ] && EDPHOME=/home/edp
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/.envrc" ] && EDPHOME=/Users/edp
+[ -z "$EDPHOME" -o \! -f "$EDPHOME/.envrc" ] &&
 	EDPHOME=`set | grep '/envrc' | grep '/edp/' | head -1 |
 	    sed 's:^[^/]*\(/[0-9A-Za-z/_-]*\)/envrc.*$:\1:'`
-if [ -z "$EDPHOME" -o \! -f "$EDPHOME/$erc_dir/envrc" ]; then
+if [ -z "$EDPHOME" -o \! -f "$EDPHOME/.envrc" ]; then
 	unset EDPHOME
 else
 	EDPHOME=`(unalias cd 2>/dev/null;
@@ -78,7 +76,7 @@ else
 	export EDPHOME
 fi
 if [ -n "$EDPHOME" ]; then
-	ENVRC=$EDPHOME/$erc_dir/envrc
+	ENVRC=$EDPHOME/.envrc
 	export ENVRC
 fi
 
@@ -112,5 +110,4 @@ fi
 # ---------------------------------------------------------------------
 # We're done.
 # ---------------------------------------------------------------------
-unset erc_dir
 [ $debug_envrc -ne 0 ] && echo "envrc end"
