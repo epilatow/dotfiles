@@ -342,8 +342,11 @@ if [ -z "$NO_HOME" ]; then
 	if [[ -d "$EDPHOME/.nvm" ]]; then
 	    NVM_DIR=$EDPHOME/.nvm; export NVM_DIR
 	    nvm() { (. $NVM_DIR/nvm.sh; nvm "$@" ) }
-	    NODE_DIR=$(dirname $(dirname $(nvm which node)))
-	    prepend_subdirs_to_pathvars $NODE_DIR
+	    nvm_alias=$(cat "$NVM_DIR/alias/default" 2>/dev/null)
+	    NODE_DIR=$(ls -d "$NVM_DIR/versions/node/v${nvm_alias}"* \
+	        2>/dev/null | sort -V | tail -1)
+	    [ -n "$NODE_DIR" ] && prepend_subdirs_to_pathvars $NODE_DIR
+	    unset nvm_alias
 	fi
 
 	# Personal tools go at the beginning of the path
