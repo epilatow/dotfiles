@@ -294,9 +294,17 @@ append_dir_to_var PATH /Applications/Docker.app/Contents/Resources/bin
 append_dir_to_var PATH /Applications/UTM.app/Contents/MacOS
 append_dir_to_var PATH "/Applications/VMware Fusion.app/Contents/Library"
 
-# MacPorts
+# macports
 prepend_dir_to_var PATH /opt/local/libexec/git-core
 prepend_subdirs_to_pathvars /opt/local
+
+# brew
+if [ -d "/opt/homebrew" ]; then
+	export HOMEBREW_PREFIX="/opt/homebrew";
+	export HOMEBREW_CELLAR="/opt/homebrew/Cellar";
+	export HOMEBREW_REPOSITORY="/opt/homebrew";
+	prepend_subdirs_to_pathvars /opt/homebrew
+fi
 
 # ---------------------------------------------------------------------
 # Java config
