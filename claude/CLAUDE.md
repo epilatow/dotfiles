@@ -168,3 +168,5 @@
 
 - When generating dynamic strings or messages, default to using
   f-strings over concatenation.
+
+append @CLAUDE-PRIVATE.md
