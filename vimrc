@@ -59,7 +59,7 @@ set hlsearch
 set history=50
 
 " Don't wrap text automatically
-set textwidth=72
+set textwidth=78
 
 " set gui options
 set guioptions-=T		" Disable toolbar
