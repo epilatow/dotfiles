@@ -81,6 +81,27 @@ system can't enforce.
   commit message.
 - Mocks use `autospec=True` so argument verification happens.
 
+## Docker conventions
+
+- Docker Compose files (`compose.yml`, `compose.yaml`,
+  `docker-compose.yml`) are linted with [dclint][dclint] via
+  `npx dclint .` from the repo root. dclint enforces key ordering
+  within services, requires explicit image tags, flags missing
+  resource limits, and similar best-practice rules.
+- A repo with compose files should pin the convention at the top
+  of each file with a `# Keep linted: npx dclint .` header so the
+  tool is discoverable for the next reader.
+- When dclint flags a rule that is genuinely wrong for a given
+  service, suppress it inline with
+  `# dclint disable-line <rule-name>` rather than disabling the
+  rule globally. Common case: tracking `latest` for an image needs
+  `# dclint disable-line service-image-require-explicit-tag`.
+- Resolve dclint warnings by fixing the file, not by widening the
+  ignore list. Out-of-order keys, missing limits, and unset
+  `restart` policies are real issues, not lint noise.
+
+[dclint]: https://github.com/zavoloklom/docker-compose-linter
+
 ## Testing
 
 - Add tests for new functionality. A change that adds a feature
