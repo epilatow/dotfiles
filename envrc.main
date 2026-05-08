@@ -336,7 +336,6 @@ append_dir_to_var PATH /opt/dtbld/bin
 # ---------------------------------------------------------------------
 if [ -z "$NO_HOME" ]; then
 	prepend_dir_to_var PATH "$EDPHOME/.cargo/bin" # rust
-	prepend_subdirs_to_pathvars "$EDPHOME/.local" # pipx
 
 	# nvm (for node)
 	if [[ -d "$EDPHOME/.nvm" ]]; then
@@ -350,13 +349,13 @@ if [ -z "$NO_HOME" ]; then
 	fi
 
 	# Personal tools go at the beginning of the path
+	prepend_subdirs_to_pathvars $EDPHOME/.local
 	prepend_subdirs_to_pathvars $EDPHOME/home/plat.$erc_os.$erc_plat
 	prepend_subdirs_to_pathvars $EDPHOME/home/plat.$erc_os
 	prepend_subdirs_to_pathvars $EDPHOME/home linkok
 	prepend_subdirs_to_pathvars $EDPHOME/common/plat.$erc_os.$erc_plat
 	prepend_subdirs_to_pathvars $EDPHOME/common/plat.$erc_os
 	prepend_subdirs_to_pathvars $EDPHOME/common linkok
-	prepend_subdirs_to_pathvars $EDPHOME/utils linkok
 fi
 
 # ---------------------------------------------------------------------
@@ -550,6 +549,8 @@ chmod 0700 $SCREENDIR 2>/dev/null || unset SCREENDIR
 
 erc_f=${ENVRC}.main.$erc_os; [ -f $erc_f ] && . $erc_f
 erc_f=${ENVRC_WORK}.main; [ -f $erc_f ] && . $erc_f
+
+export CLAUDE_PERSONAS_PROXY=edp@truenas.wallaby-snares.ts.net
 
 # ---------------------------------------------------------------------
 # evaluate any extra config
