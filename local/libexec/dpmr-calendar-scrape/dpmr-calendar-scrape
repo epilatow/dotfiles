@@ -1,0 +1,340 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "curl_cffi",
+#     "beautifulsoup4",
+#     "icalendar>=7.0",
+# ]
+# ///
+"""Scrape the Donner Party Mountain Runners webcalendar and emit a
+six-month .ics feed.
+
+The site runs the All-in-One Event Calendar (Time.ly) plugin. Its own
+iCal export endpoint and its agenda-action deep links are firewalled
+(403). The bare /calendar/ path renders fine, and so does
+/calendar/exact_date~M-D-YYYY/, which shows roughly two weeks of events
+starting from the supplied date. We walk that 14 days at a time until
+we reach the horizon, dedupe by event instance id, and emit one .ics.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from bs4 import BeautifulSoup
+from curl_cffi import requests
+from icalendar import Calendar, Event, Timezone
+
+BASE = "https://donnerpartymountainrunners.com"
+WINDOW_DAYS = 14
+HORIZON_DAYS = 183
+DEFAULT_FILENAME = "donner-party-mountain-runners.ics"
+EVENT_TZ = ZoneInfo("America/Los_Angeles")
+TIME_RE = re.compile(
+    r"(?P<sh>\d{1,2}):(?P<sm>\d{2})\s*(?P<sap>am|pm)"
+    r"\s*[-\u2013]\s*"
+    r"(?P<eh>\d{1,2}):(?P<em>\d{2})\s*(?P<eap>am|pm)",
+    re.I,
+)
+
+
+@dataclass(frozen=True)
+class CalEvent:
+    instance_id: str
+    event_id: str
+    title: str
+    start: datetime
+    end: datetime
+    location: str | None
+    description: str | None
+    url: str | None
+
+
+def fetch_window(session: requests.Session, when: date) -> str:
+    url = (
+        f"{BASE}/calendar/"
+        f"exact_date~{when.month}-{when.day}-{when.year}/"
+    )
+    resp = session.get(url, timeout=30)
+    resp.raise_for_status()
+    return resp.text
+
+
+def parse_clock(h: int, m: int, ap: str) -> tuple[int, int]:
+    ap = ap.lower()
+    if ap == "am":
+        return (0 if h == 12 else h), m
+    return (12 if h == 12 else h + 12), m
+
+
+def extract_events(html: str) -> list[CalEvent]:
+    soup = BeautifulSoup(html, "html.parser")
+    out: list[CalEvent] = []
+    for div in soup.select("div.ai1ec-event"):
+        classes = div.get("class") or []
+        instance_id = _strip_class(classes, "ai1ec-event-instance-id-")
+        event_id = _strip_class(classes, "ai1ec-event-id-")
+        end_attr = div.get("data-end")
+        if not instance_id or not event_id or not end_attr:
+            continue
+        end_dt = datetime.fromisoformat(end_attr)
+
+        title_el = div.select_one("span.ai1ec-event-title")
+        location: str | None = None
+        if title_el is not None:
+            loc_el = title_el.select_one("span.ai1ec-event-location")
+            if loc_el is not None:
+                location = (
+                    loc_el.get_text(strip=True).lstrip("@").strip() or None
+                )
+                loc_el.extract()
+            title = title_el.get_text(" ", strip=True)
+        else:
+            title = ""
+
+        time_el = div.select_one("div.ai1ec-event-time")
+        time_text = (
+            time_el.get_text(" ", strip=True) if time_el is not None else ""
+        )
+        m = TIME_RE.search(time_text)
+        if m is None:
+            start_dt = end_dt.replace(hour=0, minute=0, second=0)
+        else:
+            sh, sm = parse_clock(
+                int(m["sh"]), int(m["sm"]), m["sap"]
+            )
+            start_dt = end_dt.replace(hour=sh, minute=sm, second=0)
+            if start_dt > end_dt:
+                start_dt -= timedelta(days=1)
+
+        desc_el = div.select_one("div.ai1ec-event-description")
+        description = (
+            desc_el.get_text("\n", strip=True) if desc_el is not None else None
+        )
+
+        link_el = div.select_one("a.ai1ec-load-event")
+        url = link_el.get("href") if link_el is not None else None
+        if isinstance(url, list):
+            url = url[0] if url else None
+
+        # The website serves data-end with explicit Pacific offsets (-07:00
+        # in PDT, -08:00 in PST). Re-anchor to the named IANA zone so the
+        # emitted .ics carries TZID=America/Los_Angeles, matched by the
+        # VTIMEZONE block in build_ics.
+        out.append(
+            CalEvent(
+                instance_id=instance_id,
+                event_id=event_id,
+                title=title,
+                start=start_dt.astimezone(EVENT_TZ),
+                end=end_dt.astimezone(EVENT_TZ),
+                location=location,
+                description=description,
+                url=url,
+            )
+        )
+    return out
+
+
+def _strip_class(classes: list[str], prefix: str) -> str | None:
+    for c in classes:
+        if c.startswith(prefix):
+            return c[len(prefix):]
+    return None
+
+
+def _make_vevent(ev: CalEvent) -> Event:
+    ve = Event()
+    ve.add(
+        "uid",
+        f"ai1ec-{ev.instance_id}@donnerpartymountainrunners.com",
+    )
+    ve.add("summary", ev.title)
+    ve.add("dtstart", ev.start)
+    ve.add("dtend", ev.end)
+    # DTSTAMP is required by RFC 5545. Derive from event content (not
+    # wall-clock time) so identical inputs produce byte-identical
+    # output: avoids needless rsync churn and "everything changed"
+    # signals to subscribed clients.
+    ve.add("dtstamp", ev.start)
+    if ev.location:
+        ve.add("location", ev.location)
+    if ev.description:
+        ve.add("description", ev.description)
+    if ev.url:
+        ve.add("url", ev.url)
+    return ve
+
+
+def _vevent_sort_key(ve: Event) -> datetime:
+    start = ve.decoded("dtstart")
+    if isinstance(start, datetime):
+        return start
+    return datetime.combine(start, datetime.min.time(), tzinfo=EVENT_TZ)
+
+
+def build_ics(
+    events: list[CalEvent], past: list[Event] | None = None
+) -> bytes:
+    cal = Calendar()
+    cal.add("prodid", "-//drymartini.org//DPMR calendar mirror//EN")
+    cal.add("version", "2.0")
+    cal.add("x-wr-calname", "Donner Party Mountain Runners")
+    cal.add("x-wr-caldesc", "Mirror of donnerpartymountainrunners.com/calendar/")
+    cal.add("x-wr-timezone", str(EVENT_TZ))
+    cal.add_component(Timezone.from_tzinfo(EVENT_TZ))
+
+    vevents = [_make_vevent(ev) for ev in events]
+    if past:
+        # Current scrape wins if a UID appears in both, since the website is
+        # the source of truth for any event still in its window.
+        scraped_uids = {str(v["uid"]) for v in vevents}
+        for ve in past:
+            if str(ve["uid"]) not in scraped_uids:
+                vevents.append(ve)
+
+    vevents.sort(key=_vevent_sort_key)
+    for ve in vevents:
+        cal.add_component(ve)
+    return cal.to_ical()
+
+
+@dataclass(frozen=True)
+class _VRecord:
+    body: bytes
+    start: str
+    label: str
+
+
+def _past_vevents(cal_bytes: bytes | None, cutoff: datetime) -> list[Event]:
+    """Extract VEVENTs from an existing .ics whose start is before cutoff.
+
+    Used to preserve historical events across regeneration: the website's
+    agenda view only exposes events from a given date forward, so an event
+    that has passed since the previous run wouldn't otherwise survive.
+    """
+    if not cal_bytes:
+        return []
+    cal = Calendar.from_ical(cal_bytes)
+    out: list[Event] = []
+    for ve in cal.walk("VEVENT"):
+        start = ve.decoded("dtstart")
+        if isinstance(start, datetime):
+            if start < cutoff:
+                out.append(ve)
+        else:
+            if start < cutoff.date():
+                out.append(ve)
+    return out
+
+
+def _vevent_records(cal_bytes: bytes) -> dict[str, _VRecord]:
+    cal = Calendar.from_ical(cal_bytes)
+    out: dict[str, _VRecord] = {}
+    for ve in cal.walk("VEVENT"):
+        uid = str(ve["uid"])
+        start_iso = ve.decoded("dtstart").isoformat()
+        summary = str(ve.get("summary", ""))
+        out[uid] = _VRecord(
+            body=ve.to_ical(),
+            start=start_iso,
+            label=f"{summary} ({start_iso})",
+        )
+    return out
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Scrape the Donner Party Mountain Runners webcalendar and "
+            "emit an .ics file covering the next six months."
+        ),
+    )
+    parser.add_argument(
+        "ics_path",
+        nargs="?",
+        type=Path,
+        default=None,
+        help=(
+            f"Output .ics path. Defaults to ./{DEFAULT_FILENAME} in the "
+            "current working directory."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    out_path: Path = args.ics_path or (Path.cwd() / DEFAULT_FILENAME)
+
+    session = requests.Session(impersonate="chrome")
+
+    today = date.today()
+    horizon = today + timedelta(days=HORIZON_DAYS)
+    by_instance: dict[str, CalEvent] = {}
+    fetch_date = today
+    while fetch_date <= horizon:
+        html = fetch_window(session, fetch_date)
+        for ev in extract_events(html):
+            by_instance.setdefault(ev.instance_id, ev)
+        fetch_date += timedelta(days=WINDOW_DAYS)
+
+    if not by_instance:
+        print(
+            "no events parsed; refusing to overwrite output (site format "
+            "may have changed)",
+            file=sys.stderr,
+        )
+        return 1
+
+    events = sorted(by_instance.values(), key=lambda e: e.start)
+
+    existing: bytes | None = (
+        out_path.read_bytes() if out_path.exists() else None
+    )
+    cutoff = datetime.now(tz=EVENT_TZ).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    past = _past_vevents(existing, cutoff)
+    new_bytes = build_ics(events, past=past)
+    new_records = _vevent_records(new_bytes)
+    old_records = _vevent_records(existing) if existing else {}
+
+    added = new_records.keys() - old_records.keys()
+    removed = old_records.keys() - new_records.keys()
+    common = new_records.keys() & old_records.keys()
+    updated = {
+        u for u in common if new_records[u].body != old_records[u].body
+    }
+    unchanged = len(common) - len(updated)
+
+    file_changed = existing != new_bytes
+    if file_changed:
+        out_path.write_bytes(new_bytes)
+    out_path.chmod(0o644)
+
+    state = "wrote" if file_changed else "unchanged"
+    print(
+        f"{state} {out_path}: "
+        f"added={len(added)} removed={len(removed)} "
+        f"updated={len(updated)} unchanged={unchanged} "
+        f"(total={len(new_records)})"
+    )
+    for uid in sorted(added, key=lambda u: new_records[u].start):
+        print(f"  + {new_records[uid].label}")
+    for uid in sorted(removed, key=lambda u: old_records[u].start):
+        print(f"  - {old_records[uid].label}")
+    for uid in sorted(updated, key=lambda u: new_records[u].start):
+        print(f"  ~ {new_records[uid].label}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

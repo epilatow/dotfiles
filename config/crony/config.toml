@@ -1,0 +1,135 @@
+# ============================================================================
+# Schedules use systemd OnCalendar syntax; intervals use systemd time-span
+# syntax. See:
+#   https://www.freedesktop.org/software/systemd/man/systemd.time.html
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# defaults section
+# ----------------------------------------------------------------------------
+# Tool-wide settings cascaded to every job. Per-job and per-target
+# settings can override anything here.
+
+[defaults]
+notify_channels      = ["ntfy"]
+notify_attach_log    = true
+notify_attach_max_kb = 256
+# timeout_sec          = 3600         # default: 1800 sec (30 min)
+# log_keep_runs        = 30
+
+[defaults.notify.ntfy]
+transport              = "ntfy"
+url                    = "https://ntfy.drymartini.org/automation-crony"
+token_file             = "~/.config/crony/secrets/ntfy-token"
+headers                = { "Email" = "edp@drymartini.org" }
+
+# ----------------------------------------------------------------------------
+# job sections
+# ----------------------------------------------------------------------------
+# A schedulable unit of work. Either `command` (one-line shell) or
+# `script` (path under the dotfiles repo) is required. A job with
+# no schedule/interval is valid only if some [job-group.*] references
+# it (otherwise it can never fire).
+
+[job.u-oss-brew]
+command     = "brew update && brew upgrade && brew cleanup"
+gate        = "command -v brew"
+env.PATH    = "$PATH:/opt/homebrew/bin"
+platforms   = ["darwin"]
+
+[job.u-oss-nvm]
+command     = '. "$NVM_DIR/nvm.sh" && nvm install --lts --latest-npm --reinstall-packages-from=default'
+gate        = 'test -s "$NVM_DIR/nvm.sh"'
+env.NVM_DIR = "$HOME/.nvm"
+
+[job.u-oss-rust]
+command     = "rustup self update && rustup update"
+gate        = "command -v rustup"
+env.PATH    = "$PATH:$HOME/.cargo/bin"
+
+[job.u-oss-uv]
+command     = "mkdir -p $TMPDIR && uv self update && uv tool upgrade --all"
+gate        = "command -v uv"
+env.PATH    = "$PATH:$HOME/.local/bin"
+env.TMPDIR  = "$HOME/.local/tmp"
+
+[job.u-repo-utils]
+command   = "cd $REPO && git pull"
+gate      = "test -d $REPO"
+env.REPO  = "$HOME/src/github.com/epilatow/utils"
+
+[job.u-repo-dotfiles]
+command   = "cd $REPO && git pull"
+gate      = "test -d $REPO"
+env.REPO  = "$HOME/src/github.com/epilatow/dotfiles"
+
+[job.u-repo-links]
+command   = "binfiles install && dotfiles install"
+env.PATH  = "$PATH:$HOME/.local/bin"
+
+[job.u-www-gas-prices-breakdown]
+script    = "~/.local/libexec/gas-prices-breakdown/gas-prices-breakdown"
+args      = ["add-snapshot", "~/home/public_html/gas-prices-breakdown.html"]
+env.PATH  = "$PATH:$HOME/.local/bin"
+hosts     = ["squee"]
+
+[job.u-www-cocktails]
+script    = "$HOME/home/bin/publish_cocktails.sh"
+env.PATH  = "/opt/local/bin:$HOME/common/bin:$PATH"
+hosts     = ["squee"]
+
+[job.u-www-recipes]
+script    = "$HOME/home/bin/publish_recipes.sh"
+env.PATH  = "$PATH:/opt/local/bin"
+hosts     = ["squee"]
+
+[job.u-www-dpmr-calendar]
+script    = "~/.local/libexec/dpmr-calendar-scrape/dpmr-calendar-scrape"
+args      = ["~/home/public_html/donner-party-mountain-runners.ics"]
+gate      = "test -d $HOME/dotfiles"
+env.PATH  = "$PATH:$HOME/.local/bin"
+hosts     = ["squee"]
+
+[job.u-www-push]
+script    = "$HOME/home/bin/publish_html.sh"
+hosts     = ["squee"]
+
+# ----------------------------------------------------------------------------
+# job-group sections
+# ----------------------------------------------------------------------------
+# A scheduled sequencer that fires named jobs in order. Has its own
+# schedule but no command/script of its own.
+
+[job-group.u-oss]
+jobs     = ["u-oss-nvm", "u-oss-rust", "u-oss-uv", "u-oss-brew"]
+
+[job-group.u-weekly]
+schedule = "Mon *-*-* 02:00"
+jobs     = ["u-oss", "u-www-gas-prices-breakdown"]
+
+[job-group.u-repos]
+jobs     = ["u-repo-utils", "u-repo-dotfiles", "u-repo-links"]
+
+[job-group.u-www]
+jobs     = ["u-www-cocktails", "u-www-recipes", "u-www-dpmr-calendar", "u-www-push"]
+hosts    = ["squee"]
+
+[job-group.u-daily]
+schedule = "*-*-* 02:30"
+jobs     = ["u-repos", "u-www"]
+
+# ----------------------------------------------------------------------------
+# target sections
+# ----------------------------------------------------------------------------
+# Selects which jobs and groups install on which hosts. A host
+# target replaces the platform target when both apply; the explicit
+# `jobs` list IS the selection (no inherits / exclude / add).
+
+[target.host.truenas-brittan]
+jobs            = ["u-weekly", "u-daily"]
+
+[target.host.truenas-polaris]
+jobs            = ["u-weekly", "u-daily"]
+
+[target.host.squee]
+jobs            = ["u-weekly", "u-daily"]

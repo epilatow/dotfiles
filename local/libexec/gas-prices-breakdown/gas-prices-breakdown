@@ -1,0 +1,924 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["openpyxl"]
+# ///
+"""Manage SNAPSHOTS and embedded markdown in gas-price-breakdown.html.
+
+Subcommands:
+  list-snapshots HTML
+      Print one line per snapshot: date, state count, notes preview.
+
+  add-snapshot HTML [--target DATE] [--baseline DATE] [--dry-run]
+      Fetch live data and append a snapshot for DATE (default: most recent
+      Thursday). Inherits state-tax structure (cols 3-4) from the BASELINE
+      snapshot; does not refresh state tax rates -- those need human review.
+
+  remove-snapshot HTML SNAPSHOT_DATE [--dry-run]
+      Remove the snapshot whose `date` field is SNAPSHOT_DATE.
+
+  extract-markdown HTML [--output PATH]
+      Write the embedded SPEC_MD spec text to PATH (or stdout).
+
+Data sources used by add-snapshot:
+  Fetched live: AAA state-averages (retail), CARB weekly LCFS xlsx,
+  Oregon DEQ CFP credit-transfer xlsx.
+
+  Hand-maintained tables (need quarterly human update): CARB cap-and-trade
+  auction settlements (CARB_CCA_AUCTIONS), Washington CCA auction
+  settlements (WA_CCA_AUCTIONS). The script logs a warning when an entry
+  is older than CCA_STALE_DAYS.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import logging
+import re
+import shutil
+import sys
+import urllib.request
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+import openpyxl
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+BASELINE_DATE = "2026-04-26"
+USER_AGENT = "gas-prices-breakdown/0.2"
+
+# CARB cap-and-trade joint-auction current-vintage settlement prices.
+# Source: ARB "Summary of California-Quebec Joint Auction Settlement Prices
+# and Results" (results_summary.pdf at the CARB auction-information page).
+# Update this list quarterly when a new auction settles (Feb / May / Aug /
+# Nov). The script logs a warning when the most recent entry is older than
+# CCA_STALE_DAYS.
+CARB_CCA_AUCTIONS: list[tuple[date, float, str]] = [
+    (date(2025, 11, 19), 28.32, "Nov 2025 Joint Auction #45"),
+    (date(2026, 2, 18),  27.94, "Feb 2026 Joint Auction #46"),
+]
+
+# Washington Climate Commitment Act allowance auction settlements.
+# Source: ecology.wa.gov/air-climate/climate-commitment-act/cap-and-invest
+# /auctions-and-market. WA results are typically certified ~7 days after the
+# auction; this script keys off the certification date.
+WA_CCA_AUCTIONS: list[tuple[date, float, str]] = [
+    (date(2025, 12, 3),  70.86, "WA Auction #12 (Dec 3, 2025)"),
+    (date(2026, 3, 11),  65.26, "WA Auction #13 (Mar 4, 2026), certified Mar 11"),
+]
+
+CCA_STALE_DAYS = 130  # warn if newest auction entry is older than this
+
+# Per-gallon conversion factors. Each is back-derived from a documented data
+# point in the existing baseline snapshot so the units stay consistent with
+# what is already in the array.
+LCFS_FACTOR = 0.18 / 62.93        # CA: $/gal per $/MT (Apr 2026 anchor)
+CCA_FACTOR_MT_PER_GAL = 0.00878   # CA: MT/gal CO2 (CARB-documented)
+WA_FACTOR = 0.52 / 65.26          # WA: $/gal per $/allowance (Mar 2026 anchor)
+OR_FACTOR = 0.10 / 43.73          # OR: $/gal per $/credit (Jan 2025 anchor)
+
+# Indiana gasoline use tax suspension window (statutory).
+IN_SUSPENSION_START = date(2026, 4, 8)
+IN_SUSPENSION_END = date(2026, 5, 8)
+
+# CARB weekly LCFS landing page; the script reads the current xlsx URL from it.
+CARB_LCFS_LANDING = (
+    "https://ww2.arb.ca.gov/resources/documents/"
+    "weekly-lcfs-credit-transfer-activity-reports"
+)
+
+# AAA live state-averages page.
+AAA_URL = "https://gasprices.aaa.com/state-gas-price-averages/"
+
+# Oregon DEQ Clean Fuels Program credit transfer activity xlsx (rolling).
+OR_CFP_URL = (
+    "https://www.oregon.gov/deq/ghgp/Documents/"
+    "CFPCreditTransferActivityReport.xlsx"
+)
+
+STATE_CODE: dict[str, str] = {
+    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
+    "California": "CA", "Colorado": "CO", "Connecticut": "CT",
+    "Delaware": "DE", "District of Columbia": "DC", "Florida": "FL",
+    "Georgia": "GA", "Hawaii": "HI", "Idaho": "ID", "Illinois": "IL",
+    "Indiana": "IN", "Iowa": "IA", "Kansas": "KS", "Kentucky": "KY",
+    "Louisiana": "LA", "Maine": "ME", "Maryland": "MD",
+    "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN",
+    "Mississippi": "MS", "Missouri": "MO", "Montana": "MT",
+    "Nebraska": "NE", "Nevada": "NV", "New Hampshire": "NH",
+    "New Jersey": "NJ", "New Mexico": "NM", "New York": "NY",
+    "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH",
+    "Oklahoma": "OK", "Oregon": "OR", "Pennsylvania": "PA",
+    "Rhode Island": "RI", "South Carolina": "SC", "South Dakota": "SD",
+    "Tennessee": "TN", "Texas": "TX", "Utah": "UT", "Vermont": "VT",
+    "Virginia": "VA", "Washington": "WA", "West Virginia": "WV",
+    "Wisconsin": "WI", "Wyoming": "WY",
+}
+
+MONTHS: dict[str, int] = {
+    "January": 1, "February": 2, "March": 3, "April": 4,
+    "May": 5, "June": 6, "July": 7, "August": 8,
+    "September": 9, "October": 10, "November": 11, "December": 12,
+}
+
+# Multiplication sign U+00D7 used in note text inside the SNAPSHOTS array.
+# Defined as a Unicode escape so this source file stays ASCII; the
+# generated note text still uses the same glyph as existing snapshots.
+TIMES = "\u00d7"
+
+
+log = logging.getLogger("gas-prices-breakdown")
+
+
+# ---------------------------------------------------------------------------
+# Fetch helpers
+# ---------------------------------------------------------------------------
+
+def _http(url: str, *, decode: bool = True) -> bytes | str:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip"},
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        body = resp.read()
+        if resp.headers.get("Content-Encoding") == "gzip":
+            body = gzip.decompress(body)
+    if decode:
+        return body.decode("utf-8", errors="replace")
+    return body
+
+
+def most_recent_thursday(today: date | None = None) -> date:
+    today = today or date.today()
+    return today - timedelta(days=(today.weekday() - 3) % 7)
+
+
+# ---------------------------------------------------------------------------
+# AAA retail
+# ---------------------------------------------------------------------------
+
+def fetch_aaa_retail() -> dict[str, float]:
+    html = _http(AAA_URL)
+    table_match = re.search(
+        r'<table[^>]*id="sortable"[^>]*>(.*?)</table>',
+        html, re.S,
+    )
+    if not table_match:
+        raise RuntimeError("AAA: sortable table not found on page")
+    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", table_match.group(1), re.S)
+    out: dict[str, float] = {}
+    for tr in rows[1:]:
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
+        if not tds:
+            continue
+        name_match = re.search(r"<a[^>]*>(.*?)</a>", tds[0], re.S)
+        if not name_match:
+            continue
+        state = re.sub(r"\s+", " ", name_match.group(1)).strip()
+        state = state.replace("&amp;", "&")
+        if state not in STATE_CODE:
+            raise RuntimeError(f"AAA: unrecognized state {state!r}")
+        if len(tds) < 2:
+            raise RuntimeError(f"AAA: missing price columns for {state}")
+        clean = re.sub(r"<[^>]+>", "", tds[1])
+        clean = re.sub(r"\s+", " ", clean).strip().lstrip("$")
+        out[STATE_CODE[state]] = float(clean)
+    if len(out) != 51:
+        raise RuntimeError(f"AAA: parsed {len(out)} states, expected 51")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# CARB LCFS weekly
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class LcfsWeek:
+    monday: date
+    vwap_per_mt: float
+    source_xlsx_url: str
+
+
+def fetch_lcfs_for_target_date(target: date, cache_dir: Path) -> LcfsWeek:
+    """Return the most recent LCFS weekly VWAP available as of `target`.
+
+    CARB reports cover Mon-Sun and are published the following Tuesday;
+    target date D can use the week-of-Monday X iff X + 8 days <= D."""
+    landing = _http(CARB_LCFS_LANDING)
+    href_match = re.search(
+        r'href="([^"]*Weekly[^"]*\.xlsx)"',
+        landing,
+    )
+    if not href_match:
+        raise RuntimeError("CARB LCFS: xlsx link not found on landing page")
+    url = href_match.group(1)
+    if url.startswith("/"):
+        url = "https://ww2.arb.ca.gov" + url
+    xlsx_path = cache_dir / "lcfs.xlsx"
+    xlsx_path.write_bytes(_http(url, decode=False))  # type: ignore[arg-type]
+    weeks = _read_lcfs_weekly(xlsx_path)
+    cutoff = target - timedelta(days=8)
+    selected: tuple[date, float] | None = None
+    for monday, vwap in weeks:
+        if monday <= cutoff:
+            selected = (monday, vwap)
+        else:
+            break
+    if selected is None:
+        raise RuntimeError(f"CARB LCFS: no week with monday <= {cutoff}")
+    return LcfsWeek(monday=selected[0], vwap_per_mt=selected[1],
+                    source_xlsx_url=url)
+
+
+def _read_lcfs_weekly(path: Path) -> list[tuple[date, float]]:
+    wb = openpyxl.load_workbook(path, data_only=True)
+    sheet_name = "Weekly Average Credit Price"
+    if sheet_name not in wb.sheetnames:
+        raise RuntimeError(f"CARB LCFS xlsx missing sheet {sheet_name!r}")
+    sh = wb[sheet_name]
+    weeks: list[tuple[date, float]] = []
+    for row in sh.iter_rows(min_row=2, values_only=True):
+        a = row[0]
+        if a is None or not hasattr(a, "year"):
+            continue
+        monday = a.date() if hasattr(a, "date") else a  # type: ignore[union-attr]
+        b = row[1]
+        if not isinstance(b, (int, float)):
+            continue
+        weeks.append((monday, float(b)))
+    if not weeks:
+        raise RuntimeError("CARB LCFS xlsx: no weekly rows parsed")
+    return weeks
+
+
+# ---------------------------------------------------------------------------
+# Quarterly auction tables (CARB CCA, WA CCA)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AuctionSettlement:
+    effective: date
+    price: float
+    label: str
+
+
+def latest_auction(table: list[tuple[date, float, str]],
+                   target: date) -> AuctionSettlement:
+    selected: tuple[date, float, str] | None = None
+    for entry in table:
+        if entry[0] <= target:
+            selected = entry
+    if selected is None:
+        raise RuntimeError("no auction entry before target")
+    return AuctionSettlement(effective=selected[0], price=selected[1],
+                             label=selected[2])
+
+
+# ---------------------------------------------------------------------------
+# Oregon CFP monthly
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class OrCfpMonth:
+    year_month: str  # "YYYY-MM"
+    vwap_per_credit: float
+    source_xlsx_url: str
+
+
+def fetch_or_cfp_for_target_date(target: date, cache_dir: Path) -> OrCfpMonth:
+    """Return the most recent OR CFP monthly VWAP available as of target.
+
+    DEQ publishes month M's VWAP by the last day of month M+1; the script
+    treats month M as available from the first day of month M+2."""
+    xlsx_path = cache_dir / "oregon-cfp.xlsx"
+    xlsx_path.write_bytes(_http(OR_CFP_URL, decode=False))  # type: ignore[arg-type]
+    monthly = _read_or_cfp_monthly(xlsx_path)
+    candidates: list[tuple[tuple[int, int], float]] = []
+    for (y, m), price in monthly.items():
+        avail_year = y + (1 if m + 2 > 12 else 0)
+        avail_month = ((m + 1) % 12) + 1
+        avail = date(avail_year, avail_month, 1)
+        if avail <= target:
+            candidates.append(((y, m), price))
+    if not candidates:
+        raise RuntimeError("OR CFP: no monthly value available as of target")
+    (y, m), price = max(candidates, key=lambda t: t[0])
+    return OrCfpMonth(year_month=f"{y}-{m:02d}",
+                      vwap_per_credit=price,
+                      source_xlsx_url=OR_CFP_URL)
+
+
+def _read_or_cfp_monthly(path: Path) -> dict[tuple[int, int], float]:
+    wb = openpyxl.load_workbook(path, data_only=True)
+    sheet_name = "Monthly Credit Transfer Summary"
+    if sheet_name not in wb.sheetnames:
+        raise RuntimeError(f"OR CFP xlsx missing sheet {sheet_name!r}")
+    sh = wb[sheet_name]
+    out: dict[tuple[int, int], float] = {}
+    year: int | None = None
+    for row in sh.iter_rows(min_row=2, values_only=True):
+        a, b, _, _, e = row[:5]
+        if isinstance(a, int):
+            year = a
+        if not isinstance(b, str) or b not in MONTHS:
+            continue
+        if year is None:
+            continue
+        if not isinstance(e, (int, float)) or e <= 0:
+            continue
+        out[(year, MONTHS[b])] = float(e)
+    if not out:
+        raise RuntimeError("OR CFP xlsx: no monthly rows parsed")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# HTML parse / splice
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Snapshots:
+    preamble: str
+    blocks: list[str]
+    postamble: str
+
+
+SNAPSHOT_TRAILER_COMMENT = (
+    "\n// To add another monthly snapshot, append another object here, e.g.:"
+    "\n// , { date: \"YYYY-MM-DD\", federalExcise: 0.184, "
+    "federalSource: \"...\", ... data: [ ... ] }\n"
+)
+
+
+def parse_snapshots(html_text: str) -> Snapshots:
+    array_pattern = re.compile(
+        r"const SNAPSHOTS = \[\n([\s\S]*?)\n?\];\n",
+        re.M,
+    )
+    matches = list(array_pattern.finditer(html_text))
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected exactly one SNAPSHOTS array, found {len(matches)}"
+        )
+    array_body = matches[0].group(1)
+    blocks = _extract_objects(array_body)
+    return Snapshots(
+        preamble=html_text[:matches[0].start()],
+        blocks=blocks,
+        postamble=html_text[matches[0].end():],
+    )
+
+
+def _extract_objects(text: str) -> list[str]:
+    """Return the top-level {...} objects in text, ignoring those inside
+    string literals or // line comments."""
+    blocks: list[str] = []
+    i = 0
+    depth = 0
+    start = -1
+    in_string = False
+    while i < len(text):
+        c = text[i]
+        if in_string:
+            if c == "\\":
+                i += 2
+                continue
+            if c == "\"":
+                in_string = False
+            i += 1
+            continue
+        if c == "\"":
+            in_string = True
+            i += 1
+            continue
+        if c == "/" and i + 1 < len(text) and text[i + 1] == "/":
+            nl = text.find("\n", i)
+            i = (nl + 1) if nl >= 0 else len(text)
+            continue
+        if c == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                blocks.append(text[start:i + 1])
+                start = -1
+        i += 1
+    return blocks
+
+
+def render_snapshots(snapshots: Snapshots) -> str:
+    body = ",\n".join(snapshots.blocks)
+    return (
+        snapshots.preamble
+        + "const SNAPSHOTS = [\n"
+        + body
+        + SNAPSHOT_TRAILER_COMMENT
+        + "];\n"
+        + snapshots.postamble
+    )
+
+
+def find_block_for_date(blocks: list[str], iso_date: str) -> str | None:
+    needle = f'date: "{iso_date}"'
+    for b in blocks:
+        if needle in b:
+            return b
+    return None
+
+
+def insert_in_date_order(blocks: list[str], new_block: str,
+                         new_iso: str) -> list[str]:
+    out: list[str] = []
+    inserted = False
+    for b in blocks:
+        m = re.search(r'date: "(\d{4}-\d{2}-\d{2})"', b)
+        if not m:
+            continue
+        existing = m.group(1)
+        if not inserted and new_iso > existing:
+            out.append(new_block)
+            inserted = True
+        out.append(b)
+    if not inserted:
+        out.append(new_block)
+    return out
+
+
+def extract_data_block(snapshot_block: str) -> str:
+    m = re.search(
+        r"  data: \[\n([\s\S]*?)\n  \]\n\}\s*\Z",
+        snapshot_block,
+    )
+    if not m:
+        raise RuntimeError("could not extract data array from snapshot block")
+    return m.group(1) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Snapshot construction
+# ---------------------------------------------------------------------------
+
+def split_state_blocks(text: str) -> list[tuple[str, str]]:
+    starts = [m.start() for m in re.finditer(r'^  \{ code:"', text, re.M)]
+    if not starts:
+        raise RuntimeError("no per-state blocks found")
+    out: list[tuple[str, str]] = []
+    for i, s in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        chunk = text[s:end]
+        m = re.match(r'  \{ code:"([A-Z]{2})"', chunk)
+        if not m:
+            raise RuntimeError(f"bad per-state block prefix: {chunk[:60]!r}")
+        out.append((m.group(1), chunk))
+    return out
+
+
+def replace_retail(chunk: str, retail: float) -> str:
+    return re.sub(
+        r"retail:\s*[0-9.]+,",
+        f"retail:{retail:.3f},",
+        chunk, count=1,
+    )
+
+
+def swap_nontax(chunk: str, replacement: str) -> str:
+    i = chunk.index("nontax:{")
+    depth = 0
+    j = i
+    while j < len(chunk):
+        c = chunk[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        j += 1
+    return chunk[:i] + replacement + chunk[j:]
+
+
+def build_ca_nontax(d: date, lcfs: LcfsWeek,
+                    cca: AuctionSettlement) -> str:
+    lcfs_pass = round(lcfs.vwap_per_mt * LCFS_FACTOR, 4)
+    cca_pass = round(cca.price * CCA_FACTOR_MT_PER_GAL, 4)
+    total = round(lcfs_pass + cca_pass, 4)
+    return (
+        f"nontax:{{ total:{total:.4f}, parts:[\n"
+        f"      {{n:\"LCFS pass-through\", v:{lcfs_pass:.4f}, "
+        f"src:\"https://ww2.arb.ca.gov/resources/documents/"
+        f"weekly-lcfs-credit-transfer-activity-reports\", "
+        f"note:\"Credit ${lcfs.vwap_per_mt:.2f}/MT (week of "
+        f"{lcfs.monday.isoformat()}) {TIMES} {LCFS_FACTOR:.6f}\"}},\n"
+        f"      {{n:\"Cap-and-Trade pass-through\", v:{cca_pass:.4f}, "
+        f"src:\"https://ww2.arb.ca.gov/our-work/programs/"
+        f"cap-and-trade-program/auction-information\", "
+        f"note:\"${cca.price:.2f}/allowance ({cca.label}) {TIMES} "
+        f"{CCA_FACTOR_MT_PER_GAL} MT/gal\"}}"
+        f"], asOf:\"{d.isoformat()}\"}}"
+    )
+
+
+def build_or_nontax(month: OrCfpMonth) -> str:
+    pass_through = round(month.vwap_per_credit * OR_FACTOR, 4)
+    return (
+        f"nontax:{{ total:{pass_through:.4f}, parts:[\n"
+        f"      {{n:\"Clean Fuels Program credit pass-through\", "
+        f"v:{pass_through:.4f}, "
+        f"src:\"https://www.oregon.gov/deq/ghgp/cfp/pages/monthly-data.aspx\", "
+        f"note:\"OR CFP {month.year_month} VWAP "
+        f"${month.vwap_per_credit:.2f}/credit {TIMES} {OR_FACTOR:.6f} "
+        f"(factor anchored to existing snapshot Jan 2025)\"}}"
+        f"], asOf:\"{month.year_month}\"}}"
+    )
+
+
+def build_wa_nontax(wa: AuctionSettlement) -> str:
+    pass_through = round(wa.price * WA_FACTOR, 4)
+    return (
+        f"nontax:{{ total:{pass_through:.4f}, parts:[\n"
+        f"      {{n:\"Climate Commitment Act allowance pass-through\", "
+        f"v:{pass_through:.4f}, "
+        f"src:\"https://ecology.wa.gov/air-climate/climate-commitment-act/"
+        f"cap-and-invest/auctions-and-market\", "
+        f"note:\"${wa.price:.2f}/allowance ({wa.label}) {TIMES} "
+        f"{WA_FACTOR:.5f} (factor anchored to existing snapshot Mar 2026)\"}}"
+        f"], asOf:\"{wa.effective.isoformat()}\"}}"
+    )
+
+
+def replace_in_adval(chunk: str, d: date, retail: float) -> str:
+    in_suspension = IN_SUSPENSION_START <= d <= IN_SUSPENSION_END
+    if in_suspension:
+        new_adval = (
+            "adval:{ pct:0, parts:[\n"
+            "      {n:\"Gasoline use tax (7%): SUSPENDED Apr 8 - May 8, 2026\", "
+            f"rate:\"7% {TIMES} retail (suspended)\", effCents:0, "
+            "src:\"https://www.in.gov/dor/i-am-a/business-corp/gasoline-use-tax/\", "
+            "note:\"In suspension window\""
+            f"}}], asOf:\"{d.isoformat()}\"}}"
+        )
+    else:
+        eff_cents = round(0.07 * retail, 4)
+        new_adval = (
+            "adval:{ pct:7.0, parts:[\n"
+            "      {n:\"Gasoline use tax (7% of retail)\", "
+            f"rate:\"7% {TIMES} retail\", effCents:{eff_cents:.4f}, "
+            "src:\"https://www.in.gov/dor/i-am-a/business-corp/gasoline-use-tax/\""
+            f"}}], asOf:\"{d.isoformat()}\"}}"
+        )
+    new_chunk = re.sub(
+        r"adval:\{.*?\},(?=\s*\n\s*nontax)",
+        new_adval + ",",
+        chunk, count=1, flags=re.S,
+    )
+    if not in_suspension:
+        new_chunk = re.sub(
+            r',\s*flag:"GUT suspended through 2026-05-08"',
+            "", new_chunk, count=1,
+        )
+    return new_chunk
+
+
+def build_data_block(baseline_data: str, target: date,
+                     retail: dict[str, float], lcfs: LcfsWeek,
+                     cca: AuctionSettlement, wa: AuctionSettlement,
+                     orm: OrCfpMonth) -> str:
+    blocks = split_state_blocks(baseline_data)
+    out: list[str] = []
+    for code, chunk in blocks:
+        if code not in retail:
+            raise RuntimeError(f"missing retail price for {code}")
+        chunk = replace_retail(chunk, retail[code])
+        if code == "CA":
+            chunk = swap_nontax(chunk, build_ca_nontax(target, lcfs, cca))
+        elif code == "OR":
+            chunk = swap_nontax(chunk, build_or_nontax(orm))
+        elif code == "WA":
+            chunk = swap_nontax(chunk, build_wa_nontax(wa))
+        elif code == "IN":
+            chunk = replace_in_adval(chunk, target, retail["IN"])
+        out.append(chunk)
+    return "".join(out)
+
+
+def build_snapshot_object(target: date, baseline_block: str,
+                          retail: dict[str, float], lcfs: LcfsWeek,
+                          cca: AuctionSettlement, wa: AuctionSettlement,
+                          orm: OrCfpMonth) -> str:
+    baseline_data = extract_data_block(baseline_block)
+    body = build_data_block(baseline_data, target, retail, lcfs, cca, wa, orm)
+    notes = (
+        "Auto-generated weekly snapshot. Retail (col 2) from live AAA "
+        f"state-averages page on {target.isoformat()}. State taxes (cols 3-4) "
+        f"inherited from {BASELINE_DATE} baseline. Non-tax pass-throughs: "
+        f"CA LCFS week of {lcfs.monday.isoformat()} "
+        f"(${lcfs.vwap_per_mt:.2f}/MT); CA cap-and-trade {cca.label}; "
+        f"WA CCA {wa.label}; OR CFP {orm.year_month} "
+        f"(${orm.vwap_per_credit:.2f}/credit). IN gasoline use tax handled "
+        "per-date."
+    )
+    return (
+        "{\n"
+        f"  date: \"{target.isoformat()}\",\n"
+        "  federalExcise: 0.184,\n"
+        "  federalSource: \"https://www.irs.gov/publications/p510\",\n"
+        "  federalVintage: \"Unchanged since 1993; current per IRS Pub 510 "
+        "(2025). 18.3 cents excise + 0.1 cent LUST = 18.4 cents.\",\n"
+        f"  aaaUrl: \"{AAA_URL}\",\n"
+        f"  notes: \"{notes}\",\n"
+        "  data: [\n"
+        f"{body}"
+        "  ]\n"
+        "}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sanity checks
+# ---------------------------------------------------------------------------
+
+def sanity_check_snapshot(snapshot: str, target: date) -> None:
+    n_states = len(re.findall(r'^  \{ code:"', snapshot, re.M))
+    if n_states != 51:
+        raise RuntimeError(f"sanity: expected 51 states, got {n_states}")
+    m = re.search(r'date: "(\d{4}-\d{2}-\d{2})"', snapshot)
+    if not m or m.group(1) != target.isoformat():
+        raise RuntimeError("sanity: date in built block does not match target")
+    retail_values = [float(v) for v in re.findall(
+        r"retail:([0-9]+\.[0-9]+),", snapshot)]
+    if len(retail_values) != 51:
+        raise RuntimeError(
+            f"sanity: expected 51 retail values, got {len(retail_values)}")
+    if not all(1.0 < v < 12.0 for v in retail_values):
+        bad = [v for v in retail_values if not (1.0 < v < 12.0)]
+        raise RuntimeError(f"sanity: retail values outside plausible range: {bad}")
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+        stream=sys.stderr,
+    )
+
+
+def backup_html(html: Path) -> Path:
+    state_dir = Path.home() / ".local" / "state" / "gas-prices-breakdown"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    backup = state_dir / (
+        f"backup-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.html"
+    )
+    shutil.copy(html, backup)
+    return backup
+
+
+def write_with_canonical_mode(path: Path, content: str) -> None:
+    """Write content to path and force the result to mode 0644.
+
+    Path.write_text preserves the existing file's permissions when truncating
+    in place, which can leak whatever mode the file happened to have on disk.
+    All subcommand outputs are intended to be world-readable artifacts, so we
+    normalize on every write."""
+    path.write_text(content)
+    path.chmod(0o644)
+
+
+def block_summary(block: str) -> tuple[str, int, str]:
+    date_match = re.search(r'date: "(\d{4}-\d{2}-\d{2})"', block)
+    iso_date = date_match.group(1) if date_match else "?"
+    n_states = len(re.findall(r'^  \{ code:"', block, re.M))
+    notes_match = re.search(r'notes:\s*"((?:[^"\\]|\\.)*)"', block)
+    notes = notes_match.group(1) if notes_match else ""
+    if len(notes) > 80:
+        notes = notes[:77] + "..."
+    return iso_date, n_states, notes
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: list-snapshots
+# ---------------------------------------------------------------------------
+
+def cmd_list_snapshots(args: argparse.Namespace) -> int:
+    text = args.html.read_text()
+    snapshots = parse_snapshots(text)
+    print(f"{len(snapshots.blocks)} snapshots in {args.html}:")
+    print(f"  {'date':10s}  {'states':>6s}  notes")
+    print(f"  {'-' * 10}  {'-' * 6}  {'-' * 60}")
+    for block in snapshots.blocks:
+        iso_date, n_states, notes = block_summary(block)
+        print(f"  {iso_date:10s}  {n_states:>6d}  {notes}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: add-snapshot
+# ---------------------------------------------------------------------------
+
+def cmd_add_snapshot(args: argparse.Namespace) -> int:
+    setup_logging()
+    target = args.target or most_recent_thursday()
+    log.info("target snapshot date: %s (%s)", target, target.strftime("%a"))
+
+    cache_dir = Path.home() / ".cache" / "gas-prices-breakdown"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    html_text = args.html.read_text()
+    snapshots = parse_snapshots(html_text)
+    log.info("loaded %d existing snapshots from %s",
+             len(snapshots.blocks), args.html)
+
+    if find_block_for_date(snapshots.blocks, target.isoformat()):
+        log.info("snapshot for %s already present; nothing to do", target)
+        return 0
+
+    baseline = find_block_for_date(snapshots.blocks, args.baseline)
+    if baseline is None:
+        log.error("baseline snapshot %s not found", args.baseline)
+        return 2
+
+    log.info("fetching AAA retail (live)...")
+    retail = fetch_aaa_retail()
+    log.info("AAA: %d states; CA $%.2f, US-min $%.2f, US-max $%.2f",
+             len(retail), retail["CA"],
+             min(retail.values()), max(retail.values()))
+
+    log.info("fetching CARB LCFS weekly...")
+    lcfs = fetch_lcfs_for_target_date(target, cache_dir)
+    log.info("CARB LCFS: week of %s VWAP $%.2f/MT (xlsx %s)",
+             lcfs.monday, lcfs.vwap_per_mt, lcfs.source_xlsx_url)
+
+    cca = latest_auction(CARB_CCA_AUCTIONS, target)
+    log.info("CARB CCA: %s, $%.2f/allowance", cca.label, cca.price)
+    if (target - cca.effective).days > CCA_STALE_DAYS:
+        log.warning(
+            "CARB CCA settlement is %d days old (newer auction may exist; "
+            "update CARB_CCA_AUCTIONS)",
+            (target - cca.effective).days,
+        )
+
+    wa = latest_auction(WA_CCA_AUCTIONS, target)
+    log.info("WA CCA: %s, $%.2f/allowance", wa.label, wa.price)
+    if (target - wa.effective).days > CCA_STALE_DAYS:
+        log.warning(
+            "WA CCA settlement is %d days old (newer auction may exist; "
+            "update WA_CCA_AUCTIONS)",
+            (target - wa.effective).days,
+        )
+
+    log.info("fetching Oregon CFP...")
+    orm = fetch_or_cfp_for_target_date(target, cache_dir)
+    log.info("OR CFP: %s VWAP $%.2f/credit",
+             orm.year_month, orm.vwap_per_credit)
+
+    new_block = build_snapshot_object(target, baseline, retail,
+                                      lcfs, cca, wa, orm)
+    sanity_check_snapshot(new_block, target)
+
+    snapshots.blocks = insert_in_date_order(
+        snapshots.blocks, new_block, target.isoformat())
+    new_html = render_snapshots(snapshots)
+
+    if args.dry_run:
+        log.info("dry-run: would write %d bytes (was %d); not modifying file",
+                 len(new_html), len(html_text))
+        return 0
+
+    backup = backup_html(args.html)
+    log.info("backed up to %s", backup)
+    write_with_canonical_mode(args.html, new_html)
+    log.info("wrote %d bytes (%d snapshots in array)",
+             len(new_html), len(snapshots.blocks))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: remove-snapshot
+# ---------------------------------------------------------------------------
+
+def cmd_remove_snapshot(args: argparse.Namespace) -> int:
+    setup_logging()
+    text = args.html.read_text()
+    snapshots = parse_snapshots(text)
+
+    needle = f'date: "{args.snapshot_date}"'
+    matching = [b for b in snapshots.blocks if needle in b]
+    if not matching:
+        log.error("no snapshot found with date %s in %s",
+                  args.snapshot_date, args.html)
+        return 2
+    if len(matching) > 1:
+        log.warning("found %d blocks matching date %s; removing all",
+                    len(matching), args.snapshot_date)
+
+    snapshots.blocks = [b for b in snapshots.blocks if needle not in b]
+    new_html = render_snapshots(snapshots)
+
+    if args.dry_run:
+        log.info(
+            "dry-run: would remove %d snapshot(s) for %s; %d would remain",
+            len(matching), args.snapshot_date, len(snapshots.blocks),
+        )
+        return 0
+
+    backup = backup_html(args.html)
+    log.info("backed up to %s", backup)
+    write_with_canonical_mode(args.html, new_html)
+    log.info("removed %d snapshot(s) for %s; %d remain",
+             len(matching), args.snapshot_date, len(snapshots.blocks))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: extract-markdown
+# ---------------------------------------------------------------------------
+
+def cmd_extract_markdown(args: argparse.Namespace) -> int:
+    text = args.html.read_text()
+    match = re.search(r'const SPEC_MD = `([\s\S]*?)`;', text)
+    if not match:
+        print(f"SPEC_MD not found in {args.html}", file=sys.stderr)
+        return 2
+    # Reverse JS template-literal escapes: any '\X' in the source represents
+    # 'X' in the rendered string. Backticks and dollar-signs (the two
+    # template-literal sentinels) commonly appear escaped; '\\' compresses
+    # to '\' for any literal backslashes the spec text contains.
+    md = re.sub(r"\\(.)", lambda m: m.group(1), match.group(1))
+    if args.output is None:
+        sys.stdout.write(md)
+        if not md.endswith("\n"):
+            sys.stdout.write("\n")
+    else:
+        write_with_canonical_mode(
+            args.output,
+            md if md.endswith("\n") else md + "\n",
+        )
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    p_list = sub.add_parser("list-snapshots",
+                            help="list snapshots in the SNAPSHOTS array")
+    p_list.add_argument("html", type=Path,
+                        help="path to gas-price-breakdown.html")
+    p_list.set_defaults(func=cmd_list_snapshots)
+
+    p_add = sub.add_parser("add-snapshot",
+                           help="fetch live data and append a new snapshot")
+    p_add.add_argument("html", type=Path,
+                       help="path to gas-price-breakdown.html")
+    p_add.add_argument("--target", type=date.fromisoformat, default=None,
+                       help="target snapshot date (default: most recent Thursday)")
+    p_add.add_argument("--baseline", default=BASELINE_DATE,
+                       help="snapshot to inherit state-tax structure from")
+    p_add.add_argument("--dry-run", action="store_true",
+                       help="fetch and build but do not modify the HTML")
+    p_add.set_defaults(func=cmd_add_snapshot)
+
+    p_rm = sub.add_parser("remove-snapshot",
+                          help="remove a snapshot by its date")
+    p_rm.add_argument("html", type=Path,
+                      help="path to gas-price-breakdown.html")
+    p_rm.add_argument("snapshot_date", metavar="SNAPSHOT_DATE",
+                      help="ISO date of the snapshot to remove (e.g. 2026-04-09)")
+    p_rm.add_argument("--dry-run", action="store_true",
+                      help="report what would be removed without modifying the HTML")
+    p_rm.set_defaults(func=cmd_remove_snapshot)
+
+    p_md = sub.add_parser("extract-markdown",
+                          help="write the embedded SPEC_MD to stdout or a file")
+    p_md.add_argument("html", type=Path,
+                      help="path to gas-price-breakdown.html")
+    p_md.add_argument("--output", type=Path, default=None,
+                      help="write to this path (default: stdout)")
+    p_md.set_defaults(func=cmd_extract_markdown)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
