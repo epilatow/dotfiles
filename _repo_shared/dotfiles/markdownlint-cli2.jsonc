@@ -1,0 +1,23 @@
+// markdownlint-cli2 entry point. The lint-rule config lives in
+// `.markdownlint.json`; this file controls only what cli2 walks:
+// globs + ignores, plus the custom-rule registration below.
+{
+  "config": ".markdownlint.json",
+  "globs": ["**/*.md"],
+  "ignores": [
+    "node_modules/",
+    ".venv/",
+    ".pytest_cache/",
+    ".claude/",
+    "tmp/",
+    "**/tmp/",
+    "**/.cache/",
+    "_repo_shared/"
+  ],
+  // Custom rules shipped by repo-shared. The rule's resolved path
+  // is the canonical-path symlink that the dotfiles kind installs
+  // alongside `.markdownlint.json` and this file.
+  "customRules": [
+    "./.markdownlint-rule-no-squashed-file-references.mjs"
+  ]
+}

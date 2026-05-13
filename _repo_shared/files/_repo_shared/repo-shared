@@ -1,0 +1,16 @@
+#!/bin/bash
+# Wrapper that runs the repo-shared CLI against the project rooted at
+# the parent directory of this script's location. Two install sites:
+#
+# - In repo-shared itself, symlinked at bin/repo-shared. Resolves to the
+#   repo-shared root, which has its own pyproject.toml.
+# - In a consumer repo, vendored at _repo_shared/repo-shared. Resolves
+#   to the consumer's root, which has a pyproject.toml that pins
+#   epilatow-repo-shared as a dep; uv runs that pinned version.
+#
+# In both cases, no GitHub fetch happens at run time -- uv resolves the
+# project's local pyproject.toml + uv.lock.
+set -e
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT="$(dirname "$HERE")"
+exec uv run --project "$PROJECT" repo-shared "$@"

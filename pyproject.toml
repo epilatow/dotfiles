@@ -1,0 +1,14 @@
+[project]
+name = "dotfiles"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "epilatow-repo-shared",
+    "pytest>=9.0.3",
+]
+
+[tool.uv.sources]
+epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = "6a008dc01c79947f820fd25bc9e9cce7e0a0f9e0" }
+
+[tool.pytest.ini_options]
+testpaths = ["_repo_shared/tests"]
