@@ -63,6 +63,12 @@ command   = "cd $REPO && git pull"
 gate      = "test -d $REPO"
 env.REPO  = "$HOME/src/github.com/epilatow/dotfiles"
 
+[job.u-repo-repo-shared]
+command   = "cd $REPO && git pull"
+gate      = "test -d $REPO"
+env.REPO  = "$HOME/src/github.com/epilatow/repo-shared"
+hosts     = ["squee"]
+
 [job.u-repo-links]
 command   = "binfiles install && dotfiles install"
 env.PATH  = "$PATH:$HOME/.local/bin"
@@ -86,13 +92,44 @@ hosts     = ["squee"]
 [job.u-www-dpmr-calendar]
 script    = "~/.local/libexec/dpmr-calendar-scrape/dpmr-calendar-scrape"
 args      = ["~/home/public_html/donner-party-mountain-runners.ics"]
-gate      = "test -d $HOME/dotfiles"
 env.PATH  = "$PATH:$HOME/.local/bin"
 hosts     = ["squee"]
 
 [job.u-www-push]
 script    = "$HOME/home/bin/publish_html.sh"
 hosts     = ["squee"]
+
+[job.u-rs-self]
+command     = '. "$NVM_DIR/nvm.sh" && cd $REPO && ./bin/repo-shared upgrade-tools --push'
+gate        = "test -d $REPO"
+env.REPO    = "$HOME/src/github.com/epilatow/repo-shared"
+env.PATH    = "$PATH:$HOME/.local/bin"
+env.NVM_DIR = "$HOME/.nvm"
+hosts       = ["squee"]
+
+[job.u-rs-dotfiles]
+command     = '. "$NVM_DIR/nvm.sh" && cd $REPO && ./_repo_shared/repo-shared upgrade --push'
+gate        = "test -d $REPO"
+env.REPO    = "$HOME/src/github.com/epilatow/dotfiles"
+env.PATH    = "$PATH:$HOME/.local/bin"
+env.NVM_DIR = "$HOME/.nvm"
+hosts       = ["squee"]
+
+[job.u-rs-ha-bt]
+command     = '. "$NVM_DIR/nvm.sh" && cd $REPO && ./_repo_shared/repo-shared upgrade --push'
+gate        = "test -d $REPO"
+env.REPO    = "$HOME/src/github.com/epilatow/ha-blueprint-toolkit"
+env.PATH    = "$PATH:$HOME/.local/bin"
+env.NVM_DIR = "$HOME/.nvm"
+hosts       = ["squee"]
+
+[job.u-rs-utils]
+command     = '. "$NVM_DIR/nvm.sh" && cd $REPO && ./_repo_shared/repo-shared upgrade --push'
+gate        = "test -d $REPO"
+env.REPO    = "$HOME/src/github.com/epilatow/utils"
+env.PATH    = "$PATH:$HOME/.local/bin"
+env.NVM_DIR = "$HOME/.nvm"
+hosts       = ["squee"]
 
 # ----------------------------------------------------------------------------
 # job-group sections
@@ -105,18 +142,21 @@ jobs     = ["u-oss-nvm", "u-oss-rust", "u-oss-uv", "u-oss-brew"]
 
 [job-group.u-weekly]
 schedule = "Mon *-*-* 02:00"
-jobs     = ["u-oss", "u-www-gas-prices-breakdown"]
+jobs     = ["u-oss"]
+
+[job-group.u-rs]
+jobs     = ["u-rs-self", "u-rs-dotfiles", "u-rs-ha-bt", "u-rs-utils"]
 
 [job-group.u-repos]
-jobs     = ["u-repo-utils", "u-repo-dotfiles", "u-repo-links"]
+jobs     = ["u-repo-utils", "u-repo-dotfiles", "u-repo-links", "u-repo-repo-shared"]
 
 [job-group.u-www]
-jobs     = ["u-www-cocktails", "u-www-recipes", "u-www-dpmr-calendar", "u-www-push"]
+jobs     = ["u-www-cocktails", "u-www-recipes", "u-www-dpmr-calendar", "u-www-gas-prices-breakdown", "u-www-push"]
 hosts    = ["squee"]
 
 [job-group.u-daily]
 schedule = "*-*-* 02:30"
-jobs     = ["u-repos", "u-www"]
+jobs     = ["u-repos", "u-rs", "u-www"]
 
 # ----------------------------------------------------------------------------
 # target sections
