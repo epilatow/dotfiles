@@ -9,6 +9,8 @@
   a guess or the price you remember, so please search online for recent data,
   including MSRP and acutal prices when available.
 
+@CLAUDE-PRIVATE.md
+
 @DEVELOPMENT_SHARED.md
 
-@CLAUDE-PRIVATE.md
+@DEVELOPMENT_SHARED_AGENT.md
