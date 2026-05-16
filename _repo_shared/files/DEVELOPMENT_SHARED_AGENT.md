@@ -56,30 +56,38 @@ blocks resolved by `uv` per-run; if a tool needs a dep, add it to the script's
 PEP 723 preamble or run via `uvx <tool>`. The user's system and per-user Python
 environments are off-limits.
 
-## Killing processes
+## Process management
 
-Never use `pkill`, `killall`, or any pattern-matching kill (`pgrep -K`,
-`ps ... | xargs kill`, etc.). Use `kill <PID>` only with PIDs you've confirmed
-your own session spawned. Pattern-matching kills run against the whole system:
-a `pkill -f pytest` issued from one agent's session can take out a pytest run
-the user started in their own terminal, a long-running test loop in another
-agent's parallel worktree on the same repo, or an unrelated process whose
-command line happens to contain the same substring. None of those are
-recoverable from inside the killing session.
+Spawn background processes in a new process group so the whole subtree carries
+a single kernel-recorded tag you set yourself. On Linux:
+`setsid <tool> ... & SPAWN_PID=$!`. On macOS: `setsid -f <tool> ...`. The pgid
+equals the leader PID, so `kill -- -<pgid>` later signals every process in the
+group atomically, and a subprocess can't escape the group without explicitly
+calling `setpgid()` itself.
 
-When a process you spawned hangs:
+Record the PID and pgid at launch time -- capture the background-task tool's
+return, save `$!` for shell spawns, note any `--pidfile` path the tool wrote.
+That record is what authorizes a later kill.
 
-- Track PIDs at the point you launch them -- capture the return from the
-  background-task tool, save the task ID, or note the PID from the shell-output
-  you can see -- so a later kill targets only what you own.
-- Run `kill <PID>` (or `kill -9 <PID>` if the gentle signal didn't take)
-  against those specific PIDs.
-- Don't widen the search to "anything that looks like the tool I just ran." The
-  same tool name almost certainly belongs to someone else on a shared
-  development machine.
+**Only kill processes whose ancestry traces back to your session, or whose pgid
+matches a process group you spawned.** Anything else is off-limits. On a shared
+developer machine, a process with a matching name routinely belongs to the
+user's browser, editor, another agent session, or an in-flight test the user
+started; killing it is unrecoverable from inside the killing session.
 
-If you genuinely lost track of which PIDs are yours, stop and ask the user
-rather than pattern-killing on a guess.
+That rules out any kill target derived from a resource-sharing query -- name,
+command-line substring, port, open file, working directory. The following are
+banned no matter how narrowly scoped they look:
+
+- `pkill <anything>`, `pkill -f <anything>`, `killall <anything>`.
+- `pgrep <name-pattern> | xargs kill`, `ps ... | grep ... | xargs kill`.
+- `lsof -ti <port-or-file> | xargs kill`, `fuser -k <port-or-file>`.
+- Any pipeline of shape `<resource-match-query> | <kill>`.
+
+If you lost track of the PID and pgid for something you spawned -- e.g. a
+self-detaching tool launched without `setsid` and without capturing its
+PID-bearing output -- stop and ask the user rather than fall back to a
+resource-match query.
 
 ## Doc-sync is non-negotiable
 
