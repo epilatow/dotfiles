@@ -134,10 +134,10 @@ suggested follow-up; don't use it to excuse skipping the in-scope work.
 
 ### Never push without explicit per-action approval
 
-Local commits and ff-merge to local `master` / `main` are fine. `git push` is
-not. The user reviews each commit and authorizes the push. This applies to
-every commit, including amended ones from code-review feedback. A user
-authorizing one push does not authorize subsequent pushes.
+Local commits and ff-merge to local `main` are fine. `git push` is not. The
+user reviews each commit and authorizes the push. This applies to every commit,
+including amended ones from code-review feedback. A user authorizing one push
+does not authorize subsequent pushes.
 
 ### Reviewing commits with `npx difit`
 

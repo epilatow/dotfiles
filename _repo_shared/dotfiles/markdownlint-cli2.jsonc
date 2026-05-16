@@ -12,7 +12,8 @@
     "tmp/",
     "**/tmp/",
     "**/.cache/",
-    "_repo_shared/"
+    "_repo_shared/",
+    ".wt/"
   ],
   // Custom rules shipped by repo-shared. The rule's resolved path
   // is the canonical-path symlink that the dotfiles kind installs
