@@ -53,23 +53,7 @@ gate        = "command -v uv"
 env.PATH    = "$PATH:$HOME/.local/bin"
 env.TMPDIR  = "$HOME/.local/tmp"
 
-[job.u-repo-utils]
-command   = "cd $REPO && git pull"
-gate      = "test -d $REPO"
-env.REPO  = "$HOME/src/github.com/epilatow/utils"
-
-[job.u-repo-dotfiles]
-command   = "cd $REPO && git pull"
-gate      = "test -d $REPO"
-env.REPO  = "$HOME/src/github.com/epilatow/dotfiles"
-
-[job.u-repo-repo-shared]
-command   = "cd $REPO && git pull"
-gate      = "test -d $REPO"
-env.REPO  = "$HOME/src/github.com/epilatow/repo-shared"
-hosts     = ["squee"]
-
-[job.u-www-gas-prices-breakdown]
+[job.u-www-gas-prices]
 script    = "~/.local/libexec/gas-prices-breakdown/gas-prices-breakdown"
 args      = ["add-snapshot", "~/home/public_html/gas-prices-breakdown.html"]
 env.PATH  = "$PATH:$HOME/.local/bin"
@@ -85,7 +69,7 @@ script    = "$HOME/home/bin/publish_recipes.sh"
 env.PATH  = "$PATH:/opt/local/bin"
 hosts     = ["squee"]
 
-[job.u-www-dpmr-calendar]
+[job.u-www-dpmr-cal]
 script    = "~/.local/libexec/dpmr-calendar-scrape/dpmr-calendar-scrape"
 args      = ["~/home/public_html/donner-party-mountain-runners.ics"]
 env.PATH  = "$PATH:$HOME/.local/bin"
@@ -127,18 +111,6 @@ env.PATH    = "$PATH:$HOME/.local/bin"
 env.NVM_DIR = "$HOME/.nvm"
 hosts       = ["squee"]
 
-[job.u-misc-dotfiles]
-command   = "dotfiles install"
-env.PATH  = "$PATH:$HOME/.local/bin"
-
-[job.u-misc-binfiles]
-command   = "binfiles install"
-env.PATH  = "$PATH:$HOME/.local/bin"
-
-[job.u-misc-crony]
-command   = "crony apply"
-env.PATH  = "$PATH:$HOME/.local/bin"
-
 [job.u-misc-tz]
 command   = "darwin-tz-watchdog"
 env.PATH  = "$PATH:$HOME/.local/bin"
@@ -160,19 +132,16 @@ jobs     = ["u-oss"]
 [job-group.u-rs]
 jobs     = ["u-rs-self", "u-rs-dotfiles", "u-rs-ha-bt", "u-rs-utils"]
 
-[job-group.u-repos]
-jobs     = ["u-repo-utils", "u-repo-dotfiles", "u-repo-repo-shared"]
-
 [job-group.u-www]
-jobs     = ["u-www-cocktails", "u-www-recipes", "u-www-dpmr-calendar", "u-www-gas-prices-breakdown", "u-www-push"]
+jobs     = ["u-www-cocktails", "u-www-recipes", "u-www-dpmr-cal", "u-www-gas-prices", "u-www-push"]
 hosts    = ["squee"]
 
 [job-group.u-misc]
-jobs     = ["u-misc-dotfiles", "u-misc-binfiles", "u-misc-crony", "u-misc-tz"]
+jobs     = ["u-misc-tz"]
 
 [job-group.u-daily]
 schedule = "*-*-* 02:30"
-jobs     = ["u-repos", "u-rs", "u-www", "u-misc"]
+jobs     = ["u-rs", "u-www", "u-misc"]
 
 # ----------------------------------------------------------------------------
 # target sections
