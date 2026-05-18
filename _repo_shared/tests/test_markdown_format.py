@@ -1,10 +1,11 @@
 # This is AI generated code
 """Consumer-local ``*.md`` real files match canonical mdformat output.
 
-Walks real-file ``*.md`` under the repo root, skipping symlinks (the
-canonical-path symlinks into ``_repo_shared/`` would double-count
-vendored content otherwise) and the ``_repo_shared/`` prefix itself
-(vendored content is gated by the drift test).
+Walks tracked real-file ``*.md`` under the repo root, plus a
+tracked-but-skip post-filter that defaults to ``_repo_shared/``
+(vendored content gated by the drift test) and skips symlinks
+(canonical-path symlinks into ``_repo_shared/`` would otherwise
+double-count vendored content).
 
 The subclass below picks up consumer-configured knobs from
 ``[tool.repo-shared.markdown]`` in the consumer's
@@ -12,8 +13,7 @@ The subclass below picks up consumer-configured knobs from
 
 - ``wrap`` (int, default 79) -- ``mdformat --wrap`` value.
 - ``extra-exclude-dirs`` (list[str], default ``[]``) -- appended
-  to the base default set; never replaces, so the shared baseline
-  (``_repo_shared/``, ``node_modules/`` etc.) keeps applying.
+  to the base default set.
 """
 
 from epilatow_repo_shared.config import markdown_overrides

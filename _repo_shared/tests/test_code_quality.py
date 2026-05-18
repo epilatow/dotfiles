@@ -1,11 +1,11 @@
 # This is AI generated code
 """Lint + type-check every Python file in the repo.
 
-Auto-discovers every ``.py`` under the consumer repo root (skipping
-``_repo_shared/``, ``.venv/``, ``__pycache__/``, ...). Each
-discovered file becomes one parametrize case per tool, with the
-file path as the pytest ID so failures point straight at the
-offending file.
+Discovers every tracked ``.py`` under the consumer repo root,
+plus a tracked-but-skip post-filter that defaults to
+``_repo_shared/``. Each discovered file becomes one parametrize
+case per tool, with the file path as the pytest ID so failures
+point straight at the offending file.
 
 Three consumer-side customisation knobs, all optional, all under
 ``[tool.repo-shared.code-quality]`` in pyproject:
@@ -14,10 +14,9 @@ Three consumer-side customisation knobs, all optional, all under
   file paths for extension-less shebang scripts (``bin/foo``) that
   ``rglob("*.py")`` cannot find. Discovery does not need pyproject
   configuration to cover regular ``.py`` files.
-- ``extra-exclude-dirs`` appends to the discovery exclude list
-  (which already covers ``_repo_shared/``, ``.venv/``,
-  ``__pycache__/``, etc.). Use to skip per-repo dirs like vendored
-  third-party Python or generated code.
+- ``extra-exclude-dirs`` appends to the base exclude list. Use to
+  skip tracked-but-skip dirs like vendored third-party Python or
+  generated code.
 - ``mypy-extra-deps`` + ``mypy-python-version`` supply project-wide
   fallback mypy ``--with`` deps / ``--python-version`` for files
   *without* a PEP 723 ``# /// script`` block. A file with PEP 723

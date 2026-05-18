@@ -154,12 +154,14 @@ to review a commit (or a stack), publish it with `npx difit`. `npx difit` runs
 a web server, so the command does not exit immediately -- run it in the
 background.
 
-### Worktrees go under `$REPO/.wt/`
+### All development work happens in a worktree under `$REPO/.wt/`
 
-When you need a `git worktree add` for an isolated development / build / test /
-debug cycle, put it at `$REPO/.wt/<purpose>` -- nested under the repo's own
-checkout. Be sure that .gitignore contains .wt/. Don't drop worktrees in
-`$REPO/../<repo>.wt/` or `~/worktrees/` -- those leak outside the repo's tree.
+Never edit the main checkout directly. Every develop / build / test / debug
+cycle runs in a `git worktree add` at `$REPO/.wt/<purpose>`, nested under the
+repo's own checkout. Be sure that .gitignore contains .wt/. After the work
+lands on `main`, remove the worktree and any branches you created as part of
+the development effort (but don't touch other branches which may belong to
+other users or agents).
 
 ### Stay in scope
 
