@@ -24,8 +24,8 @@ Three consumer-side customisation knobs, all optional, all under
 
 Adding a new module / script that needs project-wide-default mypy
 behavior just lands the file -- no pyproject edit needed. Files
-needing extra mypy deps put a PEP 723 block at the top instead of
-editing a centralised list.
+needing extra mypy deps carry a PEP 723 block (a top-level comment
+anywhere in the file) instead of editing a centralised list.
 """
 
 from __future__ import annotations
