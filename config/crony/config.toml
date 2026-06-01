@@ -31,31 +31,37 @@ headers                = { "Email" = "edp@drymartini.org" }
 # no schedule/interval is valid only if some [job-group.*] references
 # it (otherwise it can never fire).
 
-[job.u-oss-brew]
+[job.u-bins-brew]
 command     = "brew update && brew upgrade && brew cleanup"
 gate        = "command -v brew"
 env.PATH    = "$PATH:/opt/homebrew/bin"
 platforms   = ["darwin"]
 uuid = "681b903c-2a7b-460d-a940-10e267f8585f"
 
-[job.u-oss-nvm]
+[job.u-bins-nvm]
 command     = '. "$NVM_DIR/nvm.sh" && nvm install --lts --latest-npm --reinstall-packages-from=default'
 gate        = 'test -s "$NVM_DIR/nvm.sh"'
 env.NVM_DIR = "$HOME/.nvm"
 uuid = "5da77278-c34d-4167-ab27-b53af33d2a48"
 
-[job.u-oss-rust]
+[job.u-bins-rust]
 command     = "rustup self update && rustup update"
 gate        = "command -v rustup"
 env.PATH    = "$PATH:$HOME/.cargo/bin"
 uuid = "aaf152b9-04d9-408e-a401-0d6f9bb74b97"
 
-[job.u-oss-uv]
+[job.u-bins-uv]
 command     = "mkdir -p $TMPDIR && uv self update && uv tool upgrade --all"
 gate        = "command -v uv"
 env.PATH    = "$PATH:$HOME/.local/bin"
 env.TMPDIR  = "$HOME/.local/tmp"
 uuid = "de84320f-63a4-4b4e-98d5-51bbc708f5bf"
+
+[job.u-bins-claude]
+command     = "claude upgrade"
+gate        = "command -v claude"
+env.PATH    = "$PATH:$HOME/.local/bin"
+uuid        = "2cc62beb-6eca-4beb-91e4-136bd86a5dfe"
 
 [job.u-www-gas-prices]
 script    = "~/.local/libexec/gas-prices-breakdown/gas-prices-breakdown"
@@ -136,13 +142,13 @@ uuid = "ca506c3d-0026-4705-a09a-16ecf7881f6c"
 # A scheduled sequencer that fires named jobs in order. Has its own
 # schedule but no command/script of its own.
 
-[job-group.u-oss]
-jobs     = ["u-oss-nvm", "u-oss-rust", "u-oss-uv", "u-oss-brew"]
+[job-group.u-bins]
+jobs     = ["u-bins-nvm", "u-bins-rust", "u-bins-uv", "u-bins-brew", "u-bins-claude"]
 uuid = "ee2e73e4-f89d-4ebf-af65-6631b32b2365"
 
 [job-group.u-weekly]
 schedule = "Mon *-*-* 02:00"
-jobs     = ["u-oss"]
+jobs     = ["u-bins"]
 uuid = "8c5893d7-bea0-421f-9f95-d36b30775fe2"
 
 [job-group.u-rs]
