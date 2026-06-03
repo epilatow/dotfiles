@@ -304,6 +304,7 @@ if [ -d "/opt/homebrew" ]; then
 	export HOMEBREW_CELLAR="/opt/homebrew/Cellar";
 	export HOMEBREW_REPOSITORY="/opt/homebrew";
 	prepend_subdirs_to_pathvars /opt/homebrew
+	append_subdirs_to_pathvars $HOMEBREW_PREFIX/opt/util-linux linkok
 fi
 
 # ---------------------------------------------------------------------
