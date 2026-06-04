@@ -61,6 +61,13 @@ or side effects, or flag invariants the type system can't enforce.
 - Line wrap at 79 chars.
 - ruff and mypy compliant. Repos enforce this differently -- see the per-repo
   Testing section for how.
+- Unused function / method / lambda parameters are flagged (ruff's `ARG` rules,
+  part of the canonical default rule set). Remove a genuinely dead parameter;
+  for one that must stay (a callback signature, an interface override), prefix
+  it with `_` (e.g. `_event`) to silence the check. A pytest fixture requested
+  only for its side effect can't be underscored -- pytest resolves fixtures by
+  exact name -- so request it with `@pytest.mark.usefixtures("name")` and drop
+  the parameter, or suppress the single line with `# noqa: ARG001`.
 - Strongly typed. Avoid storing structured data in a `Dict` with `Any` values
   -- use a `TypedDict`, dataclass, or pydantic model instead.
 - All tools have well-defined return / exit values. A tool that surfaces
