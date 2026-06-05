@@ -179,6 +179,29 @@ When a doc contains both user-facing and developer-facing content, put user
 content first. Users don't care about the developer content and shouldn't have
 to wade through it; developers will read the whole thing regardless.
 
+## Keep implementation details at the implementation
+
+Implementation details belong in exactly one place: the implementation. A code
+comment describes what the code right next to it does. A function's docstring
+or summary describes how that function works and the contract it offers.
+Documentation written for *consumers* of that function -- its callers, the
+module-level overview, user-facing docs -- describes *what* it does and how to
+use it, never *how* it does it internally.
+
+Do not restate an implementation's behavior at the sites that consume it. When
+you add an abstraction -- a platform layer, a helper, a wrapper -- the
+per-platform or per-branch behavior lives in that layer's own body and
+docstring. It does not get copied into every caller's comments, the global
+module comment, and the user-facing docs. Smearing one detail across N
+consumers guarantees it rots: the implementation changes in one place, nobody
+audits the dozen paraphrases scattered across callers and docs, and they
+silently decay into lies.
+
+The test: if a comment or a doc paragraph describes behavior that lives in
+*other* code, it is at the wrong altitude. Push it down to that code, or
+replace it with the contract the consumer can rely on instead of the mechanism
+the callee uses to deliver it.
+
 ## Doc-sync rule
 
 **Documentation is part of the change, not a follow-up.** When code changes,

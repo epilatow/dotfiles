@@ -33,8 +33,8 @@ apply.
 - **Backups when debugging.** When debugging, if you're about to delete or
   significantly modify files, first make per-session timestamped backups
   including full host and path information -- e.g.
-  `tmp/backups/<host>/<YYYYMMDD-HHMMSS>/<full-path>` -- in case the originals
-  need to be restored.
+  `$REPO/tmp/backups/<host>/<YYYYMMDD-HHMMSS>/<full-path>` -- in case the
+  originals need to be restored.
 - **Match existing repo style.** Strive to be consistent in code style, form,
   and layout with what's already in the repo. When a recommendation in these
   shared instructions conflicts with the repo's actual practice, call out the
@@ -162,6 +162,14 @@ repo's own checkout. Be sure that .gitignore contains .wt/. After the work
 lands on `main`, remove the worktree and any branches you created as part of
 the development effort (but don't touch other branches which may belong to
 other users or agents).
+
+Development scratch -- plans, code-review write-ups, rejected-finding logs, any
+`tmp/` working document -- does NOT go inside the worktree. Write it to the
+main checkout's `$REPO/tmp/`, never `$REPO/.wt/<branch>/tmp/`. The worktree is
+torn down when the work lands, taking anything under it with it; a plan or
+review parked inside the worktree is lost on cleanup. The worktree holds only
+the code being developed -- the durable paper trail lives in the main
+checkout's `tmp/`.
 
 ### Stay in scope
 
@@ -313,8 +321,8 @@ user explicitly asks for it.
 
 After the review returns, address each finding directly in the commit (amend).
 Findings the agent chooses NOT to address get appended to
-`tmp/<slug>-code-review-rejected.md` with reasoning, so the rejected set stays
-visible for the user's review.
+`$REPO/tmp/<slug>-code-review-rejected.md` with reasoning, so the rejected set
+stays visible for the user's review.
 
 ### Zero-context review
 
@@ -333,11 +341,11 @@ neutrally; the review agent's job is to evaluate independently.
 1. Spawn the review subagent with the prompt below, substituting `<SHA>`. Hand
    the agent nothing else -- no extra framing, no "we already decided X", no
    hints about which findings would be welcome.
-2. Save the review to `tmp/<slug>-code-review.md` (or
-   `tmp/<slug>-code-review-N.md` for amend cycles).
+2. Save the review to `$REPO/tmp/<slug>-code-review.md` (or
+   `$REPO/tmp/<slug>-code-review-N.md` for amend cycles).
 3. Address findings. For each finding, either fix it in the commit (amend) or
-   append the rejected finding to `tmp/<slug>-code-review-rejected.md` with
-   reasoning on why it was rejected.
+   append the rejected finding to `$REPO/tmp/<slug>-code-review-rejected.md`
+   with reasoning on why it was rejected.
 
 ### The review prompt (verbatim)
 
@@ -403,9 +411,9 @@ Tag findings P1 (blocks) / P2 (must-fix-before-shipping)
 
 ### Valid vs. invalid rejection rationales
 
-A code-review finding can be appended to `tmp/<slug>-code-review-rejected.md`
-only when the reasoning holds up on its own merits. Examples of *valid*
-rejections:
+A code-review finding can be appended to
+`$REPO/tmp/<slug>-code-review-rejected.md` only when the reasoning holds up on
+its own merits. Examples of *valid* rejections:
 
 - The finding is genuinely out of the diff's blast radius (a different file the
   diff didn't touch, behavior the change doesn't affect).
