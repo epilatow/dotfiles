@@ -11,16 +11,16 @@
 # settings can override anything here.
 
 [defaults]
-notify_channels      = ["ntfy"]
-notify_attach_log    = true
-notify_attach_max_kb = 256
-# timeout_sec          = 3600         # default: 1800 sec (30 min)
-# log_keep_runs        = 30
+notify-channels      = ["ntfy"]
+notify-attach-log    = true
+notify-attach-max-kb = 256
+# timeout-sec          = 3600         # default: 1800 sec (30 min)
+# log-keep-runs        = 30
 
 [defaults.notify.ntfy]
 transport              = "ntfy"
 url                    = "https://ntfy.drymartini.org/automation-crony"
-token_file             = "~/.config/crony/secrets/ntfy-token"
+token-file             = "~/.config/crony/secrets/ntfy-token"
 headers                = { "Email" = "edp@drymartini.org" }
 
 # ----------------------------------------------------------------------------
@@ -39,7 +39,7 @@ platforms   = ["darwin"]
 uuid = "681b903c-2a7b-460d-a940-10e267f8585f"
 
 [job.u-bins-nvm]
-command     = '. "$NVM_DIR/nvm.sh" && nvm install --lts --latest-npm --reinstall-packages-from=default'
+command     = '. "$NVM_DIR/nvm.sh" && nvm install --lts --latest-npm --reinstall-packages-from=default && npm update -g'
 gate        = 'test -s "$NVM_DIR/nvm.sh"'
 env.NVM_DIR = "$HOME/.nvm"
 uuid = "5da77278-c34d-4167-ab27-b53af33d2a48"
