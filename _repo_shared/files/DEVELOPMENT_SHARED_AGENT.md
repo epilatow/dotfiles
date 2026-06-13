@@ -18,11 +18,10 @@ apply.
 - **Plan first.** Before making any changes, present a plan and wait for
   explicit approval. If the task changes mid-work or a new design discussion
   begins, stop making changes and return to planning.
-- **Test baseline before changes.** Check for any associated tests (test files
-  in `tests/`, a utility's `self-test` subcommand, etc.) and run them to
-  establish a baseline. Flag any pre-existing testing problems before
-  implementing planned changes -- a broken baseline affects how post-change
-  tests are interpreted.
+- **Test baseline before changes.** Check for any associated tests (e.g. test
+  files in `tests/`) and run them to establish a baseline. Flag any
+  pre-existing testing problems before implementing planned changes -- a broken
+  baseline affects how post-change tests are interpreted.
 - **Re-run after changes.** After modifying any code or utility, run the
   associated tests (or the full suite if it's fast enough) before considering
   the change complete.
