@@ -1,0 +1,1 @@
+../local/share/agents/SHARED.md

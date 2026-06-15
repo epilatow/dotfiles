@@ -1,0 +1,30 @@
+personality = "pragmatic"
+model = "gpt-5.5"
+model_reasoning_effort = "medium"
+project_doc_max_bytes = 50000
+[projects."/Users/edp/src/home_assistant"]
+trust_level = "trusted"
+
+[projects."/Users/edp/z/home-assistant-node-red-flows"]
+trust_level = "trusted"
+
+[projects."/Users/edp/src/estate_archives_update"]
+trust_level = "trusted"
+
+[projects."/Users/edp/src/secure_archiver"]
+trust_level = "trusted"
+
+[projects."/Users/edp/src/github.com/epilatow/ha-blueprint-toolkit"]
+trust_level = "trusted"
+
+[projects."/Users/edp/src/github.com/epilatow/repo-shared"]
+trust_level = "trusted"
+
+[projects."/Users/edp/src/github.com/epilatow/utils"]
+trust_level = "trusted"
+
+[projects."/Users/edp"]
+trust_level = "trusted"
+
+[tui.model_availability_nux]
+"gpt-5.5" = 4
