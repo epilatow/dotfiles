@@ -8,4 +8,3 @@
 - If I ask for the price of something, I want an accurate and recent price, not
   a guess or the price you remember, so please search online for recent data,
   including MSRP and acutal prices when available.
-

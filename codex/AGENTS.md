@@ -1,3 +1,5 @@
+# Agent instructions
+
 Please read these files in order and follow their instructions:
 
 1. `SHARED.md`
