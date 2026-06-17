@@ -68,8 +68,32 @@ or side effects, or flag invariants the type system can't enforce.
   only for its side effect can't be underscored -- pytest resolves fixtures by
   exact name -- so request it with `@pytest.mark.usefixtures("name")` and drop
   the parameter, or suppress the single line with `# noqa: ARG001`.
-- Strongly typed. Avoid storing structured data in a `Dict` with `Any` values
-  -- use a `TypedDict`, dataclass, or pydantic model instead.
+- Strongly typed. Don't use `Any` for a value this code inspects or accesses --
+  model it with a `TypedDict`, dataclass, or pydantic model (a bare
+  `Dict[str, Any]` standing in for structured data is the usual offender).
+  `Any` is acceptable only for an opaque handle: a blob received from one place
+  and passed to another, never inspected in between.
+- Don't route structured data through an untyped `dict` -- especially not one
+  built up key-by-key and splatted as `**kwargs` into a typed constructor. mypy
+  validates field names and value types when you assign them on a dataclass /
+  `TypedDict` / model, but not when you stuff them into a bare dict, so shape
+  errors slip to runtime and surface only where a test happens to exercise that
+  path. Construct the typed object directly (or parse into a `TypedDict`)
+  instead.
+- Don't overload `str` / `int` for a closed set of values. When a return (or
+  field, or parameter) is one of a fixed set of tokens -- a status, kind,
+  outcome, or discriminant -- model it as an `Enum`, not a bare `str` whose
+  magic values get hard-coded at every call site. Reach for `StrEnum` /
+  `IntEnum` when the value must also serialize as its plain string / int (e.g.
+  written to JSON and round-tripped), so the on-disk form is unchanged while
+  the set stays closed, type-checked, and self-documenting.
+- Import the module under test; don't load it with `importlib`. `mypy` types a
+  module built via `SourceFileLoader` / `module_from_spec` as a bare
+  `ModuleType`, so every attribute access on it resolves to `Any` and the
+  test's uses go unchecked. Prefer a plain `import`; if the target isn't
+  normally importable (e.g. an extension-less entry-point script), make it
+  importable -- e.g. a `.py` alias symlink on the `mypy` / `sys.path` search
+  path -- rather than loading it dynamically.
 - All tools have well-defined return / exit values. A tool that surfaces
   success vs. failure to a wrapper script must do so via the exit code, not
   just stdout / stderr.
