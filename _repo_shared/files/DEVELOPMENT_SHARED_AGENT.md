@@ -139,28 +139,32 @@ suggested follow-up; don't use it to excuse skipping the in-scope work.
 
 ## SCM
 
-### Never push without explicit per-action approval
+### Never merge to `main` or push without explicit per-action approval
 
-Local commits and ff-merge to local `main` are fine. `git push` is not. The
-user reviews each commit and authorizes the push. This applies to every commit,
-including amended ones from code-review feedback. A user authorizing one push
-does not authorize subsequent pushes.
+Work happens on a branch in a worktree (see below); committing there is fine.
+Two actions need the user's explicit, per-action approval: merging onto `main`
+(including a local fast-forward merge) and `git push`. Leave the work on its
+branch and ask -- do not drop it onto `main` unprompted, even when the merge
+would be a clean fast-forward.
+
+This applies to every commit, including amended ones from code-review feedback.
+Approval for one merge or push does not authorize subsequent ones.
 
 ### Reviewing commits with `npx difit`
 
-The user reviews commits locally before authorizing a push. When the user asks
-to review a commit (or a stack), publish it with `npx difit`. `npx difit` runs
-a web server, so the command does not exit immediately -- run it in the
-background.
+The user reviews commits locally before authorizing a merge or push. When the
+user asks to review a commit (or a stack), publish it with `npx difit`.
+`npx difit` runs a web server, so the command does not exit immediately -- run
+it in the background.
 
 ### All development work happens in a worktree under `$REPO/.wt/`
 
 Never edit the main checkout directly. Every develop / build / test / debug
 cycle runs in a `git worktree add` at `$REPO/.wt/<purpose>`, nested under the
-repo's own checkout. Be sure that .gitignore contains .wt/. After the work
-lands on `main`, remove the worktree and any branches you created as part of
-the development effort (but don't touch other branches which may belong to
-other users or agents).
+repo's own checkout. Be sure that .gitignore contains .wt/. Once the user has
+approved the merge and the work has landed on `main`, remove the worktree and
+any branches you created as part of the development effort (but don't touch
+other branches which may belong to other users or agents).
 
 Development scratch -- plans, code-review write-ups, rejected-finding logs, any
 `tmp/` working document -- does NOT go inside the worktree. Write it to the
