@@ -492,17 +492,12 @@ if [ -z "$NO_TERM" ]; then
 	# vt100 is our default fallback
 	terms="$TERM vt100"
 
-	# we almost always connect to consoles within xterms.
-	if [ "$TERM" = "sun-color" ]; then
-		TERM=xterm
-	fi
-
 	#
 	# If the current TERM is an xterm variant, add our prefered
 	# xterm compatabile variants to our preferences list.
 	#
 	echo "$TERM" | egrep "rxvt|xterm" >/dev/null &&
-		terms="rxvt xtermc xterm-color xterm $terms"
+		terms="xterm-256color xterm-color xtermc xterm rxvt $terms"
 
 	unset TERM
 	set_terminfo
