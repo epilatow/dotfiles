@@ -1,0 +1,32 @@
+# .ssh/config
+#
+# Per-host configs must be defined before global options, since the
+# first match for any given option takes precedence.
+#
+
+# Assembly first
+Include config.d/*
+
+# Port 22 github.com access is unreliable and breaks automation, so use 443
+Host github.com
+    Hostname ssh.github.com
+    Port 443
+    User git
+
+#
+# Global options
+#
+Host *
+Compression yes
+ForwardAgent no
+KeepAlive yes
+ConnectTimeout 15
+ConnectionAttempts 3
+
+# X11 options
+ForwardX11Trusted yes
+ForwardX11 no
+
+# User keepalives to avoid proxies killing idle connections.
+ServerAliveInterval 30
+ServerAliveCountMax 5
