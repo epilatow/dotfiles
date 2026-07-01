@@ -180,6 +180,17 @@ Each commit edits only what its own description calls for. Adjacent cleanup
 that "would be nice to do anyway" goes into a separate commit, OR is bumped
 into a new entry in the relevant tracking doc.
 
+### Stage explicit paths when hand-building a commit
+
+When staging a commit by hand -- an initial commit or an amend -- name each
+path with `git add <path>`. Don't reach for `git add -A` (nor `git add .` /
+`git add -u`): a blanket add sweeps in whatever else is sitting in the working
+tree -- scratch files, editor droppings, a stray `tmp/` artifact, an unrelated
+debug edit -- and lands it in the commit unnoticed. Naming paths keeps each
+commit to exactly what its description calls for. (Programmatic tooling that
+stages a known-clean worktree it fully controls is the exception; this rule is
+about an agent hand-building commits.)
+
 ### Working with local commits
 
 Changes to existing local (unpushed) commits should generally fold into the
@@ -213,10 +224,24 @@ Not `rebase -i`, not `--autosquash`, not non-interactive `rebase <upstream>` or
   loss.
 
 For folds, reorders, and mid-stack edits, use the backup-branch + cherry-pick +
-amend technique below. If a feature branch needs to be updated onto a moved
-base (the case `git rebase main` would normally cover), stop and ask -- surface
-the options (merge commit, user rebases manually, or agent cherry-picks onto
-the new base with a diff-check) rather than choosing.
+amend technique below. To update a feature branch onto a moved base (the case
+`git rebase main` would normally cover), use that same technique -- see its
+moved-base variant below. Never resolve a moved base with a merge commit (see
+below).
+
+### Never use merge commits
+
+Keep history linear -- never create a merge commit. The place this tempts an
+agent is updating a feature branch onto a moved base: do not merge the new base
+into the branch. Rebase it with the backup-branch + cherry-pick technique below
+instead.
+
+The other place it tempts an agent is landing a branch on `main` after `main`
+has advanced past the branch's base. Do not create a merge commit, and do not
+cherry-pick the branch's commits onto `main` directly. Instead rebase the
+branch onto the new `main` tip (same technique), then fast-forward merge the
+whole branch onto `main`. Rebasing happens on the branch; `main` only ever
+advances by fast-forward.
 
 ### Backup-branch + cherry-pick technique
 
@@ -236,6 +261,13 @@ For mid-stack edits, folds, and reorders:
 The same technique applies to reordering commits in a stack: reset to the
 appropriate ancestor, then cherry-pick commits back in the desired order. The
 diff-check still applies (for pure reorders, the diff should be empty).
+
+It also rebases a branch onto a moved base: reset to the new base commit (not
+an ancestor of the branch), then cherry-pick the branch's own commits back on
+top, resolving conflicts as they arise. Here the diff-check against the old
+branch HEAD is *not* expected to be empty -- it should show exactly what the
+new base introduces plus any conflict resolutions you made, and nothing else.
+Anything more means a commit was dropped, duplicated, or mis-resolved.
 
 To fold a later commit into an earlier one specifically, use the same
 backup-branch + reset + cherry-pick technique. Do **not** use
