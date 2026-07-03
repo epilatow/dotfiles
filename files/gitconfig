@@ -1,3 +1,5 @@
 [user]
 	email = edp@drymartini.org
 	name = Edward Pilatowicz
+[init]
+	defaultBranch = main
