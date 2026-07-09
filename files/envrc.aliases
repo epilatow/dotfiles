@@ -8,15 +8,12 @@ type vim >/dev/null 2>&1
 alias su-="su -"
 alias us="su"
 
-alias typea="type_alias"
-
 # restore sanity to a screwed up terminal
-alias termreset="echo ; stty sane; tput reset; tput rmso"
+alias termreset="echo ; stty sane; tput reset; tput rmso; stty intr "
 
 # misc aliases
-alias new_locale="unset LC_FIXED; set_locale"
-
-# command aliases
+alias lcreset="unset LC_FIXED; set_locale"
+alias tclaude="tmux new claude"
 alias ls="ls -F"
 
 # wrapper aliases

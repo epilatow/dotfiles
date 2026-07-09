@@ -1,0 +1,9 @@
+{
+  "name": "tmux-namer",
+  "description": "Name the surrounding tmux session after the Claude Code conversation title.",
+  "version": "1.0.0",
+  "author": {
+    "name": "epilatow",
+    "email": "edp@drymartini.org"
+  }
+}
