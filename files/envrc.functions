@@ -684,3 +684,23 @@ type_alias()
 	(unalias $1; type $1)
 	return $?
 }
+
+# restore sanity to a screwed up terminal
+termreset() {
+	# Recover from line-drawing mode, where regular text renders as
+	# box-drawing glyphs.  (The invisible argument is a literal
+	# ctrl-O / shift-in byte.)
+	echo 
+	# Make ctrl-C interrupt the foreground process again.
+	stty intr 
+	# Recover the kernel tty state a raw-mode program left behind:
+	# keystrokes echo again and Enter behaves normally instead of
+	# staircase output.
+	stty sane
+	# Full emulator reset: un-sticks terminal-side modes such as mouse
+	# reporting (which hijacks click-drag selection), alternate screen,
+	# and charset/color state.  Clears the screen as a side effect.
+	tput reset
+	# Stop displaying all output highlighted in standout/reverse video.
+	tput rmso
+}

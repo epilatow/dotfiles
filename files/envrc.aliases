@@ -8,12 +8,12 @@ type vim >/dev/null 2>&1
 alias su-="su -"
 alias us="su"
 
-# restore sanity to a screwed up terminal
-alias termreset="echo ; stty sane; tput reset; tput rmso; stty intr "
-
 # misc aliases
 alias lcreset="unset LC_FIXED; set_locale"
 alias tclaude="tmux new claude"
+alias tclauded="tmux new claude --dangerously-skip-permissions"
+alias tcodex="tmux new codex"
+alias tcodexd="tmux new codex --dangerously-bypass-approvals-and-sandbox"
 alias ls="ls -F"
 
 # wrapper aliases
