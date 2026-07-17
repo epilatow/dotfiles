@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${HOME}/.local/libexec/tmux-agent-session-namer/tmux-agent-session-namer\" codex"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${HOME}/.local/libexec/tmux-agent-session-namer/tmux-agent-session-namer\" codex"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -11,4 +11,9 @@ dependencies = [
 epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = "73d0a925bdc1f57427641faedc636f1efbec83ac" }
 
 [tool.pytest.ini_options]
-testpaths = ["_repo_shared/tests"]
+testpaths = ["_repo_shared/tests", "tests"]
+
+[tool.repo-shared.code-quality]
+python-targets = [
+    "files/local/libexec/tmux-agent-session-namer/tmux-agent-session-namer",
+]

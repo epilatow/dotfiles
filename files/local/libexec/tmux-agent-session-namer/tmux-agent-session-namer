@@ -1,0 +1,384 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = []
+# ///
+"""Name a tmux session after an agent session."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import select
+import subprocess
+import sys
+import time
+from enum import StrEnum
+from typing import IO, cast
+
+type JsonObject = dict[str, object]
+
+CODEX_GLOBAL_TITLE_WARNING = (
+    "tmux naming disabled: run /title and select only Thread, then start a "
+    "new Codex session."
+)
+CODEX_PROJECT_TITLE_WARNING = (
+    'tmux naming disabled: set [tui] terminal_title = ["thread"] in the '
+    "applicable .codex/config.toml, then start a new Codex session."
+)
+CODEX_THREAD_TITLE_IDS = frozenset(("thread", "thread-title"))
+TMUX_SLOT_LOCK = "tmux-agent-session-namer-slots"
+STATUS_RIGHT = "".join(
+    (
+        "#{?window_bigger,",
+        "[#{window_offset_x}#,#{window_offset_y}] ,}",
+        "%H:%M %d-%b-%y",
+    )
+)
+
+
+class Agent(StrEnum):
+    CLAUDE = "claude"
+    CODEX = "codex"
+
+
+class CodexHookEvent(StrEnum):
+    SESSION_START = "SessionStart"
+    STOP = "Stop"
+
+
+class CodexTitleConfig(StrEnum):
+    CONFIGURED = "configured"
+    GLOBAL_MISCONFIGURED = "global-misconfigured"
+    PROJECT_MISCONFIGURED = "project-misconfigured"
+
+
+class JsonRpcClient:
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        if process.stdin is None or process.stdout is None:
+            raise OSError("app-server pipes unavailable")
+        self.process = process
+        self.stdin = cast(IO[bytes], process.stdin)
+        self.stdout = cast(IO[bytes], process.stdout)
+        self.pending = b""
+
+    def send(self, message: JsonObject) -> None:
+        self.stdin.write((json.dumps(message) + "\n").encode())
+        self.stdin.flush()
+
+    def request(
+        self,
+        message: JsonObject,
+        *,
+        request_id: int,
+    ) -> JsonObject:
+        self.send(message)
+        deadline = time.monotonic() + 3
+        while True:
+            while b"\n" not in self.pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                readable, _, _ = select.select(
+                    [self.stdout],
+                    [],
+                    [],
+                    remaining,
+                )
+                if not readable:
+                    raise TimeoutError
+                chunk = os.read(self.stdout.fileno(), 4096)
+                if not chunk:
+                    raise EOFError
+                self.pending += chunk
+            line, self.pending = self.pending.split(b"\n", 1)
+            parsed: object = json.loads(line)
+            response = _as_json_object(parsed)
+            if response.get("id") == request_id:
+                return response
+
+
+def _as_json_object(value: object) -> JsonObject:
+    if not isinstance(value, dict):
+        raise TypeError("expected JSON object")
+    if not all(isinstance(key, str) for key in value):
+        raise TypeError("expected string JSON keys")
+    return cast(JsonObject, value)
+
+
+def _nested_json_object(value: JsonObject, key: str) -> JsonObject:
+    return _as_json_object(value[key])
+
+
+def _stop_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def _codex_result(method: str, params: JsonObject) -> JsonObject | None:
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        process = subprocess.Popen(
+            ["codex", "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        client = JsonRpcClient(process)
+        client.request(
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "tmux-agent-session-namer",
+                        "version": "1",
+                    },
+                },
+            },
+            request_id=1,
+        )
+        client.send({"method": "initialized", "params": {}})
+        response = client.request(
+            {
+                "id": 2,
+                "method": method,
+                "params": params,
+            },
+            request_id=2,
+        )
+        return _nested_json_object(response, "result")
+    except (
+        EOFError,
+        OSError,
+        TimeoutError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+    ):
+        return None
+    finally:
+        if process is not None:
+            _stop_process(process)
+
+
+def _codex_result_has_thread_only_title(
+    result: dict[str, object] | None,
+) -> bool:
+    if result is None:
+        return False
+    try:
+        config = _nested_json_object(result, "config")
+        tui = _nested_json_object(config, "tui")
+        terminal_title = tui["terminal_title"]
+    except KeyError, TypeError:
+        return False
+    return (
+        isinstance(terminal_title, list)
+        and len(terminal_title) == 1
+        and isinstance(terminal_title[0], str)
+        and terminal_title[0] in CODEX_THREAD_TITLE_IDS
+    )
+
+
+def codex_thread_title_config() -> CodexTitleConfig:
+    global_result = _codex_result(
+        "config/read",
+        {"includeLayers": False},
+    )
+    if not _codex_result_has_thread_only_title(global_result):
+        return CodexTitleConfig.GLOBAL_MISCONFIGURED
+    effective_result = _codex_result(
+        "config/read",
+        {
+            "cwd": os.getcwd(),
+            "includeLayers": False,
+        },
+    )
+    if not _codex_result_has_thread_only_title(effective_result):
+        return CodexTitleConfig.PROJECT_MISCONFIGURED
+    return CodexTitleConfig.CONFIGURED
+
+
+def codex_thread_label(session_id: str) -> str | None:
+    result = _codex_result(
+        "thread/read",
+        {
+            "threadId": session_id,
+            "includeTurns": False,
+        },
+    )
+    if result is None:
+        return None
+    try:
+        thread = _nested_json_object(result, "thread")
+    except KeyError, TypeError:
+        return None
+    for key in ("name", "preview"):
+        value = thread.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _read_codex_hook_input() -> tuple[CodexHookEvent | None, str | None]:
+    if sys.stdin.isatty():
+        return None, None
+    try:
+        hook_input = _as_json_object(json.load(sys.stdin))
+    except OSError, json.JSONDecodeError, TypeError:
+        return None, None
+
+    event_value = hook_input.get("hook_event_name")
+    try:
+        event = (
+            CodexHookEvent(event_value)
+            if isinstance(event_value, str)
+            else None
+        )
+    except ValueError:
+        event = None
+    session_id = hook_input.get("session_id")
+    return event, session_id if isinstance(session_id, str) else None
+
+
+def _run_tmux(*args: str, capture_output: bool = False) -> str:
+    result = subprocess.run(
+        ["tmux", *args],
+        check=False,
+        stdout=subprocess.PIPE if capture_output else subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    return result.stdout.rstrip("\n") if capture_output else ""
+
+
+def _allocate_slot(option: str) -> str | None:
+    _run_tmux("wait-for", "-L", TMUX_SLOT_LOCK)
+    try:
+        current = _run_tmux(
+            "show-options",
+            "-qv",
+            option,
+            capture_output=True,
+        )
+        if current:
+            return current
+
+        output = _run_tmux(
+            "list-sessions",
+            "-F",
+            f"#{{{option}}}",
+            capture_output=True,
+        )
+        used = {
+            line
+            for line in output.splitlines()
+            if re.fullmatch(r"[0-9][0-9]", line)
+        }
+        for number in range(100):
+            candidate = f"{number:02d}"
+            if candidate not in used:
+                _run_tmux("set-option", option, candidate)
+                return candidate
+        return None
+    finally:
+        _run_tmux("wait-for", "-U", TMUX_SLOT_LOCK)
+
+
+def _configure_tmux(agent: Agent) -> None:
+    option = f"@{agent}_num"
+    if _allocate_slot(option) is None:
+        return
+
+    title = "#{pane_title}"
+    if agent is Agent.CLAUDE:
+        title = "#{s|^. ||:pane_title}"
+    name = f"#{{=30:{agent}#{{{option}}}-#{{s| |-|:{title}}}}}"
+    conditional_name = f"#{{?pane_title,{name},#{{session_name}}}}"
+    hook = f'rename-session "{conditional_name}"'
+
+    _run_tmux("set-hook", "pane-title-changed", hook)
+    _run_tmux("rename-session", conditional_name)
+    _run_tmux("set-option", "status-left-length", "34")
+    _run_tmux("set-option", "status-right", STATUS_RIGHT)
+
+
+def _literal_tmux_format(value: str) -> str:
+    return value.replace("#", "##")
+
+
+def _rename_tmux(agent: Agent, title: str) -> None:
+    slot = _allocate_slot(f"@{agent}_num")
+    if slot is None:
+        return
+
+    fragment = re.sub(r"\s+", "-", title).strip("-")
+    fragment = "".join(
+        character for character in fragment if character.isprintable()
+    )
+    if not fragment:
+        return
+    name = f"{agent}{slot}-{fragment}"[:30]
+    _run_tmux("rename-session", _literal_tmux_format(name))
+
+
+def _parse_agent(argv: list[str]) -> Agent | None:
+    if len(argv) != 1:
+        return None
+    try:
+        return Agent(argv[0])
+    except ValueError:
+        return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    if not os.environ.get("TMUX"):
+        return 0
+
+    agent = _parse_agent(argv if argv is not None else sys.argv[1:])
+    if agent is None:
+        return 2
+
+    if agent is Agent.CODEX:
+        event, session_id = _read_codex_hook_input()
+        title_config = codex_thread_title_config()
+        if title_config is not CodexTitleConfig.CONFIGURED:
+            if event is CodexHookEvent.SESSION_START:
+                warning = (
+                    CODEX_GLOBAL_TITLE_WARNING
+                    if title_config is CodexTitleConfig.GLOBAL_MISCONFIGURED
+                    else CODEX_PROJECT_TITLE_WARNING
+                )
+                print(
+                    json.dumps(
+                        {
+                            "continue": True,
+                            "systemMessage": warning,
+                        }
+                    )
+                )
+            return 0
+        if event is CodexHookEvent.STOP:
+            if session_id is not None:
+                title = codex_thread_label(session_id)
+                if title is not None:
+                    _rename_tmux(agent, title)
+            return 0
+
+    _configure_tmux(agent)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
