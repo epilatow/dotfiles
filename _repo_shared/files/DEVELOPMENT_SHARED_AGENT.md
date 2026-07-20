@@ -361,11 +361,13 @@ stays visible for the user's review.
 
 ### Zero-context review
 
-The review subagent must start with **zero context inherited from the calling
-agent**. It does not see the calling agent's conversation, prior plans, working
-notes, or any pre-framing of which decisions are "intentional". It receives
-only what the review request explicitly hands it: the commit SHA. It then
-evaluates the commit on its own.
+The review subagent must start with **zero authored context inherited from the
+calling agent**. It does not see the calling agent's conversation, prior plans,
+working notes, or any pre-framing of which decisions are "intentional". It
+receives only two neutral inputs: the commit SHA and the absolute path to a
+clean detached review worktree named only from that SHA. The path locates the
+repository without adding human-authored framing. It then evaluates the commit
+on its own.
 
 This matters because pre-framing decisions as "intentional" is exactly how
 regressions slip past review. The calling agent's job is to surface the SHA
@@ -373,12 +375,20 @@ neutrally; the review agent's job is to evaluate independently.
 
 ### Protocol
 
-1. Spawn the review subagent with the prompt below, substituting `<SHA>`. Hand
-   the agent nothing else -- no extra framing, no "we already decided X", no
-   hints about which findings would be welcome.
-2. Save the review to `$REPO/tmp/<slug>-code-review.md` (or
+1. Create a clean detached review worktree at `$REPO/.wt/code-review-<SHA>`,
+   where `<SHA>` is the full commit SHA. Reuse an existing path only when it is
+   clean, detached, and at that exact commit. Never put a human-authored
+   purpose or branch name in the review worktree path.
+2. Spawn the review subagent with the prompt below, substituting `<SHA>` and
+   `<REPO>` with the commit SHA and detached review-worktree path. Hand the
+   agent nothing else -- no extra framing, no "we already decided X", no hints
+   about which findings would be welcome.
+3. Save the review to `$REPO/tmp/<slug>-code-review.md` (or
    `$REPO/tmp/<slug>-code-review-N.md` for amend cycles).
-3. Address findings. For each finding, either fix it in the commit (amend) or
+4. Remove the detached review worktree after saving the response. If it is
+   unexpectedly dirty, retain it and surface the problem instead of forcing
+   removal.
+5. Address findings. For each finding, either fix it in the commit (amend) or
    append the rejected finding to `$REPO/tmp/<slug>-code-review-rejected.md`
    with reasoning on why it was rejected.
 
@@ -401,6 +411,16 @@ Inputs:
   and may rationalize choices that don't match the
   underlying problem.
 - Commit SHA: <SHA>.
+- Repo path: <REPO>, a clean detached review worktree
+  named only from the commit SHA.
+
+Use the supplied repo path as the working directory. Do not
+search other repositories or the filesystem for the commit.
+Prior reviews, plans, rejected-finding logs, reflogs, and
+superseded versions of this commit are deliberately excluded
+context. Do not inspect them. Review only the specified commit,
+its parent, and the broader tracked repository state needed to
+evaluate that commit.
 
 You are free to read any file in the repo you need to
 understand the broader context. A code review against the
