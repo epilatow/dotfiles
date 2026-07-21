@@ -242,7 +242,7 @@ could touch and verify it still matches reality. Specifically:
 
 - `DEVELOPMENT.md` and `DEVELOPMENT_SHARED.md` -- update when dev-process
   tooling changes (new test conventions, new lint rules, renamed or removed CLI
-  flags on a tool, new required steps in the develop / test / commit cycle).
+  flags on a tool, new required steps in the develop / commit / test cycle).
 - `DEVELOPMENT_AGENT.md` and `DEVELOPMENT_SHARED_AGENT.md` -- update when
   agent-specific workflow changes (review protocol, file markers, new
   agent-only conventions).
