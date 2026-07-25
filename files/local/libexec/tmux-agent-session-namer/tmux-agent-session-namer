@@ -29,12 +29,10 @@ CODEX_PROJECT_TITLE_WARNING = (
 )
 CODEX_THREAD_TITLE_IDS = frozenset(("thread", "thread-title"))
 TMUX_SLOT_LOCK = "tmux-agent-session-namer-slots"
-STATUS_RIGHT = "".join(
-    (
-        "#{?window_bigger,",
-        "[#{window_offset_x}#,#{window_offset_y}] ,}",
-        "%H:%M %d-%b-%y",
-    )
+STATUS_RIGHT = (
+    "#{?window_bigger,"
+    "[#{window_offset_x}#,#{window_offset_y}] ,}"
+    "%H:%M %d-%b-%y"
 )
 
 
