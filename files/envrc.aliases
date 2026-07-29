@@ -11,9 +11,9 @@ alias us="su"
 # misc aliases
 alias lcreset="unset LC_FIXED; set_locale"
 alias tclaude="tmux new claude"
-alias tclauded="tmux new claude --dangerously-skip-permissions"
-alias tcodex="tmux new codex"
-alias tcodexd="tmux new codex --dangerously-bypass-approvals-and-sandbox"
+alias tclauded="tclaude --dangerously-skip-permissions"
+alias tcodex="tmux new codex  -c 'tui.terminal_title=[\"thread-title\"]'"
+alias tcodexd="tcodex --dangerously-bypass-approvals-and-sandbox"
 alias ls="ls -F"
 
 # wrapper aliases
