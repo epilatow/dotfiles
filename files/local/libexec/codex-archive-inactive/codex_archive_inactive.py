@@ -30,6 +30,7 @@ type JsonObject = dict[str, object]
 DEFAULT_MINIMUM_AGE_SECONDS = 3600
 PAGE_SIZE = 100
 REQUEST_TIMEOUT_SECONDS = 15
+SNAPSHOT_RETRY_DELAYS_SECONDS = (15, 30, 60)
 LSOF_TIMEOUTS_SECONDS = (15, 120)
 MAX_LABEL_LENGTH = 68
 INTERACTIVE_SOURCE_KINDS = ("cli", "vscode")
@@ -48,6 +49,10 @@ ALL_SOURCE_KINDS = (
 
 class ArchiveError(RuntimeError):
     """A Codex session archive operation failed."""
+
+
+class TransientRpcError(ArchiveError):
+    """An app-server request can be retried on a fresh connection."""
 
 
 class ThreadStatus(StrEnum):
@@ -75,6 +80,12 @@ class CleanupResult:
     open_families: int
     changed_before_archive: int
     blocked_families: int
+
+
+@dataclass(frozen=True)
+class ThreadSnapshot:
+    listed: tuple[Thread, ...]
+    all_threads: tuple[Thread, ...]
 
 
 class JsonConnection(Protocol):
@@ -137,7 +148,12 @@ class JsonRpcClient:
                         continue
                     error = response.get("error")
                     if error is not None:
-                        raise ArchiveError(
+                        error_type = (
+                            TransientRpcError
+                            if _is_transient_rpc_error(error)
+                            else ArchiveError
+                        )
+                        raise error_type(
                             f"{method} failed: {_format_rpc_error(error)}"
                         )
                     return _as_object(
@@ -145,7 +161,7 @@ class JsonRpcClient:
                         f"{method} result",
                     )
         except TimeoutError as exc:
-            raise ArchiveError(
+            raise TransientRpcError(
                 f"{method} timed out after {self._request_timeout} seconds"
             ) from exc
 
@@ -165,6 +181,14 @@ def _format_rpc_error(value: object) -> str:
         return repr(value)
     message = error.get("message")
     return message if isinstance(message, str) else repr(error)
+
+
+def _is_transient_rpc_error(value: object) -> bool:
+    try:
+        error = _as_object(value, "JSON-RPC error")
+    except ArchiveError:
+        return False
+    return error.get("code") == -32001
 
 
 def _required_str(value: object, context: str) -> str:
@@ -306,6 +330,15 @@ async def read_thread(client: RpcClient, thread_id: str) -> Thread:
 
 async def archive_thread(client: RpcClient, thread_id: str) -> None:
     await client.request("thread/archive", {"threadId": thread_id})
+
+
+async def load_thread_snapshot(client: RpcClient) -> ThreadSnapshot:
+    return ThreadSnapshot(
+        listed=tuple(await list_threads(client)),
+        all_threads=tuple(
+            await list_threads(client, source_kinds=ALL_SOURCE_KINDS)
+        ),
+    )
 
 
 def _eligible(thread: Thread, *, now: int, minimum_age: int) -> bool:
@@ -463,28 +496,29 @@ def _safe_family(
     return True
 
 
-async def cleanup_sessions(
+async def _cleanup_snapshot(
     client: RpcClient,
     *,
+    snapshot: ThreadSnapshot,
     open_paths: Collection[Path],
     sessions_dir: Path,
     dry_run: bool,
     minimum_age: int,
     now: int,
 ) -> CleanupResult:
-    listed = await list_threads(client)
-    all_threads = await list_threads(client, source_kinds=ALL_SOURCE_KINDS)
-    families = _thread_families(listed, all_threads)
+    families = _thread_families(snapshot.listed, snapshot.all_threads)
     open_root_ids = {
         root_id
         for root_id, family in families.items()
         if any(member.rollout_path in open_paths for member in family)
     }
-    kept = [root for root in listed if root.thread_id in open_root_ids]
+    kept = [
+        root for root in snapshot.listed if root.thread_id in open_root_ids
+    ]
     kept_ids = {root.thread_id for root in kept}
     candidates = [
         thread
-        for thread in listed
+        for thread in snapshot.listed
         if _eligible(thread, now=now, minimum_age=minimum_age)
     ]
     selected: list[Thread] = []
@@ -530,6 +564,26 @@ async def cleanup_sessions(
         open_families=len(open_root_ids),
         changed_before_archive=changed_before_archive,
         blocked_families=blocked_families,
+    )
+
+
+async def cleanup_sessions(
+    client: RpcClient,
+    *,
+    open_paths: Collection[Path],
+    sessions_dir: Path,
+    dry_run: bool,
+    minimum_age: int,
+    now: int,
+) -> CleanupResult:
+    return await _cleanup_snapshot(
+        client,
+        snapshot=await load_thread_snapshot(client),
+        open_paths=open_paths,
+        sessions_dir=sessions_dir,
+        dry_run=dry_run,
+        minimum_age=minimum_age,
+        now=now,
     )
 
 
@@ -627,28 +681,54 @@ async def run_cleanup(
     dry_run: bool,
     minimum_age: int,
     now: int,
+    snapshot_retry_delays: Sequence[int] = SNAPSHOT_RETRY_DELAYS_SECONDS,
 ) -> CleanupResult:
     normalized_sessions_dir = _normalized_path(sessions_dir)
-    open_paths = open_rollout_paths(normalized_sessions_dir)
-    ensure_app_server(socket_path)
-    async with unix_connect(
-        path=str(socket_path.expanduser()),
-        uri="ws://localhost/",
-        compression=None,
-        user_agent_header=None,
-        open_timeout=REQUEST_TIMEOUT_SECONDS,
-        close_timeout=1,
-    ) as connection:
-        client = JsonRpcClient(connection)
-        await initialize(client)
-        return await cleanup_sessions(
-            client,
-            open_paths=open_paths,
-            sessions_dir=normalized_sessions_dir,
-            dry_run=dry_run,
-            minimum_age=minimum_age,
-            now=now,
-        )
+    retry_delays = iter(snapshot_retry_delays)
+    attempts = 0
+    while True:
+        attempts += 1
+        snapshot_loaded = False
+        try:
+            ensure_app_server(socket_path)
+            async with unix_connect(
+                path=str(socket_path.expanduser()),
+                uri="ws://localhost/",
+                compression=None,
+                user_agent_header=None,
+                open_timeout=REQUEST_TIMEOUT_SECONDS,
+                close_timeout=1,
+            ) as connection:
+                client = JsonRpcClient(connection)
+                await initialize(client)
+                snapshot = await load_thread_snapshot(client)
+                snapshot_loaded = True
+                open_paths = open_rollout_paths(normalized_sessions_dir)
+                return await _cleanup_snapshot(
+                    client,
+                    snapshot=snapshot,
+                    open_paths=open_paths,
+                    sessions_dir=normalized_sessions_dir,
+                    dry_run=dry_run,
+                    minimum_age=minimum_age,
+                    now=now,
+                )
+        except (
+            OSError,
+            TimeoutError,
+            TransientRpcError,
+            WebSocketException,
+        ) as exc:
+            if snapshot_loaded:
+                raise
+            try:
+                delay = next(retry_delays)
+            except StopIteration:
+                raise ArchiveError(
+                    "could not load thread snapshot after "
+                    f"{attempts} attempts: {exc}"
+                ) from exc
+            await asyncio.sleep(delay)
 
 
 def _print_result(

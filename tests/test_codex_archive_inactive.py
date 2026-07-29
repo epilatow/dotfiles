@@ -6,10 +6,12 @@ import subprocess
 import sys
 from collections import deque
 from pathlib import Path
-from typing import cast
-from unittest.mock import patch
+from types import TracebackType
+from typing import Self, cast
+from unittest.mock import call, patch
 
 import pytest
+from websockets.exceptions import WebSocketException
 
 REPO_ROOT = Path(__file__).parents[1]
 LIBEXEC_DIR = (
@@ -77,6 +79,28 @@ class FakeConnection:
 
     async def recv(self) -> str | bytes:
         return self.incoming.popleft()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc_value: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        return None
+
+
+class NeverRespondConnection(FakeConnection):
+    async def recv(self) -> str | bytes:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class DisconnectingConnection(FakeConnection):
+    async def recv(self) -> str | bytes:
+        raise WebSocketException("daemon replaced")
 
 
 def test_command_is_python_314_uv_script() -> None:
@@ -151,6 +175,39 @@ def test_json_rpc_reports_server_errors() -> None:
 
     with pytest.raises(archive.ArchiveError, match="archive refused"):
         asyncio.run(client.request("thread/archive", {"threadId": "a"}))
+
+
+def test_json_rpc_reports_server_overload_as_transient() -> None:
+    connection = FakeConnection(
+        [
+            json.dumps(
+                {
+                    "id": 1,
+                    "error": {
+                        "code": -32001,
+                        "message": "Server overloaded; retry later.",
+                    },
+                }
+            )
+        ]
+    )
+    client = archive.JsonRpcClient(connection)
+
+    with pytest.raises(
+        archive.TransientRpcError,
+        match="Server overloaded",
+    ):
+        asyncio.run(client.request("thread/list", {}))
+
+
+def test_json_rpc_reports_timeout_as_transient() -> None:
+    client = archive.JsonRpcClient(
+        NeverRespondConnection([]),
+        request_timeout=0,
+    )
+
+    with pytest.raises(archive.TransientRpcError, match="timed out"):
+        asyncio.run(client.request("thread/list", {}))
 
 
 def test_json_rpc_rejects_binary_messages() -> None:
@@ -646,6 +703,178 @@ def test_ensure_app_server_rejects_missing_custom_socket(
         pytest.raises(archive.ArchiveError, match="socket does not exist"),
     ):
         archive.ensure_app_server(tmp_path / "custom.sock")
+
+
+@pytest.mark.parametrize(
+    "unavailable",
+    [
+        FakeConnection(
+            [
+                json.dumps({"id": 1, "result": {}}),
+                json.dumps(
+                    {
+                        "id": 2,
+                        "error": {
+                            "code": -32001,
+                            "message": "Server overloaded; retry later.",
+                        },
+                    }
+                ),
+            ]
+        ),
+        DisconnectingConnection([]),
+    ],
+    ids=("overloaded", "daemon-disconnected"),
+)
+def test_run_cleanup_reconnects_to_load_snapshot(
+    tmp_path: Path,
+    unavailable: FakeConnection,
+) -> None:
+    ready = FakeConnection(
+        [
+            json.dumps({"id": 1, "result": {}}),
+            json.dumps({"id": 2, "result": {"data": [], "nextCursor": None}}),
+            json.dumps({"id": 3, "result": {"data": [], "nextCursor": None}}),
+        ]
+    )
+    with (
+        patch.object(
+            archive,
+            "unix_connect",
+            autospec=True,
+            side_effect=(unavailable, ready),
+        ) as connect,
+        patch.object(
+            archive,
+            "ensure_app_server",
+            autospec=True,
+        ) as ensure,
+        patch.object(
+            archive,
+            "open_rollout_paths",
+            autospec=True,
+            return_value=set(),
+        ) as open_paths,
+        patch(
+            "asyncio.sleep",
+            autospec=True,
+        ) as sleep,
+    ):
+        result = asyncio.run(
+            archive.run_cleanup(
+                socket_path=tmp_path / "control.sock",
+                sessions_dir=tmp_path,
+                dry_run=False,
+                minimum_age=1_000,
+                now=10_000,
+                snapshot_retry_delays=(7,),
+            )
+        )
+
+    assert result.archived == 0
+    assert connect.call_count == 2
+    assert ensure.call_count == 2
+    open_paths.assert_called_once_with(tmp_path)
+    sleep.assert_awaited_once_with(7)
+
+
+def test_run_cleanup_does_not_retry_candidate_processing(
+    tmp_path: Path,
+) -> None:
+    ready = FakeConnection(
+        [
+            json.dumps({"id": 1, "result": {}}),
+            json.dumps({"id": 2, "result": {"data": [], "nextCursor": None}}),
+            json.dumps({"id": 3, "result": {"data": [], "nextCursor": None}}),
+        ]
+    )
+    with (
+        patch.object(
+            archive,
+            "unix_connect",
+            autospec=True,
+            return_value=ready,
+        ) as connect,
+        patch.object(
+            archive,
+            "ensure_app_server",
+            autospec=True,
+        ),
+        patch.object(
+            archive,
+            "open_rollout_paths",
+            autospec=True,
+            return_value=set(),
+        ),
+        patch.object(
+            archive,
+            "_cleanup_snapshot",
+            autospec=True,
+            side_effect=archive.TransientRpcError("connection replaced"),
+        ),
+        patch(
+            "asyncio.sleep",
+            autospec=True,
+        ) as sleep,
+        pytest.raises(archive.TransientRpcError, match="connection replaced"),
+    ):
+        asyncio.run(
+            archive.run_cleanup(
+                socket_path=tmp_path / "control.sock",
+                sessions_dir=tmp_path,
+                dry_run=False,
+                minimum_age=1_000,
+                now=10_000,
+                snapshot_retry_delays=(0,),
+            )
+        )
+
+    assert connect.call_count == 1
+    sleep.assert_not_awaited()
+
+
+def test_run_cleanup_stops_after_snapshot_retries(
+    tmp_path: Path,
+) -> None:
+    unavailable = tuple(DisconnectingConnection([]) for _ in range(3))
+    with (
+        patch.object(
+            archive,
+            "unix_connect",
+            autospec=True,
+            side_effect=unavailable,
+        ) as connect,
+        patch.object(
+            archive,
+            "ensure_app_server",
+            autospec=True,
+        ) as ensure,
+        patch.object(
+            archive,
+            "open_rollout_paths",
+            autospec=True,
+        ) as open_paths,
+        patch(
+            "asyncio.sleep",
+            autospec=True,
+        ) as sleep,
+        pytest.raises(archive.ArchiveError, match="after 3 attempts"),
+    ):
+        asyncio.run(
+            archive.run_cleanup(
+                socket_path=tmp_path / "control.sock",
+                sessions_dir=tmp_path,
+                dry_run=False,
+                minimum_age=1_000,
+                now=10_000,
+                snapshot_retry_delays=(1, 2),
+            )
+        )
+
+    assert connect.call_count == 3
+    assert ensure.call_count == 3
+    assert sleep.await_args_list == [call(1), call(2)]
+    open_paths.assert_not_called()
 
 
 def test_print_result_is_quiet_for_noop(
