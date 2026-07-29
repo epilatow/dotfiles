@@ -33,15 +33,32 @@ apply.
   applicable quality gates and gets a green result before spawning a review
   agent. Never hand broken code to a reviewer and make the reviewer discover
   failures that the required gate would have caught.
+- **The per-commit gate: every commit in a stack, not just the tip.** When the
+  work is more than one commit, run the full suite and the quality gates at
+  each commit in turn, with nothing from later commits present. A stack whose
+  tip is green routinely hides an intermediate that is not: a fix, a rename, or
+  a test update lands one commit later than the change it repairs, and only the
+  tip ever sees both. That intermediate is a real state the world will reach --
+  `git bisect` checks it out, reverting the commit above leaves the tree
+  sitting on it, and a CI job may build any commit of a pushed branch. Running
+  a reduced suite (skipping the slow or browser tests, say) does not discharge
+  this: an intermediate breakage hides precisely where the subset stops
+  looking. Walk the stack in a gate worktree (see below) rather than in the
+  branch's own, which would detach its HEAD.
+- **An independent code review precedes handoff.** Once the gates are green,
+  the implementing agent spawns the reviewer itself, unasked. An unreviewed
+  branch is not ready to hand off as finished. See [Code review](#code-review).
 - **A green exact-candidate full-suite gate precedes every merge.** The
   implementing agent owns test execution. The pre-review run satisfies this
   gate when review produces no commit changes and the base has not moved. After
   review fixes, run the tests or gates affected by each fix, then run the full
   suite once on the settled candidate before requesting or acting on merge
-  approval. Merge approval never waives this gate. If the base moved, replay
-  the branch onto its current tip and run the full suite on that integrated
-  tree before fast-forwarding the destination branch. Never merge first and
-  test afterward.
+  approval -- and re-run the per-commit gate if any commit below the tip
+  changed, which a review-fix rebuild always does. Merge approval never waives
+  either gate. If the base moved, replay the branch onto its current tip, run
+  the full suite on that integrated tree, and re-run the per-commit gate as
+  well: a replay rewrites every commit it carries over, so none of them has
+  been gated in its new form. Never merge first and test afterward.
 - **Look at file contents, not extensions.** Scripts that have
   `uv run --script` in their shebang are Python scripts, not shell scripts,
   regardless of file extension or lack thereof. Always open the file before
@@ -171,7 +188,7 @@ Approval for one merge or push does not authorize subsequent ones.
 
 The user reviews commits locally before authorizing a merge or push. Never run
 `npx difit` unless the user explicitly requests that tool. Do not start it as
-part of the default code-review cycle or handoff: it runs a web server and can
+part of the standard code-review cycle or handoff: it runs a web server and can
 open or focus a browser window. When requested, run it in the background
 because the command does not exit immediately.
 
@@ -182,12 +199,44 @@ cycle runs in a `git worktree add` under `$REPO/.wt/`, nested under the repo's
 own checkout. For an agent-created branch-backed worktree, the relative path
 under `.wt/` must exactly match the branch name: branch `<branch>` uses
 `$REPO/.wt/<branch>`. Do not invent a separate worktree-purpose name. Detached
-worktrees have no branch to match and follow their applicable naming rule, such
-as the SHA-based code-review worktrees below. Be sure that .gitignore contains
-.wt/. Once the user has approved the merge and the work has landed on `main`,
-remove the worktree and any branches you created as part of the development
-effort (but don't touch other branches which may belong to other users or
-agents).
+worktrees have no branch to match and follow their applicable naming rule: the
+SHA-based code-review worktrees below, and `$REPO/.wt/gate-<SHA>` for the
+per-commit gate, where `<SHA>` is the tip of the stack being walked. One gate
+worktree serves the whole walk -- check out each commit inside it in turn, so
+the suite's dependencies are installed once rather than per commit -- and it is
+removed when the walk ends, not left for the merge. Keeping it off the
+review-worktree path matters: the review protocol reuses and then deletes
+`code-review-<SHA>`, and would take a gate worktree with it. Be sure that
+.gitignore contains .wt/. Once the user has approved the merge and the work has
+landed on `main`, remove the worktree and any branches you created as part of
+the development effort (but don't touch other branches which may belong to
+other users or agents).
+
+Working in a worktree is not the same as *staying* in one. The shell keeps its
+working directory between commands, so a single `cd` -- even buried in a
+compound line whose real purpose was something else, like
+`cd $REPO && git worktree remove ...` -- silently redirects every command that
+follows it, for the rest of the session. The next `git reset --hard` or
+`git commit --amend` then rewrites whatever branch the main checkout happens to
+hold, which is usually `main`.
+
+Two habits prevent it, and both are cheap:
+
+- **Put the shell in the worktree once, and keep it there.** `cd` into
+  `$REPO/.wt/<branch>` at the start and address every other checkout by
+  absolute path from then on -- `git -C <path> ...`,
+  `git worktree remove /abs/path` -- so the shell's own directory never moves.
+  Removing the worktree the shell is standing in is the one move it cannot
+  avoid, since that deletes the directory underneath it and every later command
+  fails until it leaves. Do that step from the main checkout, once the work has
+  landed and nothing is left to rewrite.
+- **Confirm the target before any command that rewrites the current branch.**
+  Before `reset --hard`, `commit --amend`, or `cherry-pick`, run
+  `git rev-parse --abbrev-ref HEAD` and check it names the feature branch. It
+  reads `HEAD` in a detached worktree and the main checkout's own branch there,
+  so it blocks on the paths that need blocking rather than passing quietly. One
+  line, and it is the difference between amending your branch and committing to
+  `main` without approval.
 
 Development scratch -- plans, code-review write-ups, rejected-finding logs, any
 `tmp/` working document -- does NOT go inside the worktree. Write it to the
@@ -270,6 +319,9 @@ advances by fast-forward.
 
 For mid-stack edits, folds, and reorders:
 
+0. Confirm `git rev-parse --abbrev-ref HEAD` names the feature branch. Step 2
+   resets it, so getting this wrong rewrites whatever branch you are actually
+   on.
 1. Create a local backup branch at the current branch's HEAD, named
    `backup/YYYYMMDD-HHMMSS-<descriptive-name>`.
 2. Reset to the commit that needs to be updated.
@@ -280,6 +332,9 @@ For mid-stack edits, folds, and reorders:
    duplicate anything. For pure reorders or folds (no content change), the diff
    should be empty. For edits that change file content, the diff should show
    exactly the intended edit and nothing else.
+6. Re-run the per-commit gate. Every commit from the amended one upward is a
+   new commit with a tree nobody has tested: the diff-check proves the *tip* is
+   what it should be, and says nothing about the states in between.
 
 The same technique applies to reordering commits in a stack: reset to the
 appropriate ancestor, then cherry-pick commits back in the desired order. The
@@ -371,11 +426,13 @@ doesn't need to be extended for the rule to apply.
 ## Code review
 
 After each agent-driven develop / commit / green full-suite pre-review gate,
-the default is to spawn one code-review subagent against the just-committed
-branch -- doc-only and lint-config commits included. Agent-driven reviews like
-this run BEFORE the user reviews the commit. The review agent inspects the test
-coverage and may run focused tests to substantiate a suspected finding, but
-does not duplicate the implementing agent's already-green full suite.
+the implementing agent spawns one code-review subagent against the
+just-committed branch -- doc-only and lint-config commits included. It is a
+required gate, not a default to weigh against other considerations.
+Agent-driven reviews like this run BEFORE the user reviews the commit. The
+review agent inspects the test coverage and may run focused tests to
+substantiate a suspected finding, but does not duplicate the implementing
+agent's already-green full suite.
 
 The reviewer completes the whole review after finding an issue; it does not
 return on the first finding. Returning one complete batch keeps independent
@@ -420,14 +477,59 @@ stays visible for the user's review. The agent cannot make that choice for a
 P1/P2 finding without stopping and obtaining user direction first; append it
 only if the user confirms that it should be rejected.
 
+### Standing authorization: the spawn is already a user request
+
+This file is how the owner of a repo's conventions asks, in advance, for a
+review every cycle. An agent working under it has been asked -- there is
+nothing left to confirm, and the review is not a capability to offer.
+
+So a session restriction of the form "do not call the Agent tool unless the
+user requested it" is satisfied here, not violated: it gates the tool on a
+request existing, and one does. Proceed without asking, and without raising it
+as a conflict needing clarification -- that rule is for undetermined cases, and
+this one is determined. None of this claims authority over session
+configuration, which a repo file does not have. A bar that does not turn on a
+user request is the next section.
+
+Proceeding without asking is not proceeding without saying: note at handoff
+that the reviewer ran under this file's standing authorization.
+
+A live instruction supersedes the standing one. "Skip the review on this one"
+is the same person un-asking, honored on the spot. Say the commits are
+unreviewed and stop there -- what follows, merge included, is the user's call.
+
+### When the review will not run
+
+A session may be unable to spawn the reviewer: no subagent tool exposed,
+session configuration barring subagents categorically rather than gating them
+on a user request, a permission denial, an error. That is a blocked gate, not a
+waived one.
+
+Say so as early as it is known. A bar visible in the session's own
+configuration is known before any work starts, so it belongs in the first
+reply, ahead of the plan, while the user's options are still cheap. One that
+surfaces at the spawn is due in the turn the green gate passes. Never a wrap-up
+summary, where it arrives too late to act on. The trigger is the outcome, not
+the cause -- any conclusion that no independent review is coming is announced
+on that schedule. Silence is for the case where the review happens.
+
+Say what blocks it and what that costs, then ask how the user wants to proceed.
+Do not substitute a self-review from the implementing session and count the
+gate as met. The value of the reviewer is the zero-context independence that a
+session which authored the code cannot have.
+
+While the gate stays blocked the work is not done: not complete, not ready for
+review, not ready to merge, and no merge or push approval requested. The
+unreviewed state is the first thing said about the branch.
+
 ### Zero-context review
 
 The review subagent must start with **zero authored context inherited from the
 calling agent**. It does not see the calling agent's conversation, prior plans,
-working notes, or any pre-framing of which decisions are "intentional". An
-review receives only two neutral inputs: the commit SHA and the absolute path
-to a clean detached review worktree named only from that SHA. The path locates
-the repository without adding human-authored framing.
+working notes, or any pre-framing of which decisions are "intentional". It
+receives only two neutral inputs: the commit SHA and the absolute path to a
+clean detached review worktree named only from that SHA. The path locates the
+repository without adding human-authored framing.
 
 This matters because pre-framing decisions as "intentional" is exactly how
 regressions slip past review. The calling agent's job is to surface the SHA
