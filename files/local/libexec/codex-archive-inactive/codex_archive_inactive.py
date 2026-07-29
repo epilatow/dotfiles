@@ -30,7 +30,7 @@ type JsonObject = dict[str, object]
 DEFAULT_MINIMUM_AGE_SECONDS = 3600
 PAGE_SIZE = 100
 REQUEST_TIMEOUT_SECONDS = 15
-LSOF_TIMEOUT_SECONDS = 10
+LSOF_TIMEOUTS_SECONDS = (15, 120)
 MAX_LABEL_LENGTH = 68
 INTERACTIVE_SOURCE_KINDS = ("cli", "vscode")
 ALL_SOURCE_KINDS = (
@@ -315,8 +315,9 @@ def _eligible(thread: Thread, *, now: int, minimum_age: int) -> bool:
     )
 
 
-def _verify_tree_readable(root: Path) -> None:
+def _session_files(root: Path) -> tuple[Path, ...]:
     pending = [root]
+    files: list[Path] = []
     while pending:
         directory = pending.pop()
         try:
@@ -324,17 +325,46 @@ def _verify_tree_readable(root: Path) -> None:
                 for entry in entries:
                     if entry.is_dir(follow_symlinks=False):
                         pending.append(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False):
+                        files.append(_normalized_path(Path(entry.path)))
         except OSError as exc:
             raise ArchiveError(
                 f"could not traverse session directory {directory}: {exc}"
             ) from exc
+    return tuple(files)
+
+
+def _run_lsof(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    last_timeout: subprocess.TimeoutExpired | None = None
+    for timeout in LSOF_TIMEOUTS_SECONDS:
+        try:
+            return subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            last_timeout = exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ArchiveError(
+                f"could not inspect open session files: {exc}"
+            ) from exc
+    if last_timeout is None:
+        raise ArchiveError("lsof has no configured timeout attempts")
+    raise ArchiveError(
+        f"could not inspect open session files: {last_timeout}"
+    ) from last_timeout
 
 
 def open_rollout_paths(sessions_dir: Path) -> set[Path]:
     sessions_dir = _normalized_path(sessions_dir)
     if not sessions_dir.is_dir():
         raise ArchiveError(f"session directory does not exist: {sessions_dir}")
-    _verify_tree_readable(sessions_dir)
+    session_files = _session_files(sessions_dir)
+    if not session_files:
+        return set()
 
     lsof = Path("/usr/sbin/lsof")
     if not lsof.is_file():
@@ -343,18 +373,16 @@ def open_rollout_paths(sessions_dir: Path) -> set[Path]:
             raise ArchiveError("lsof is not installed")
         lsof = Path(discovered)
 
-    try:
-        completed = subprocess.run(
-            [str(lsof), "-w", "-Fn", "+D", str(sessions_dir)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=LSOF_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ArchiveError(
-            f"could not inspect open session files: {exc}"
-        ) from exc
+    completed = _run_lsof(
+        [
+            str(lsof),
+            "-w",
+            "-Fn",
+            "-f",
+            "--",
+            *(str(path) for path in session_files),
+        ]
+    )
 
     if completed.stderr.strip():
         raise ArchiveError(
@@ -546,6 +574,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Archive eligible sessions instead of previewing the changes",
     )
     parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Show protected sessions and zero-result summaries",
+    )
+    parser.add_argument(
         "--minimum-age",
         type=_nonnegative_int,
         default=DEFAULT_MINIMUM_AGE_SECONDS,
@@ -617,7 +651,15 @@ async def run_cleanup(
         )
 
 
-def _print_result(result: CleanupResult, *, dry_run: bool) -> None:
+def _print_result(
+    result: CleanupResult,
+    *,
+    dry_run: bool,
+    verbose: bool,
+) -> None:
+    changed = bool(result.selected) if dry_run else result.archived > 0
+    if not changed and not verbose:
+        return
     for thread in result.kept:
         print(f"keeping: {thread.label}")
     for thread in result.selected:
@@ -630,18 +672,12 @@ def _print_result(result: CleanupResult, *, dry_run: bool) -> None:
             f"and {result.changed_before_archive} changed session(s)"
         )
         return
-    if (
-        result.archived
-        or result.kept
-        or result.blocked_families
-        or result.changed_before_archive
-    ):
-        print(
-            f"archived {result.archived} session(s); "
-            f"observed {result.open_families} open family(s); "
-            f"skipped {result.blocked_families} active/uncertain family(s) "
-            f"and {result.changed_before_archive} changed session(s)"
-        )
+    print(
+        f"archived {result.archived} session(s); "
+        f"observed {result.open_families} open family(s); "
+        f"skipped {result.blocked_families} active/uncertain family(s) "
+        f"and {result.changed_before_archive} changed session(s)"
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -662,7 +698,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (ArchiveError, OSError, TimeoutError, WebSocketException) as exc:
         print(f"codex-archive-inactive: {exc}", file=sys.stderr)
         return 1
-    _print_result(result, dry_run=dry_run)
+    _print_result(result, dry_run=dry_run, verbose=args.verbose)
     return 0
 
 

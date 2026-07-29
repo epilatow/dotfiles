@@ -99,6 +99,8 @@ def test_help_describes_scheduled_cleanup_options() -> None:
 
     assert result.returncode == 0
     assert "--apply" in result.stdout
+    assert "-v" in result.stdout
+    assert "--verbose" in result.stdout
     assert "--dry-run" not in result.stdout
     assert "--minimum-age SECONDS" in result.stdout
     assert "--socket" not in result.stdout
@@ -459,6 +461,9 @@ def test_open_rollout_paths_parses_lsof_names(
 ) -> None:
     first = tmp_path / "first.jsonl"
     second = tmp_path / "nested" / "second.jsonl"
+    second.parent.mkdir()
+    first.touch()
+    second.touch()
     with patch(
         "subprocess.run",
         autospec=True,
@@ -471,11 +476,15 @@ def test_open_rollout_paths_parses_lsof_names(
     ) as run:
         assert archive.open_rollout_paths(tmp_path) == {first, second}
     assert run.call_count == 1
+    command = run.call_args.args[0]
+    assert "+D" not in command
+    assert command[-2:] == [str(first), str(second)]
 
 
 def test_open_rollout_paths_accepts_lsof_no_matches(
     tmp_path: Path,
 ) -> None:
+    (tmp_path / "closed.jsonl").touch()
     with patch(
         "subprocess.run",
         autospec=True,
@@ -497,6 +506,7 @@ def test_open_rollout_paths_canonicalizes_symlinks(
     alias = tmp_path / "alias"
     alias.symlink_to(sessions_dir, target_is_directory=True)
     rollout = sessions_dir / "thread.jsonl"
+    rollout.touch()
     with patch(
         "subprocess.run",
         autospec=True,
@@ -527,6 +537,7 @@ def test_open_rollout_paths_fails_on_unreadable_tree(
 def test_open_rollout_paths_fails_closed(
     tmp_path: Path,
 ) -> None:
+    (tmp_path / "thread.jsonl").touch()
     with (
         patch(
             "subprocess.run",
@@ -541,6 +552,52 @@ def test_open_rollout_paths_fails_closed(
         pytest.raises(archive.ArchiveError, match="permission denied"),
     ):
         archive.open_rollout_paths(tmp_path)
+
+
+def test_open_rollout_paths_retries_a_timeout(
+    tmp_path: Path,
+) -> None:
+    rollout = tmp_path / "thread.jsonl"
+    rollout.touch()
+    with patch(
+        "subprocess.run",
+        autospec=True,
+        side_effect=(
+            subprocess.TimeoutExpired(cmd=["lsof"], timeout=15),
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout=f"p123\nf4\nn{rollout}\n",
+                stderr="",
+            ),
+        ),
+    ) as run:
+        assert archive.open_rollout_paths(tmp_path) == {rollout}
+
+    assert [call.kwargs["timeout"] for call in run.call_args_list] == [
+        15,
+        120,
+    ]
+
+
+def test_open_rollout_paths_fails_after_retry_timeout(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "thread.jsonl").touch()
+    with (
+        patch(
+            "subprocess.run",
+            autospec=True,
+            side_effect=(
+                subprocess.TimeoutExpired(cmd=["lsof"], timeout=15),
+                subprocess.TimeoutExpired(cmd=["lsof"], timeout=120),
+            ),
+        ) as run,
+        pytest.raises(archive.ArchiveError, match="timed out after 120"),
+    ):
+        archive.open_rollout_paths(tmp_path)
+
+    assert run.call_count == 2
 
 
 def test_ensure_app_server_starts_missing_default_socket(
@@ -604,9 +661,28 @@ def test_print_result_is_quiet_for_noop(
             blocked_families=0,
         ),
         dry_run=False,
+        verbose=False,
     )
 
     assert capsys.readouterr().out == ""
+
+    archive._print_result(
+        archive.CleanupResult(
+            selected=(),
+            kept=(),
+            archived=0,
+            open_families=0,
+            changed_before_archive=0,
+            blocked_families=0,
+        ),
+        dry_run=False,
+        verbose=True,
+    )
+
+    assert capsys.readouterr().out == (
+        "archived 0 session(s); observed 0 open family(s); skipped 0 "
+        "active/uncertain family(s) and 0 changed session(s)\n"
+    )
 
 
 def test_print_result_lists_dry_run_candidates(
@@ -640,6 +716,7 @@ def test_print_result_lists_dry_run_candidates(
             blocked_families=2,
         ),
         dry_run=True,
+        verbose=False,
     )
 
     assert capsys.readouterr().out == (
@@ -647,6 +724,48 @@ def test_print_result_lists_dry_run_candidates(
         "archiving: Useful session\n"
         "would archive 1 session(s); observed 1 open family(s); skipped 2 "
         "active/uncertain family(s) and 1 changed session(s)\n"
+    )
+
+
+def test_print_result_kept_noop_requires_verbose(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = archive.CleanupResult(
+        selected=(),
+        kept=(
+            archive.Thread(
+                thread_id="thread-2",
+                label="Active session",
+                updated_at=2_000,
+                status=archive.ThreadStatus.NOT_LOADED,
+                rollout_path=Path("/sessions/thread-2.jsonl"),
+                parent_thread_id=None,
+            ),
+        ),
+        archived=0,
+        open_families=1,
+        changed_before_archive=0,
+        blocked_families=0,
+    )
+
+    archive._print_result(
+        result,
+        dry_run=False,
+        verbose=False,
+    )
+
+    assert capsys.readouterr().out == ""
+
+    archive._print_result(
+        result,
+        dry_run=False,
+        verbose=True,
+    )
+
+    assert capsys.readouterr().out == (
+        "keeping: Active session\n"
+        "archived 0 session(s); observed 1 open family(s); skipped 0 "
+        "active/uncertain family(s) and 0 changed session(s)\n"
     )
 
 
