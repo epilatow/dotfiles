@@ -5,6 +5,7 @@ requires-python = ">=3.14"
 dependencies = [
     "epilatow-repo-shared",
     "pytest>=9.0.3",
+    "websockets>=16,<17",
 ]
 
 [tool.uv.sources]
@@ -12,6 +13,9 @@ epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = 
 
 [tool.pytest.ini_options]
 testpaths = ["_repo_shared/tests", "tests"]
+
+[tool.mypy]
+mypy_path = ["files/local/libexec/codex-archive-inactive"]
 
 [tool.repo-shared.code-quality]
 python-targets = [
