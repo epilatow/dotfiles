@@ -42,7 +42,6 @@ uuid        = "4c392a33-485b-4a2a-abd6-4d029d151769"
 command     = "~/.local/libexec/codex-archive-inactive/codex_archive_inactive.py --apply"
 gate        = "command -v codex"
 env.PATH    = "$PATH:$HOME/.local/bin"
-interval    = "1h"
 uuid        = "835402ee-69ce-41e4-ab02-c277ba9eeda4"
 
 [job.u-bins-brew]
