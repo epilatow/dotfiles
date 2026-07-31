@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = "7479009c79854700cfad35e12b7e988d00e302e6" }
+epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = "95b7151c35e5b199e9097fd3a8e3f79cdb7b390b" }
 
 [tool.pytest.ini_options]
 testpaths = ["_repo_shared/tests", "tests"]
