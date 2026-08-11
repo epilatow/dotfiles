@@ -89,6 +89,36 @@ blocks resolved by `uv` per-run; if a tool needs a dep, add it to the script's
 PEP 723 preamble or run via `uvx <tool>`. The user's system and per-user Python
 environments are off-limits.
 
+## Use the built-in file editors
+
+When the session exposes file-editing tools (Edit / Write / string-replace /
+notebook editors), every file modification goes through them. Do not build
+edits out of shell commands (`sed -i`, `awk ... > tmp && mv`, `echo >>`,
+heredocs, `perl -pi -e`) or one-off Python scripts when an editor tool could
+make the change.
+
+The editor tools fail loudly and atomically: an edit either applies or the tool
+errors, and the result is visible in the tool response. A chained shell edit
+has neither property -- a mid-chain failure can leave the file part-modified or
+untouched while the chain's overall exit status still reads as success, and the
+session carries on believing the edit landed.
+
+Legitimate non-editor cases, all of which own the whole transformation rather
+than splicing content by hand:
+
+- Purpose-built tools whose job is the rewrite: formatters (`ruff format`,
+  `mdformat`), `ruff check --fix`, codemods.
+- Whole-file moves and verbatim copies (`git mv`, `mv`, `cp` -- e.g. the
+  debugging backups above) -- no content is being spliced.
+- Bulk mechanical rewrites across many files where per-file editor calls are
+  impractical. Script it as a single dedicated step -- never chained to
+  anything else -- and verify the outcome with `git diff` / `grep` before
+  moving on.
+
+In a session with no editor tool, shell edits are unavoidable: run one command
+per step, check its exit status, and verify the file content after each edit
+rather than assuming the pipeline worked.
+
 ## Process management
 
 Spawn background processes in a new process group so the whole subtree carries
