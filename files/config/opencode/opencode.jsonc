@@ -6,8 +6,12 @@
         "z-ai/glm-5.2": {
           "options": {
             "provider": {
-              "order": ["z-ai"],
-              "allow_fallbacks": false,
+              "only": [
+                "z-ai",
+                "friendli",
+                "novita"
+              ],
+              "allow_fallbacks": true,
               "require_parameters": true
             }
           }
