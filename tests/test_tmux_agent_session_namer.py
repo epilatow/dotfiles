@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -33,6 +34,8 @@ CLAUDE_WRAPPER = (
     / "tmux-name.sh"
 )
 CODEX_HOOKS = REPO_ROOT / "files" / "codex" / "hooks.json"
+CRONY_CONFIG = REPO_ROOT / "files" / "config" / "crony" / "config.toml"
+ENVRC_ALIASES = REPO_ROOT / "files" / "envrc.aliases"
 
 
 @pytest.fixture
@@ -205,7 +208,7 @@ def test_codex_session_start_hook_uses_guarded_namer() -> None:
                             "command": (
                                 '"${HOME}/.local/libexec/'
                                 "tmux-agent-session-namer/"
-                                'tmux-agent-session-namer" codex'
+                                'tmux-agent-session-namer" codex-hook'
                             ),
                         }
                     ],
@@ -219,7 +222,7 @@ def test_codex_session_start_hook_uses_guarded_namer() -> None:
                             "command": (
                                 '"${HOME}/.local/libexec/'
                                 "tmux-agent-session-namer/"
-                                'tmux-agent-session-namer" codex'
+                                'tmux-agent-session-namer" codex-hook'
                             ),
                         }
                     ],
@@ -227,6 +230,115 @@ def test_codex_session_start_hook_uses_guarded_namer() -> None:
             ],
         }
     }
+
+
+def _write_argv_logger(path: Path, label: str) -> None:
+    path.write_text(
+        f"""#!/bin/sh
+printf '%s' '{label}' >> "$ARGV_LOG"
+for arg in "$@"; do
+    printf '\\t%s' "$arg" >> "$ARGV_LOG"
+done
+printf '\\n' >> "$ARGV_LOG"
+""",
+    )
+    path.chmod(0o755)
+
+
+def test_remote_mode_configures_tmux_client_before_codex(
+    tmp_path: Path,
+    fake_tmux: tuple[Path, Path],
+) -> None:
+    bin_dir = fake_tmux[0]
+    _write_argv_logger(bin_dir / "tmux", "tmux")
+    _write_argv_logger(bin_dir / "codex", "codex")
+    log = tmp_path / "argv.log"
+    env = os.environ.copy()
+    env.update(
+        {
+            "ARGV_LOG": str(log),
+            "PATH": f"{bin_dir}:{env['PATH']}",
+            "TMUX": "/tmp/tmux,fake,0",
+        },
+    )
+
+    result = subprocess.run(
+        [str(HELPER), "codex-remote", "resume", "thread id"],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    calls = log.read_text().splitlines()
+    assert all(call.startswith("tmux\t") for call in calls[:-1])
+    assert calls[-1] == (
+        "codex\t--remote\tunix://\t-c\t"
+        'tui.terminal_title=["thread-title"]\tresume\tthread id'
+    )
+
+
+def test_envrc_tcodex_functions_preserve_arguments(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_argv_logger(bin_dir / "tmux", "tmux")
+    log = tmp_path / "argv.log"
+    env = os.environ.copy()
+    env.update(
+        {
+            "ARGV_LOG": str(log),
+            "HOME": str(home),
+            "PATH": f"{bin_dir}:{env['PATH']}",
+        },
+    )
+
+    result = subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            '. "$1"; tcodex resume "thread id"; tcodexd --foo',
+            "sh",
+            str(ENVRC_ALIASES),
+        ],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    helper = (
+        f"{home}/.local/libexec/tmux-agent-session-namer/"
+        "tmux-agent-session-namer"
+    )
+    assert result.returncode == 0
+    assert log.read_text().splitlines() == [
+        f"tmux\tnew\t{helper}\tcodex-remote\tresume\tthread id",
+        (
+            f"tmux\tnew\t{helper}\tcodex-remote\t"
+            "--dangerously-bypass-approvals-and-sandbox\t--foo"
+        ),
+    ]
+
+
+def test_crony_runs_one_shared_remote_control_app_server() -> None:
+    config = tomllib.loads(CRONY_CONFIG.read_text())
+
+    assert config["job"]["codex-remote-control"] == {
+        "command": ("codex app-server --remote-control --listen unix://"),
+        "gate": "command -v codex",
+        "env": {"PATH": "$PATH:$HOME/.local/bin"},
+        "daemon": True,
+        "uuid": "4c392a33-485b-4a2a-abd6-4d029d151769",
+    }
+    assert "codex-archive" not in config["job"]
+    assert "u-hourly" not in config["job-group"]
+    assert config["target"]["host"]["squee"]["jobs"] == [
+        "u-weekly",
+        "u-daily",
+        "codex-remote-control",
+    ]
 
 
 def test_helper_is_python_314_uv_script() -> None:
@@ -246,7 +358,7 @@ def test_does_nothing_outside_tmux(
 ) -> None:
     result = run_helper(
         fake_tmux,
-        "codex",
+        "codex-hook",
         in_tmux=False,
     )
 
@@ -269,7 +381,7 @@ def test_codex_warns_and_skips_tmux_without_thread_only_title(
 ) -> None:
     result = run_helper(
         fake_tmux,
-        "codex",
+        "codex-hook",
         extra_env={"FAKE_CODEX_TERMINAL_TITLE": terminal_title},
     )
 
@@ -289,7 +401,7 @@ def test_codex_guard_rejects_global_title_even_if_project_enables_thread(
 ) -> None:
     result = run_helper(
         fake_tmux,
-        "codex",
+        "codex-hook",
         extra_env={
             "FAKE_CODEX_TERMINAL_TITLE": '["activity", "project"]',
             "FAKE_CODEX_PROJECT_TERMINAL_TITLE": '["thread"]',
@@ -312,7 +424,7 @@ def test_codex_guard_rejects_project_disabling_thread_title(
 ) -> None:
     result = run_helper(
         fake_tmux,
-        "codex",
+        "codex-hook",
         extra_env={
             "FAKE_CODEX_TERMINAL_TITLE": '["thread"]',
             "FAKE_CODEX_PROJECT_TERMINAL_TITLE": ('["spinner", "project"]'),
@@ -344,7 +456,7 @@ def test_codex_allocates_slot_and_tracks_thread_title(
 ) -> None:
     result = run_helper(
         fake_tmux,
-        "codex",
+        "codex-client",
         extra_env={
             "FAKE_CODEX_TERMINAL_TITLE": terminal_title,
             "FAKE_TMUX_USED_NUMS": "00\n01\n",
@@ -368,12 +480,33 @@ def test_codex_allocates_slot_and_tracks_thread_title(
     assert "set-option status-left-length 34" in commands
 
 
+def test_codex_client_trusts_the_launchers_title_override(
+    fake_tmux: tuple[Path, Path],
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        "codex-client",
+        extra_env={
+            "FAKE_CODEX_TERMINAL_TITLE": '["activity", "project"]',
+        },
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    commands = fake_tmux[1].read_text().splitlines()
+    assert any(
+        command.startswith("set-hook pane-title-changed ")
+        for command in commands
+    )
+    assert not fake_tmux[1].with_name("codex.log").exists()
+
+
 def test_codex_stop_renames_from_explicit_thread_name(
     fake_tmux: tuple[Path, Path],
 ) -> None:
     result = run_helper(
         fake_tmux,
-        "codex",
+        "codex-hook",
         extra_env={
             "FAKE_CODEX_TERMINAL_TITLE": '["thread"]',
             "FAKE_CODEX_THREAD_NAME": json.dumps("Feline Ideas"),
@@ -416,7 +549,7 @@ def test_codex_stop_falls_back_to_preview_and_allocates_slot(
 ) -> None:
     result = run_helper(
         fake_tmux,
-        "codex",
+        "codex-hook",
         extra_env={
             "FAKE_CODEX_TERMINAL_TITLE": '["thread"]',
             "FAKE_CODEX_THREAD_PREVIEW": json.dumps(
@@ -449,7 +582,7 @@ def test_codex_stop_treats_title_as_literal_tmux_format(
     tmux_environment = create_tmux_session(real_tmux_server, "literal")
     result = run_helper(
         fake_tmux,
-        "codex",
+        "codex-hook",
         extra_env={
             "FAKE_CODEX_TERMINAL_TITLE": '["thread"]',
             "FAKE_CODEX_THREAD_NAME": json.dumps(
@@ -481,7 +614,7 @@ def test_codex_pane_title_hook_treats_title_as_literal_tmux_format(
     tmux_environment = create_tmux_session(real_tmux_server, "literal")
     result = run_helper(
         fake_tmux,
-        "codex",
+        "codex-client",
         extra_env={
             "FAKE_CODEX_TERMINAL_TITLE": '["thread"]',
             **tmux_environment,
@@ -525,7 +658,7 @@ def test_concurrent_codex_starts_allocate_distinct_slots(
     def start_helper(tmux_environment: dict[str, str]) -> int:
         return run_helper(
             fake_tmux,
-            "codex",
+            "codex-client",
             extra_env={
                 "FAKE_CODEX_TERMINAL_TITLE": '["thread"]',
                 **tmux_environment,
@@ -558,7 +691,7 @@ def test_codex_stop_skips_tmux_without_thread_only_title(
 ) -> None:
     result = run_helper(
         fake_tmux,
-        "codex",
+        "codex-hook",
         extra_env={
             "FAKE_CODEX_TERMINAL_TITLE": '["activity", "project"]',
             "FAKE_CODEX_THREAD_NAME": json.dumps("Feline Ideas"),
@@ -590,7 +723,7 @@ def test_does_not_reuse_a_slot_when_all_are_allocated(
     used = "\n".join(f"{slot:02d}" for slot in range(100))
     result = run_helper(
         fake_tmux,
-        "codex",
+        "codex-client",
         extra_env={
             "FAKE_CODEX_TERMINAL_TITLE": '["thread"]',
             "FAKE_TMUX_USED_NUMS": used,
@@ -645,7 +778,7 @@ def test_claude_reuses_slot_and_strips_leading_status(
         (),
         ("other",),
         ("codex;bad",),
-        ("codex", "--require-codex-thread-title"),
+        ("codex-hook", "--require-codex-thread-title"),
         ("claude", "--strip-leading-status"),
     ],
 )

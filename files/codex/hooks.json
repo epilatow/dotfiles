@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${HOME}/.local/libexec/tmux-agent-session-namer/tmux-agent-session-namer\" codex"
+            "command": "\"${HOME}/.local/libexec/tmux-agent-session-namer/tmux-agent-session-namer\" codex-hook"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${HOME}/.local/libexec/tmux-agent-session-namer/tmux-agent-session-namer\" codex"
+            "command": "\"${HOME}/.local/libexec/tmux-agent-session-namer/tmux-agent-session-namer\" codex-hook"
           }
         ]
       }

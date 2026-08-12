@@ -41,6 +41,13 @@ class Agent(StrEnum):
     CODEX = "codex"
 
 
+class Invocation(StrEnum):
+    CLAUDE = "claude"
+    CODEX_CLIENT = "codex-client"
+    CODEX_HOOK = "codex-hook"
+    CODEX_REMOTE = "codex-remote"
+
+
 class CodexHookEvent(StrEnum):
     SESSION_START = "SessionStart"
     STOP = "Stop"
@@ -331,33 +338,56 @@ def _rename_tmux(agent: Agent, title: str) -> None:
     _run_tmux("rename-session", _literal_tmux_format(name))
 
 
-def _parse_agent(argv: list[str]) -> Agent | None:
-    if len(argv) != 1:
+def _parse_invocation(argv: list[str]) -> Invocation | None:
+    if not argv:
         return None
     try:
-        return Agent(argv[0])
+        invocation = Invocation(argv[0])
     except ValueError:
         return None
+    if invocation is not Invocation.CODEX_REMOTE and len(argv) != 1:
+        return None
+    return invocation
 
 
 def main(argv: list[str] | None = None) -> int:
     if not os.environ.get("TMUX"):
         return 0
 
-    agent = _parse_agent(argv if argv is not None else sys.argv[1:])
-    if agent is None:
+    invocation_args = argv if argv is not None else sys.argv[1:]
+    invocation = _parse_invocation(invocation_args)
+    if invocation is None:
         return 2
 
+    agent = Agent.CLAUDE if invocation is Invocation.CLAUDE else Agent.CODEX
     if agent is Agent.CODEX:
+        if invocation is Invocation.CODEX_REMOTE:
+            _configure_tmux(agent)
+            os.execvp(
+                "codex",
+                [
+                    "codex",
+                    "--remote",
+                    "unix://",
+                    "-c",
+                    'tui.terminal_title=["thread-title"]',
+                    *invocation_args[1:],
+                ],
+            )
+
+        if invocation is Invocation.CODEX_CLIENT:
+            _configure_tmux(agent)
+            return 0
+
         event, session_id = _read_codex_hook_input()
         title_config = codex_thread_title_config()
         if title_config is not CodexTitleConfig.CONFIGURED:
+            warning = (
+                CODEX_GLOBAL_TITLE_WARNING
+                if title_config is CodexTitleConfig.GLOBAL_MISCONFIGURED
+                else CODEX_PROJECT_TITLE_WARNING
+            )
             if event is CodexHookEvent.SESSION_START:
-                warning = (
-                    CODEX_GLOBAL_TITLE_WARNING
-                    if title_config is CodexTitleConfig.GLOBAL_MISCONFIGURED
-                    else CODEX_PROJECT_TITLE_WARNING
-                )
                 print(
                     json.dumps(
                         {

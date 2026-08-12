@@ -12,8 +12,16 @@ alias us="su"
 alias lcreset="unset LC_FIXED; set_locale"
 alias tclaude="tmux new claude"
 alias tclauded="tclaude --dangerously-skip-permissions"
-alias tcodex="tmux new codex  -c 'tui.terminal_title=[\"thread-title\"]'"
-alias tcodexd="tcodex --dangerously-bypass-approvals-and-sandbox"
+tcodex()
+{
+	tmux new \
+	    "$HOME/.local/libexec/tmux-agent-session-namer/tmux-agent-session-namer" \
+	    codex-remote "$@"
+}
+tcodexd()
+{
+	tcodex --dangerously-bypass-approvals-and-sandbox "$@"
+}
 alias ls="ls -F"
 
 # wrapper aliases
