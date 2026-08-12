@@ -551,6 +551,24 @@ A live instruction supersedes the standing one. "Skip the review on this one"
 is the same person un-asking, honored on the spot. Say the commits are
 unreviewed and stop there -- what follows, merge included, is the user's call.
 
+### Noninteractive subagents
+
+A noninteractive agent must not launch a child that can stop for interaction
+unless the parent or its controller will service that interaction. Configure
+the child so every expected action resolves to `allow` or `deny`, with no more
+authority than the task requires, before unattended work begins. Instructions
+in a prompt cannot answer a runtime permission request. This applies to the
+review subagent as well as development jobs, and does not move review ownership
+away from the implementing agent. If neither condition can be guaranteed, do
+not launch the child; report its gate as blocked.
+
+Every unattended child also needs a controller-enforced deadline and a recorded
+cancellation handle; for an external process, record its PID / process group. A
+deadline written only in the prompt is not enforcement, and a `running` status
+is not completion. A review counts only when its explicit response has been
+saved under the normal protocol below. If the child cannot complete, cancel it
+through that handle, preserve the worktree, and report the gate as blocked.
+
 ### When the review will not run
 
 A session may be unable to spawn the reviewer: no subagent tool exposed,

@@ -67,14 +67,14 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "epilatow-repo-shared", git = "https://github.com/epilatow/repo-shared?rev=44bb54eb3dc49f6e4de3daed4775c5d199ee8cb7" },
+    { name = "epilatow-repo-shared", git = "https://github.com/epilatow/repo-shared?rev=c8023c951c25c4797e7d98c7cd8f340cbb1fda89" },
     { name = "pytest", specifier = ">=9.0.3" },
 ]
 
 [[package]]
 name = "epilatow-repo-shared"
 version = "0.1.0"
-source = { git = "https://github.com/epilatow/repo-shared?rev=44bb54eb3dc49f6e4de3daed4775c5d199ee8cb7#44bb54eb3dc49f6e4de3daed4775c5d199ee8cb7" }
+source = { git = "https://github.com/epilatow/repo-shared?rev=c8023c951c25c4797e7d98c7cd8f340cbb1fda89#c8023c951c25c4797e7d98c7cd8f340cbb1fda89" }
 dependencies = [
     { name = "mdformat" },
     { name = "mdformat-gfm" },
