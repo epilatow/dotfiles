@@ -6,8 +6,7 @@ top of:
 - [DEVELOPMENT.md](DEVELOPMENT.md) -- repo-specific dev conventions for humans
   \+ agents (this file's human-side companion).
 - [DEVELOPMENT_SHARED_AGENT.md](DEVELOPMENT_SHARED_AGENT.md) -- shared
-  cross-repo agent conventions (plan-first protocol, SCM rules, commit-message
-  hygiene, code-review protocol).
+  cross-repo agent conventions.
 - [DEVELOPMENT_SHARED.md](DEVELOPMENT_SHARED.md) -- shared conventions for
   humans + agents.
 

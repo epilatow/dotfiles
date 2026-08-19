@@ -259,10 +259,11 @@ that mentions it.
 
 - Use `- component: Summary of change.` format. Match what's already in
   `git log`; the existing repo style is the source of truth.
-- Include a `Co-Authored-By:` trailer for AI-assisted commits.
 - Wrap the message body at about 72 columns. `git log` indents the body by four
   spaces when it displays it, so a wider body overruns 80 columns in the log;
-  the subject stays short and on one line.
+  the subject stays short and on one line. Trailers are exempt: a trailer is
+  one unbreakable token-value pair, and folding it would break the parsers that
+  read it, so a long one is allowed to overrun.
 
 **Explain the why, not the what.** The diff already shows what changed. The
 commit message should give a future reader the context they can't derive from
@@ -292,5 +293,14 @@ Specifically, do NOT include:
   in Y". `tmp/` files, code-review threads, and review inputs are working state
   that does not survive in `git log`. If a constraint matters, restate it
   inline; if it's just a paper trail, drop it.
+- Transient, machine-local, or private handles -- API keys, machine hostnames,
+  local filesystem paths, URLs into a private tracker or chat. A commit message
+  is a permanent record, world-readable on a public repo, while those handles
+  mean nothing to a later reader who cannot resolve them anyway. The test is
+  whether a stranger reading the commit years from now can still follow it, so
+  durable public references stay fine: an issue reference against this repo's
+  tracker (`Fixes #1234`), a link to a public upstream bug, and the authorship
+  trailers (`Co-Authored-By:`, `Signed-off-by:`, `Reported-by:`) that credit a
+  commit's contributors.
 
 [dclint]: https://github.com/zavoloklom/docker-compose-linter

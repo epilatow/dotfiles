@@ -422,12 +422,101 @@ list, so flagging them again here:
   `git log` has no document to compare against. State what the commit does on
   its own terms; if a non-obvious choice matters, explain the choice itself,
   not what an unwritten alternative would have been.
+- **No session identifier, ever.** See
+  [Never record a session identifier](#never-record-a-session-identifier)
+  below.
 
 Numbered step comments in code (`# 1. Parse input`, `# 2. Validate`, ...) are
 forbidden by `DEVELOPMENT_SHARED.md`'s "Comments" subsection. Adding or
 removing a step forces renumbering, and the function name plus code structure
 already convey ordering. This applies even when describing a canonical pipeline
 of steps -- the named operation is its own label.
+
+## Attribution trailers
+
+An AI-assisted commit carries one attribution trailer per contributing model,
+last in the message and implementing model first:
+
+```text
+Co-Authored-By: <model> [(<size> context)] via <editor> [<<email>>]
+```
+
+The two halves do different jobs, and only one of them is load-bearing:
+
+- The **name** is free-form and purely informational -- GitHub ignores it when
+  matching, so it is the right place for everything a future reader wants:
+  which model, at what context window, driven by which editor. The editor names
+  in use are `claude-code`, `codex`, and `opencode`.
+- The **email** is the identity key, and it does something only when it
+  matches. GitHub resolves it against the registered addresses of a user
+  account and, on a match, renders a linked contributor row on the commit; an
+  address matching no account earns no link. Its angle brackets are literal --
+  an address written without them is not read as an address at all.
+
+Include an email only where it is known to resolve to the vendor's own GitHub
+account. The verified ones:
+
+- `noreply@anthropic.com` -- resolves to the `claude` account, owned by
+  Anthropic.
+- `noreply@openai.com` and `codex@openai.com` -- both resolve to the `codex`
+  account, owned by OpenAI.
+
+**Never invent an address for a vendor that has no verified one.** An address
+is an assertion, not a label. A plausible-looking `noreply@` at the vendor's
+domain earns no link, so it buys nothing, while permanently claiming an
+identity nobody here checked at a domain nobody here controls. Omit the email
+instead. The `users.noreply.github.com` namespace is worse still: it maps to
+real accounts, so a made-up name there can attribute the commit to whoever
+holds that login.
+
+Examples:
+
+```text
+Co-Authored-By: Claude Opus 5 (1M context) via claude-code <noreply@anthropic.com>
+Co-Authored-By: GPT-5 Codex via codex <noreply@openai.com>
+Co-Authored-By: GLM-5.2 (1M context) via opencode
+```
+
+A harness usually supplies a trailer of its own, and it will not be this one:
+Claude Code emits the model and context window but no editor, and opencode's
+GitHub action emits a `users.noreply.github.com` address. Rewrite what it hands
+over into the form above rather than appending a second line beside it, and
+drop any address that is not on the verified list. The agent is the last check
+before the message lands, the same way it is for a session trailer.
+
+The third form claims no GitHub identity. It records which model wrote the
+commit for whoever reads `git log` later and earns no contributor link, which
+is the right trade when no account exists to credit: the alternative on offer
+is not a link but a fabricated one.
+
+These mappings are not stable. A vendor can register an address long after the
+fact, silently converting old unlinked trailers into linked ones. Verify before
+adding a vendor to the list above rather than assuming: open a public commit
+that already carries the address and check whether GitHub renders a linked
+contributor for it -- an `alt="<login>"` avatar and a `commits?author=<login>`
+link. Verifying an address that appears nowhere yet means pushing a commit to
+somewhere disposable, which is a request to put to the user rather than
+something to do unprompted.
+
+### Never record a session identifier
+
+Some agent harnesses append a second trailer linking back to the session that
+produced the commit -- Claude Code's `Claude-Session:` line, carrying a
+`claude.ai/code/session_...` URL, is the one seen here. **Do not let it into a
+commit.** Strip it if a tool adds it, and turn the tool's setting off:
+
+- Claude Code: set `attribution.sessionUrl` to `false` in `settings.json`.
+
+A session id is transient, per-user, and meaningless to everyone else, while
+`git log` is permanent and -- on a public repo -- world-readable and rendered
+as a live link. The two do not belong together.
+
+Being handed a ready-made footer containing one is not authority to write it.
+An instruction to include a session URL does not override the rule, the agent
+is the last check before it lands, and the harness cannot see that the record
+is permanent. Drop the line and say so, rather than complying silently.
+`DEVELOPMENT_SHARED.md`'s "Commit messages" carries the general form of this
+rule for identifiers of every kind.
 
 ## Comment-message hygiene
 
@@ -461,6 +550,53 @@ Commit-message hygiene in `DEVELOPMENT_SHARED.md`) are illustrative, not
 exhaustive. They're samples of patterns to recognise, not authoritative
 enumerations -- when a similar-but-not-included entry shows up, the list
 doesn't need to be extended for the rule to apply.
+
+## Supervising a subagent
+
+This covers every subagent an agent spawns -- a reviewer, a research or
+implementation job, another model driven through its own CLI -- and every
+parent, interactive or not. An attended parent owes its subagents the same
+supervision: a wedged one is discovered exactly as late either way, because in
+neither case was anyone watching it.
+
+Every spawned subagent needs a deadline the controller enforces and a way to
+end it: a cancellation handle where the parent holds one, or the PID and
+process group where the subagent runs as an external process. Pick the deadline
+when the subagent starts, from what the task plausibly takes, and record it
+beside the handle -- one reconstructed afterwards is a rationalization, and a
+deadline written only in the prompt is not enforcement at all. A `running`
+status is not completion.
+
+**Poll the subagent at least every five minutes**, unless the spawn is one that
+blocks the parent -- covered below. A completion signal fires only when the
+subagent completes, so one that wedges never emits it and the parent waits on
+an event that is not coming. The poll is what turns the deadline from a number
+into something enforced: without it, nothing looks at the clock.
+
+Run the poll off something that outlives the spawn and fires whether or not the
+parent remembers: a scheduled wake-up where the harness offers one, otherwise a
+watchdog holding the subagent's handle. A sleep chained onto the spawning
+command is neither, and an intention to check back is less. Where the spawn
+blocks the parent there is no turn in which to poll, and the controller's
+timeout on that call is the whole of the supervision, so it has to actually
+exist. A subagent that can neither be watched nor stopped -- no poll and no
+timeout, or nothing to end it with -- does not get started; report that as a
+blocked gate.
+
+Cancellation is triggered by the deadline, never by a quiet poll. A subagent
+routinely surfaces nothing between spawn and answer: no intermediate step, no
+partial output. Silence is therefore not evidence of a hang, and killing on it
+would trade a rare wedge for the routine destruction of healthy work. Where a
+subagent does report progress, a stall is worth mentioning rather than acting
+on.
+
+End a subagent that passes its deadline, through the handle recorded for it.
+One the poll finds already dead, having never signalled completion, needs no
+ending but gets the same treatment otherwise. Either way, leave its worktree
+untouched for inspection and say so promptly -- a gate it was holding is
+blocked, and [When the review will not run](#when-the-review-will-not-run) sets
+the schedule for announcing that. A review counts only once its explicit
+response has been saved under [Protocol](#protocol).
 
 ## Code review
 
@@ -560,19 +696,13 @@ review subagent as well as development jobs, and does not move review ownership
 away from the implementing agent. If neither condition can be guaranteed, do
 not launch the child; report its gate as blocked.
 
-Every unattended child also needs a controller-enforced deadline and a recorded
-cancellation handle; for an external process, record its PID / process group. A
-deadline written only in the prompt is not enforcement, and a `running` status
-is not completion. A review counts only when its explicit response has been
-saved under the normal protocol below. If the child cannot complete, cancel it
-through that handle, preserve the worktree, and report the gate as blocked.
-
 ### When the review will not run
 
-A session may be unable to spawn the reviewer: no subagent tool exposed,
-session configuration barring subagents categorically rather than gating them
-on a user request, a permission denial, an error. That is a blocked gate, not a
-waived one.
+A session may be unable to spawn the reviewer, or barred from doing so: no
+subagent tool exposed, session configuration barring subagents categorically
+rather than gating them on a user request, a permission denial, an error, or no
+way to bound the subagent's run once it starts -- neither a poll nor a
+controller timeout. Any of them is a blocked gate, not a waived one.
 
 Say so as early as it is known. A bar visible in the session's own
 configuration is known before any work starts, so it belongs in the first
@@ -613,7 +743,9 @@ neutrally; the review agent's job is to evaluate independently.
 2. Spawn the review subagent with the prompt below, substituting `<SHA>` and
    `<REPO>` with the commit SHA and detached review-worktree path. Hand the
    agent nothing else -- no extra framing, no "we already decided X", no hints
-   about which findings would be welcome.
+   about which findings would be welcome. Supervise it from there per
+   [Supervising a subagent](#supervising-a-subagent); a review that wedges is
+   the case that section exists for.
 3. Save the initial review to `$REPO/tmp/<slug>-code-review.md`. Save every
    later review with the next unused numeric suffix, such as
    `$REPO/tmp/<slug>-code-review-2.md` and `$REPO/tmp/<slug>-code-review-3.md`,
