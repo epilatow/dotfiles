@@ -5,20 +5,28 @@
 # ///
 """Name a tmux session after an agent session.
 
-The first agent to name a session owns it until the session ends, so an
-agent started inside another agent's pane leaves the name alone. Hand a
-session to a different agent by unsetting its owner with
-`tmux set-option -u @agent_namer` before starting that agent. A session
-carries one name, so a second agent in another of its panes still moves
-that name, now through the owner's slot and format.
+Only an agent tmux itself was told to run names anything: the pane must
+have been started with an agent launcher, so an agent typed at a shell
+prompt leaves that session's name alone. The name describes what tmux
+was opened to do, not whatever is running in it at the moment.
+
+Among the agents that qualify, the first to name a session owns it
+until the session ends, and one started inside another's pane leaves
+the name alone. A session carries one name, so an agent launched as the
+command of a second pane still moves that name, now through the owner's
+slot and format. To hand a session to a different agent, unset its
+owner with `tmux set-option -u @agent_namer` and start that agent as a
+pane's own command, since the prompt route is refused either way.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
 import select
+import shlex
 import subprocess
 import sys
 import time
@@ -41,6 +49,9 @@ CODEX_SESSION_OWNER_WARNING = (
 CODEX_THREAD_TITLE_IDS = frozenset(("thread", "thread-title"))
 TMUX_SLOT_LOCK = "tmux-agent-session-namer-slots"
 SESSION_AGENT_OPTION = "@agent_namer"
+# What tmux must have started a pane with for the session to be named:
+# the claude CLI, or this helper, which is how tcodex launches codex.
+AGENT_START_COMMANDS = frozenset(("claude", "tmux-agent-session-namer"))
 STATUS_RIGHT = (
     "#{?window_bigger,"
     "[#{window_offset_x}#,#{window_offset_y}] ,}"
@@ -315,6 +326,45 @@ def _slot_for(option: str) -> str | None:
     return None
 
 
+@functools.cache
+def _pane_starts_an_agent() -> bool:
+    """Report whether tmux was launched to run an agent in this pane.
+
+    tmux records the command it started the pane with and keeps it after
+    that command execs something else, so this still answers for a pane
+    whose agent has been running for days. An empty answer is a pane tmux
+    opened for a shell, whatever was later typed into it. Naming stops
+    rather than guessing wherever the answer cannot be had for the pane
+    we are in: an unset `TMUX_PANE`, an unparseable command, or a read
+    tmux refuses. It stops too where the launcher is unrecognisable as
+    one, which includes handing tmux the whole command as a single
+    argument -- `tmux new "claude --resume"` records the quoted string
+    and nothing splits it back apart.
+
+    Cached because the answer holds for one run of this process: what
+    rewrites it is `respawn-pane`, which replaces whatever the pane was
+    running. Ownership is the opposite, claimable by another agent
+    mid-run, so every caller re-reads that.
+    """
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return False
+
+    start = _run_tmux(
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        "#{pane_start_command}",
+        capture_output=True,
+    )
+    try:
+        argv = shlex.split(start)
+    except ValueError:
+        return False
+    return bool(argv) and os.path.basename(argv[0]) in AGENT_START_COMMANDS
+
+
 def _session_owner() -> str:
     return _run_tmux(
         "show-options",
@@ -327,13 +377,17 @@ def _session_owner() -> str:
 def _allocate_slot(agent: Agent) -> str | None:
     """Return this agent's slot, or None when it names nothing.
 
-    None covers a session another agent owns as well as `_slot_for`
-    finding no free number. Refusing the first matters because an agent
-    started inside another agent's pane would otherwise take the naming
-    over: the title still comes from the pane's own agent, so it would be
-    rendered under the wrong slot and through a format written for a
-    title the other agent never emits.
+    None covers a pane tmux did not start an agent in and a session
+    another agent owns, as well as `_slot_for` finding no free number.
+    Refusing the second matters because an agent started inside another
+    agent's pane would otherwise take the naming over: the title still
+    comes from the pane's own agent, so it would be rendered under the
+    wrong slot and through a format written for a title the other agent
+    never emits.
     """
+    if not _pane_starts_an_agent():
+        return None
+
     _run_tmux("wait-for", "-L", TMUX_SLOT_LOCK)
     try:
         owner = _session_owner()
@@ -427,9 +481,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         event, session_id = _read_codex_hook_input()
-        # _allocate_slot reads ownership again under the slot lock and is
-        # the authoritative check; this read is what keeps a refused
-        # session out of the app-server round-trips below.
+        # Both of these are read again by _allocate_slot, which is the
+        # authoritative gate; asking here is what keeps a pane it will
+        # refuse out of the app-server round-trips below.
+        if not _pane_starts_an_agent():
+            return 0
+
         owner = _session_owner()
         if owner and owner != agent:
             # Name the owner rather than the title configuration below,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shutil
@@ -7,7 +8,7 @@ import subprocess
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 import pytest
@@ -33,8 +34,13 @@ CLAUDE_WRAPPER = (
     / "hooks"
     / "tmux-name.sh"
 )
-OWNER_READ_ONLY_COMMANDS = ["show-options -qv @agent_namer"]
+PANE_START_COMMAND = "display-message -p -t %0 #{pane_start_command}"
+OWNER_READ_ONLY_COMMANDS = [
+    PANE_START_COMMAND,
+    "show-options -qv @agent_namer",
+]
 REFUSED_SLOT_COMMANDS = [
+    PANE_START_COMMAND,
     "wait-for -L tmux-agent-session-namer-slots",
     "show-options -qv @agent_namer",
     "wait-for -U tmux-agent-session-namer-slots",
@@ -54,6 +60,9 @@ def fake_tmux(tmp_path: Path) -> tuple[Path, Path]:
         """#!/bin/sh
 printf '%s\\n' "$*" >> "$FAKE_TMUX_LOG"
 case "$1" in
+    display-message)
+        printf '%s' "${FAKE_TMUX_START-claude}"
+        ;;
     show-options)
         case "$3" in
             @agent_namer)
@@ -134,8 +143,10 @@ def run_helper(
     )
     if in_tmux:
         env["TMUX"] = "/tmp/tmux,fake,0"
+        env["TMUX_PANE"] = "%0"
     else:
         env.pop("TMUX", None)
+        env.pop("TMUX_PANE", None)
     if extra_env is not None:
         env.update(extra_env)
 
@@ -191,13 +202,36 @@ def real_tmux_server(
         )
 
 
+def agent_stub(bin_dir: Path, name: str) -> Path:
+    """Write an executable named for an agent launcher that just waits.
+
+    It execs, the way tcodex's launcher becomes codex, so a session
+    built from one holds a pane whose running command is no longer the
+    command tmux recorded starting it with.
+    """
+    stub = bin_dir / name
+    stub.write_text("#!/bin/sh\nexec sleep 300\n")
+    stub.chmod(0o755)
+    return stub
+
+
 def create_tmux_session(
     real_tmux_server: tuple[str, str],
     name: str,
+    command: str | None = None,
 ) -> dict[str, str]:
     real_tmux, server = real_tmux_server
     subprocess.run(
-        [real_tmux, "-L", server, "new-session", "-d", "-s", name],
+        [
+            real_tmux,
+            "-L",
+            server,
+            "new-session",
+            "-d",
+            "-s",
+            name,
+            *([command] if command is not None else []),
+        ],
         check=True,
     )
     details = subprocess.run(
@@ -220,6 +254,30 @@ def create_tmux_session(
         "TMUX": f"{socket_path},{pid},{session_id.removeprefix('$')}",
         "TMUX_PANE": pane_id,
     }
+
+
+def accepted_start_commands() -> frozenset[str]:
+    """Read AGENT_START_COMMANDS out of the helper's source.
+
+    The helper is an extension-less uv script rather than an importable
+    module, and this needs the value the deployed script actually holds
+    rather than a copy of it kept here.
+    """
+    for node in ast.walk(ast.parse(HELPER.read_text())):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name)
+            and target.id == "AGENT_START_COMMANDS"
+            for target in node.targets
+        ):
+            continue
+        call = node.value
+        assert isinstance(call, ast.Call)
+        return frozenset(
+            cast("tuple[str, ...]", ast.literal_eval(call.args[0])),
+        )
+    raise AssertionError(f"AGENT_START_COMMANDS is unset in {HELPER}")
 
 
 def read_session_option(
@@ -274,6 +332,9 @@ def test_codex_session_start_hook_uses_guarded_namer() -> None:
 
 
 def _write_argv_logger(path: Path, label: str) -> None:
+    # The tmux logger answers the pane-start-command probe as a pane tmux
+    # was given an agent to run, so a logged run reaches the naming the
+    # caller is there to observe rather than being refused before it.
     path.write_text(
         f"""#!/bin/sh
 printf '%s' '{label}' >> "$ARGV_LOG"
@@ -281,6 +342,11 @@ for arg in "$@"; do
     printf '\\t%s' "$arg" >> "$ARGV_LOG"
 done
 printf '\\n' >> "$ARGV_LOG"
+case "$1" in
+    display-message)
+        printf '%s' "${{FAKE_TMUX_START-claude}}"
+        ;;
+esac
 """,
     )
     path.chmod(0o755)
@@ -300,6 +366,7 @@ def test_remote_mode_configures_tmux_client_before_codex(
             "ARGV_LOG": str(log),
             "PATH": f"{bin_dir}:{env['PATH']}",
             "TMUX": "/tmp/tmux,fake,0",
+            "TMUX_PANE": "%0",
         },
     )
 
@@ -314,6 +381,10 @@ def test_remote_mode_configures_tmux_client_before_codex(
     assert result.returncode == 0
     calls = log.read_text().splitlines()
     assert all(call.startswith("tmux\t") for call in calls[:-1])
+    assert any(
+        call.startswith("tmux\tset-hook\tpane-title-changed") for call in calls
+    )
+    assert any(call.startswith("tmux\trename-session") for call in calls)
     assert calls[-1] == (
         "codex\t--remote\tunix://\t-c\t"
         'tui.terminal_title=["thread-title"]\tresume\tthread id'
@@ -361,6 +432,53 @@ def test_envrc_tcodex_functions_preserve_arguments(tmp_path: Path) -> None:
             "--dangerously-bypass-approvals-and-sandbox\t--foo"
         ),
     ]
+
+
+def test_the_launcher_aliases_run_commands_the_helper_accepts(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_argv_logger(bin_dir / "tmux", "tmux")
+    log = tmp_path / "argv.log"
+    env = os.environ.copy()
+    env.update(
+        {
+            "ARGV_LOG": str(log),
+            "HOME": str(home),
+            "PATH": f"{bin_dir}:{env['PATH']}",
+        },
+    )
+
+    # tcodex is a function and runs as written. tclaude is an alias, and
+    # a non-interactive bash expands one only under expand_aliases and
+    # only on input parsed after the alias exists, hence the eval. A sh
+    # without either lands on the "new", "new" assertion below rather
+    # than passing quietly.
+    result = subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            (
+                'shopt -s expand_aliases 2>/dev/null; . "$1"; '
+                "eval tclaude; tcodex"
+            ),
+            "sh",
+            str(ENVRC_ALIASES),
+        ],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    launched = [call.split("\t") for call in log.read_text().splitlines()]
+    assert [argv[1] for argv in launched] == ["new", "new"]
+    assert accepted_start_commands() == {
+        os.path.basename(argv[2]) for argv in launched
+    }
 
 
 def test_crony_runs_one_shared_remote_control_app_server() -> None:
@@ -563,6 +681,7 @@ def test_codex_stop_renames_from_explicit_thread_name(
     assert result.returncode == 0
     assert result.stdout == ""
     assert fake_tmux[1].read_text().splitlines() == [
+        PANE_START_COMMAND,
         "show-options -qv @agent_namer",
         "wait-for -L tmux-agent-session-namer-slots",
         "show-options -qv @agent_namer",
@@ -610,6 +729,7 @@ def test_codex_stop_falls_back_to_preview_and_allocates_slot(
     assert result.returncode == 0
     assert result.stdout == ""
     assert fake_tmux[1].read_text().splitlines() == [
+        PANE_START_COMMAND,
         "show-options -qv @agent_namer",
         "wait-for -L tmux-agent-session-namer-slots",
         "show-options -qv @agent_namer",
@@ -626,7 +746,11 @@ def test_codex_stop_treats_title_as_literal_tmux_format(
     fake_tmux: tuple[Path, Path],
     real_tmux_server: tuple[str, str],
 ) -> None:
-    tmux_environment = create_tmux_session(real_tmux_server, "literal")
+    tmux_environment = create_tmux_session(
+        real_tmux_server,
+        "literal",
+        str(agent_stub(fake_tmux[0], "tmux-agent-session-namer")),
+    )
     result = run_helper(
         fake_tmux,
         "codex-hook",
@@ -658,7 +782,11 @@ def test_codex_pane_title_hook_treats_title_as_literal_tmux_format(
     fake_tmux: tuple[Path, Path],
     real_tmux_server: tuple[str, str],
 ) -> None:
-    tmux_environment = create_tmux_session(real_tmux_server, "literal")
+    tmux_environment = create_tmux_session(
+        real_tmux_server,
+        "literal",
+        str(agent_stub(fake_tmux[0], "tmux-agent-session-namer")),
+    )
     result = run_helper(
         fake_tmux,
         "codex-client",
@@ -698,7 +826,11 @@ def test_concurrent_codex_starts_allocate_distinct_slots(
 ) -> None:
     session_count = 12
     tmux_environments = [
-        create_tmux_session(real_tmux_server, f"concurrent-{number}")
+        create_tmux_session(
+            real_tmux_server,
+            f"concurrent-{number}",
+            str(agent_stub(fake_tmux[0], "tmux-agent-session-namer")),
+        )
         for number in range(session_count)
     ]
 
@@ -780,6 +912,7 @@ def test_does_not_reuse_a_slot_when_all_are_allocated(
     assert result.returncode == 0
     commands = fake_tmux[1].read_text().splitlines()
     assert commands == [
+        PANE_START_COMMAND,
         "wait-for -L tmux-agent-session-namer-slots",
         "show-options -qv @agent_namer",
         "show-options -qv @codex_num",
@@ -912,6 +1045,7 @@ def test_codex_stop_renames_a_session_it_already_owns(
 
     assert result.returncode == 0
     assert fake_tmux[1].read_text().splitlines() == [
+        PANE_START_COMMAND,
         "show-options -qv @agent_namer",
         "wait-for -L tmux-agent-session-namer-slots",
         "show-options -qv @agent_namer",
@@ -951,7 +1085,11 @@ def test_an_agent_started_inside_a_session_keeps_the_owners_naming(
     real_tmux_server: tuple[str, str],
     claude_home: Path,
 ) -> None:
-    tmux_environment = create_tmux_session(real_tmux_server, "owned")
+    tmux_environment = create_tmux_session(
+        real_tmux_server,
+        "owned",
+        str(agent_stub(fake_tmux[0], "tmux-agent-session-namer")),
+    )
     owner = run_helper(
         fake_tmux,
         "codex-client",
@@ -995,6 +1133,187 @@ def test_an_agent_started_inside_a_session_keeps_the_owners_naming(
         text=True,
     ).stdout.strip()
     assert session_name == "codex00-*-Nested-Title"
+
+
+@pytest.mark.parametrize(
+    ("start_command", "names_the_session"),
+    [
+        ("", False),
+        ("zsh", False),
+        ("vim", False),
+        ("claude-code-wrapper", False),
+        ('"claude --unbalanced', False),
+        ("claude --dangerously-skip-permissions", True),
+        ('"/opt/some path/claude" --dangerously-skip-permissions', True),
+        (
+            (
+                "/home/u/.local/libexec/tmux-agent-session-namer"
+                "/tmux-agent-session-namer codex-remote resume"
+            ),
+            True,
+        ),
+    ],
+)
+def test_only_a_pane_tmux_started_an_agent_in_is_named(
+    fake_tmux: tuple[Path, Path],
+    claude_home: Path,
+    start_command: str,
+    names_the_session: bool,
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        extra_env={
+            "FAKE_TMUX_CURRENT_NUM": "07",
+            "FAKE_TMUX_START": start_command,
+            "HOME": str(claude_home),
+        },
+        script=CLAUDE_WRAPPER,
+    )
+
+    assert result.returncode == 0
+    commands = fake_tmux[1].read_text().splitlines()
+    configured = any(
+        command.startswith("set-hook pane-title-changed ")
+        for command in commands
+    )
+    assert configured is names_the_session
+    if not names_the_session:
+        assert commands == [PANE_START_COMMAND]
+
+
+def test_nothing_is_named_when_tmux_names_no_pane(
+    fake_tmux: tuple[Path, Path],
+    claude_home: Path,
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        extra_env={
+            "FAKE_TMUX_CURRENT_NUM": "07",
+            "FAKE_TMUX_START": "claude",
+            "HOME": str(claude_home),
+            "TMUX_PANE": "",
+        },
+        script=CLAUDE_WRAPPER,
+    )
+
+    assert result.returncode == 0
+    assert not fake_tmux[1].exists()
+
+
+def test_codex_hook_reads_no_thread_for_a_pane_tmux_gave_a_shell(
+    fake_tmux: tuple[Path, Path],
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        "codex-hook",
+        extra_env={
+            "FAKE_CODEX_TERMINAL_TITLE": '["activity", "project"]',
+            "FAKE_TMUX_START": "",
+        },
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert fake_tmux[1].read_text().splitlines() == [PANE_START_COMMAND]
+    assert not fake_tmux[1].with_name("codex.log").exists()
+
+
+def test_a_session_is_named_from_the_command_tmux_started_it_with(
+    fake_tmux: tuple[Path, Path],
+    real_tmux_server: tuple[str, str],
+    claude_home: Path,
+) -> None:
+    tmux_environment = create_tmux_session(
+        real_tmux_server,
+        "launched",
+        str(agent_stub(fake_tmux[0], "claude")),
+    )
+
+    result = run_helper(
+        fake_tmux,
+        extra_env={"HOME": str(claude_home), **tmux_environment},
+        script=CLAUDE_WRAPPER,
+    )
+
+    assert result.returncode == 0
+    assert read_session_option(real_tmux_server, "@agent_namer") == "claude"
+    real_tmux, server = real_tmux_server
+    running = subprocess.run(
+        [
+            real_tmux,
+            "-L",
+            server,
+            "display-message",
+            "-p",
+            "-t",
+            tmux_environment["TMUX_PANE"],
+            "#{pane_current_command}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert running == "sleep"
+    subprocess.run(
+        [
+            real_tmux,
+            "-L",
+            server,
+            "select-pane",
+            "-t",
+            tmux_environment["TMUX_PANE"],
+            "-T",
+            "* Launched Title",
+        ],
+        check=True,
+    )
+    session_name = subprocess.run(
+        [real_tmux, "-L", server, "display-message", "-p", "#S"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert session_name == "claude00-Launched-Title"
+
+
+def test_a_shell_session_keeps_its_name_when_an_agent_starts_in_it(
+    fake_tmux: tuple[Path, Path],
+    real_tmux_server: tuple[str, str],
+    claude_home: Path,
+) -> None:
+    tmux_environment = create_tmux_session(real_tmux_server, "handmade")
+
+    result = run_helper(
+        fake_tmux,
+        extra_env={"HOME": str(claude_home), **tmux_environment},
+        script=CLAUDE_WRAPPER,
+    )
+
+    assert result.returncode == 0
+    real_tmux, server = real_tmux_server
+    subprocess.run(
+        [
+            real_tmux,
+            "-L",
+            server,
+            "select-pane",
+            "-t",
+            tmux_environment["TMUX_PANE"],
+            "-T",
+            "* Renamed Title",
+        ],
+        check=True,
+    )
+    session_name = subprocess.run(
+        [real_tmux, "-L", server, "display-message", "-p", "#S"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert session_name == "handmade"
+    assert read_session_option(real_tmux_server, "@agent_namer") == ""
+    assert read_session_option(real_tmux_server, "@claude_num") == ""
+    assert read_session_option(real_tmux_server, "pane-title-changed") == ""
 
 
 @pytest.mark.parametrize(

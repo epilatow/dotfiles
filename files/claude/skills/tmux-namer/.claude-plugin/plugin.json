@@ -1,6 +1,6 @@
 {
   "name": "tmux-namer",
-  "description": "Name the surrounding tmux session after the Claude Code conversation title, unless another agent already names it.",
+  "description": "Name the surrounding tmux session after the Claude Code conversation title, when tmux started this pane with Claude Code and no other agent already names it.",
   "version": "1.0.0",
   "author": {
     "name": "epilatow",
