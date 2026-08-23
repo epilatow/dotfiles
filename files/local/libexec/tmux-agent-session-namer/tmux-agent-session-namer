@@ -3,7 +3,15 @@
 # requires-python = ">=3.14"
 # dependencies = []
 # ///
-"""Name a tmux session after an agent session."""
+"""Name a tmux session after an agent session.
+
+The first agent to name a session owns it until the session ends, so an
+agent started inside another agent's pane leaves the name alone. Hand a
+session to a different agent by unsetting its owner with
+`tmux set-option -u @agent_namer` before starting that agent. A session
+carries one name, so a second agent in another of its panes still moves
+that name, now through the owner's slot and format.
+"""
 
 from __future__ import annotations
 
@@ -27,8 +35,12 @@ CODEX_PROJECT_TITLE_WARNING = (
     'tmux naming disabled: set [tui] terminal_title = ["thread"] in the '
     "applicable .codex/config.toml, then start a new Codex session."
 )
+CODEX_SESSION_OWNER_WARNING = (
+    "tmux naming disabled: {owner} already names this tmux session."
+)
 CODEX_THREAD_TITLE_IDS = frozenset(("thread", "thread-title"))
 TMUX_SLOT_LOCK = "tmux-agent-session-namer-slots"
+SESSION_AGENT_OPTION = "@agent_namer"
 STATUS_RIGHT = (
     "#{?window_bigger,"
     "[#{window_offset_x}#,#{window_offset_y}] ,}"
@@ -268,42 +280,77 @@ def _run_tmux(*args: str, capture_output: bool = False) -> str:
     return result.stdout.rstrip("\n") if capture_output else ""
 
 
-def _allocate_slot(option: str) -> str | None:
+def _slot_for(option: str) -> str | None:
+    """Return the session's slot for one agent, allocating a free one.
+
+    None once all hundred are in use. Callers hold TMUX_SLOT_LOCK, which
+    is what keeps two sessions starting at once from picking the same
+    number.
+    """
+    current = _run_tmux(
+        "show-options",
+        "-qv",
+        option,
+        capture_output=True,
+    )
+    if current:
+        return current
+
+    output = _run_tmux(
+        "list-sessions",
+        "-F",
+        f"#{{{option}}}",
+        capture_output=True,
+    )
+    used = {
+        line
+        for line in output.splitlines()
+        if re.fullmatch(r"[0-9][0-9]", line)
+    }
+    for number in range(100):
+        candidate = f"{number:02d}"
+        if candidate not in used:
+            _run_tmux("set-option", option, candidate)
+            return candidate
+    return None
+
+
+def _session_owner() -> str:
+    return _run_tmux(
+        "show-options",
+        "-qv",
+        SESSION_AGENT_OPTION,
+        capture_output=True,
+    )
+
+
+def _allocate_slot(agent: Agent) -> str | None:
+    """Return this agent's slot, or None when it names nothing.
+
+    None covers a session another agent owns as well as `_slot_for`
+    finding no free number. Refusing the first matters because an agent
+    started inside another agent's pane would otherwise take the naming
+    over: the title still comes from the pane's own agent, so it would be
+    rendered under the wrong slot and through a format written for a
+    title the other agent never emits.
+    """
     _run_tmux("wait-for", "-L", TMUX_SLOT_LOCK)
     try:
-        current = _run_tmux(
-            "show-options",
-            "-qv",
-            option,
-            capture_output=True,
-        )
-        if current:
-            return current
+        owner = _session_owner()
+        if owner and owner != agent:
+            return None
 
-        output = _run_tmux(
-            "list-sessions",
-            "-F",
-            f"#{{{option}}}",
-            capture_output=True,
-        )
-        used = {
-            line
-            for line in output.splitlines()
-            if re.fullmatch(r"[0-9][0-9]", line)
-        }
-        for number in range(100):
-            candidate = f"{number:02d}"
-            if candidate not in used:
-                _run_tmux("set-option", option, candidate)
-                return candidate
-        return None
+        slot = _slot_for(f"@{agent}_num")
+        if slot is not None and not owner:
+            _run_tmux("set-option", SESSION_AGENT_OPTION, agent)
+        return slot
     finally:
         _run_tmux("wait-for", "-U", TMUX_SLOT_LOCK)
 
 
 def _configure_tmux(agent: Agent) -> None:
     option = f"@{agent}_num"
-    if _allocate_slot(option) is None:
+    if _allocate_slot(agent) is None:
         return
 
     title = "#{pane_title}"
@@ -324,7 +371,7 @@ def _literal_tmux_format(value: str) -> str:
 
 
 def _rename_tmux(agent: Agent, title: str) -> None:
-    slot = _allocate_slot(f"@{agent}_num")
+    slot = _allocate_slot(agent)
     if slot is None:
         return
 
@@ -380,6 +427,31 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         event, session_id = _read_codex_hook_input()
+        # _allocate_slot reads ownership again under the slot lock and is
+        # the authoritative check; this read is what keeps a refused
+        # session out of the app-server round-trips below.
+        owner = _session_owner()
+        if owner and owner != agent:
+            # Name the owner rather than the title configuration below,
+            # which decides nothing while another agent owns the session.
+            # The hand-over command stays in this module's docstring: this
+            # message reaches whichever agent was refused, usually a nested
+            # one, and an agent told how to seize the name may take it.
+            if event is CodexHookEvent.SESSION_START:
+                print(
+                    json.dumps(
+                        {
+                            "continue": True,
+                            "systemMessage": (
+                                CODEX_SESSION_OWNER_WARNING.format(
+                                    owner=owner,
+                                )
+                            ),
+                        }
+                    )
+                )
+            return 0
+
         title_config = codex_thread_title_config()
         if title_config is not CodexTitleConfig.CONFIGURED:
             warning = (

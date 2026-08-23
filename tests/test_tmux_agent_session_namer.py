@@ -33,6 +33,12 @@ CLAUDE_WRAPPER = (
     / "hooks"
     / "tmux-name.sh"
 )
+OWNER_READ_ONLY_COMMANDS = ["show-options -qv @agent_namer"]
+REFUSED_SLOT_COMMANDS = [
+    "wait-for -L tmux-agent-session-namer-slots",
+    "show-options -qv @agent_namer",
+    "wait-for -U tmux-agent-session-namer-slots",
+]
 CODEX_HOOKS = REPO_ROOT / "files" / "codex" / "hooks.json"
 CRONY_CONFIG = REPO_ROOT / "files" / "config" / "crony" / "config.toml"
 ENVRC_ALIASES = REPO_ROOT / "files" / "envrc.aliases"
@@ -49,7 +55,14 @@ def fake_tmux(tmp_path: Path) -> tuple[Path, Path]:
 printf '%s\\n' "$*" >> "$FAKE_TMUX_LOG"
 case "$1" in
     show-options)
-        printf '%s' "${FAKE_TMUX_CURRENT_NUM-}"
+        case "$3" in
+            @agent_namer)
+                printf '%s' "${FAKE_TMUX_OWNER-}"
+                ;;
+            *)
+                printf '%s' "${FAKE_TMUX_CURRENT_NUM-}"
+                ;;
+        esac
         ;;
     list-sessions)
         printf '%s' "${FAKE_TMUX_USED_NUMS-}"
@@ -144,6 +157,21 @@ def run_helper(
 
 
 @pytest.fixture
+def claude_home(tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    installed_helper = (
+        home
+        / ".local"
+        / "libexec"
+        / "tmux-agent-session-namer"
+        / "tmux-agent-session-namer"
+    )
+    installed_helper.parent.mkdir(parents=True)
+    installed_helper.symlink_to(HELPER)
+    return home
+
+
+@pytest.fixture
 def real_tmux_server(
     fake_tmux: tuple[Path, Path],
 ) -> Iterator[tuple[str, str]]:
@@ -192,6 +220,19 @@ def create_tmux_session(
         "TMUX": f"{socket_path},{pid},{session_id.removeprefix('$')}",
         "TMUX_PANE": pane_id,
     }
+
+
+def read_session_option(
+    real_tmux_server: tuple[str, str],
+    option: str,
+) -> str:
+    real_tmux, server = real_tmux_server
+    return subprocess.run(
+        [real_tmux, "-L", server, "show-options", "-qv", option],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 def test_codex_session_start_hook_uses_guarded_namer() -> None:
@@ -393,7 +434,7 @@ def test_codex_warns_and_skips_tmux_without_thread_only_title(
             "start a new Codex session."
         ),
     }
-    assert not fake_tmux[1].exists()
+    assert fake_tmux[1].read_text().splitlines() == OWNER_READ_ONLY_COMMANDS
 
 
 def test_codex_guard_rejects_global_title_even_if_project_enables_thread(
@@ -416,7 +457,7 @@ def test_codex_guard_rejects_global_title_even_if_project_enables_thread(
             "start a new Codex session."
         ),
     }
-    assert not fake_tmux[1].exists()
+    assert fake_tmux[1].read_text().splitlines() == OWNER_READ_ONLY_COMMANDS
 
 
 def test_codex_guard_rejects_project_disabling_thread_title(
@@ -440,7 +481,7 @@ def test_codex_guard_rejects_project_disabling_thread_title(
             "session."
         ),
     }
-    assert not fake_tmux[1].exists()
+    assert fake_tmux[1].read_text().splitlines() == OWNER_READ_ONLY_COMMANDS
 
 
 @pytest.mark.parametrize(
@@ -522,8 +563,11 @@ def test_codex_stop_renames_from_explicit_thread_name(
     assert result.returncode == 0
     assert result.stdout == ""
     assert fake_tmux[1].read_text().splitlines() == [
+        "show-options -qv @agent_namer",
         "wait-for -L tmux-agent-session-namer-slots",
+        "show-options -qv @agent_namer",
         "show-options -qv @codex_num",
+        "set-option @agent_namer codex",
         "wait-for -U tmux-agent-session-namer-slots",
         "rename-session codex04-Feline-Ideas",
     ]
@@ -566,10 +610,13 @@ def test_codex_stop_falls_back_to_preview_and_allocates_slot(
     assert result.returncode == 0
     assert result.stdout == ""
     assert fake_tmux[1].read_text().splitlines() == [
+        "show-options -qv @agent_namer",
         "wait-for -L tmux-agent-session-namer-slots",
+        "show-options -qv @agent_namer",
         "show-options -qv @codex_num",
         "list-sessions -F #{@codex_num}",
         "set-option @codex_num 01",
+        "set-option @agent_namer codex",
         "wait-for -U tmux-agent-session-namer-slots",
         "rename-session codex01-Suggest-cat-names-plea",
     ]
@@ -704,7 +751,7 @@ def test_codex_stop_skips_tmux_without_thread_only_title(
 
     assert result.returncode == 0
     assert result.stdout == ""
-    assert not fake_tmux[1].exists()
+    assert fake_tmux[1].read_text().splitlines() == OWNER_READ_ONLY_COMMANDS
     codex_messages = [
         json.loads(line)
         for line in fake_tmux[1]
@@ -734,6 +781,7 @@ def test_does_not_reuse_a_slot_when_all_are_allocated(
     commands = fake_tmux[1].read_text().splitlines()
     assert commands == [
         "wait-for -L tmux-agent-session-namer-slots",
+        "show-options -qv @agent_namer",
         "show-options -qv @codex_num",
         "list-sessions -F #{@codex_num}",
         "wait-for -U tmux-agent-session-namer-slots",
@@ -741,22 +789,15 @@ def test_does_not_reuse_a_slot_when_all_are_allocated(
 
 
 def test_claude_reuses_slot_and_strips_leading_status(
-    tmp_path: Path,
     fake_tmux: tuple[Path, Path],
+    claude_home: Path,
 ) -> None:
-    home = tmp_path / "home"
-    installed_helper = (
-        home
-        / ".local"
-        / "libexec"
-        / "tmux-agent-session-namer"
-        / "tmux-agent-session-namer"
-    )
-    installed_helper.parent.mkdir(parents=True)
-    installed_helper.symlink_to(HELPER)
     result = run_helper(
         fake_tmux,
-        extra_env={"FAKE_TMUX_CURRENT_NUM": "07", "HOME": str(home)},
+        extra_env={
+            "FAKE_TMUX_CURRENT_NUM": "07",
+            "HOME": str(claude_home),
+        },
         script=CLAUDE_WRAPPER,
     )
 
@@ -770,6 +811,190 @@ def test_claude_reuses_slot_and_strips_leading_status(
         and "claude#{@claude_num}-#{s| |-|:#{s|^. ||:pane_title}}" in command
         for command in commands
     )
+    assert "set-option @agent_namer claude" in commands
+
+
+def test_codex_start_leaves_a_session_claude_names_alone(
+    fake_tmux: tuple[Path, Path],
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        "codex-client",
+        extra_env={
+            "FAKE_CODEX_TERMINAL_TITLE": '["thread"]',
+            "FAKE_TMUX_OWNER": "claude",
+        },
+    )
+
+    assert result.returncode == 0
+    assert fake_tmux[1].read_text().splitlines() == REFUSED_SLOT_COMMANDS
+
+
+@pytest.mark.parametrize(
+    ("hook_input", "expected_stdout"),
+    [
+        (
+            {"hook_event_name": "SessionStart", "session_id": "test"},
+            {
+                "continue": True,
+                "systemMessage": (
+                    "tmux naming disabled: claude already names this tmux "
+                    "session."
+                ),
+            },
+        ),
+        (
+            {"hook_event_name": "Stop", "session_id": "target-thread-id"},
+            None,
+        ),
+    ],
+)
+def test_codex_hook_leaves_a_session_claude_names_alone(
+    fake_tmux: tuple[Path, Path],
+    hook_input: Mapping[str, object],
+    expected_stdout: Mapping[str, object] | None,
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        "codex-hook",
+        extra_env={
+            "FAKE_CODEX_TERMINAL_TITLE": '["activity", "project"]',
+            "FAKE_CODEX_THREAD_NAME": json.dumps("Feline Ideas"),
+            "FAKE_TMUX_OWNER": "claude",
+        },
+        hook_input=hook_input,
+    )
+
+    assert result.returncode == 0
+    if expected_stdout is None:
+        assert result.stdout == ""
+    else:
+        assert json.loads(result.stdout) == expected_stdout
+    assert fake_tmux[1].read_text().splitlines() == OWNER_READ_ONLY_COMMANDS
+    assert not fake_tmux[1].with_name("codex.log").exists()
+
+
+def test_claude_leaves_a_session_codex_names_alone(
+    fake_tmux: tuple[Path, Path],
+    claude_home: Path,
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        extra_env={
+            "FAKE_TMUX_CURRENT_NUM": "07",
+            "FAKE_TMUX_OWNER": "codex",
+            "HOME": str(claude_home),
+        },
+        script=CLAUDE_WRAPPER,
+    )
+
+    assert result.returncode == 0
+    assert fake_tmux[1].read_text().splitlines() == REFUSED_SLOT_COMMANDS
+
+
+def test_codex_stop_renames_a_session_it_already_owns(
+    fake_tmux: tuple[Path, Path],
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        "codex-hook",
+        extra_env={
+            "FAKE_CODEX_TERMINAL_TITLE": '["thread"]',
+            "FAKE_CODEX_THREAD_NAME": json.dumps("Feline Ideas"),
+            "FAKE_TMUX_CURRENT_NUM": "04",
+            "FAKE_TMUX_OWNER": "codex",
+        },
+        hook_input={
+            "hook_event_name": "Stop",
+            "session_id": "target-thread-id",
+        },
+    )
+
+    assert result.returncode == 0
+    assert fake_tmux[1].read_text().splitlines() == [
+        "show-options -qv @agent_namer",
+        "wait-for -L tmux-agent-session-namer-slots",
+        "show-options -qv @agent_namer",
+        "show-options -qv @codex_num",
+        "wait-for -U tmux-agent-session-namer-slots",
+        "rename-session codex04-Feline-Ideas",
+    ]
+
+
+def test_claude_reconfigures_a_session_it_already_owns(
+    fake_tmux: tuple[Path, Path],
+    claude_home: Path,
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        extra_env={
+            "FAKE_TMUX_CURRENT_NUM": "07",
+            "FAKE_TMUX_OWNER": "claude",
+            "HOME": str(claude_home),
+        },
+        script=CLAUDE_WRAPPER,
+    )
+
+    assert result.returncode == 0
+    commands = fake_tmux[1].read_text().splitlines()
+    assert any(
+        command.startswith("set-hook pane-title-changed ")
+        for command in commands
+    )
+    assert not any(
+        command.startswith("set-option @agent_namer") for command in commands
+    )
+
+
+def test_an_agent_started_inside_a_session_keeps_the_owners_naming(
+    fake_tmux: tuple[Path, Path],
+    real_tmux_server: tuple[str, str],
+    claude_home: Path,
+) -> None:
+    tmux_environment = create_tmux_session(real_tmux_server, "owned")
+    owner = run_helper(
+        fake_tmux,
+        "codex-client",
+        extra_env={
+            "FAKE_CODEX_TERMINAL_TITLE": '["thread"]',
+            **tmux_environment,
+        },
+    )
+    assert owner.returncode == 0
+
+    nested = run_helper(
+        fake_tmux,
+        extra_env={"HOME": str(claude_home), **tmux_environment},
+        script=CLAUDE_WRAPPER,
+    )
+
+    assert nested.returncode == 0
+    assert read_session_option(real_tmux_server, "@agent_namer") == "codex"
+    assert read_session_option(real_tmux_server, "@claude_num") == ""
+    assert "codex#{@codex_num}-#{s| |-|:#{pane_title}}" in (
+        read_session_option(real_tmux_server, "pane-title-changed")
+    )
+    real_tmux, server = real_tmux_server
+    subprocess.run(
+        [
+            real_tmux,
+            "-L",
+            server,
+            "select-pane",
+            "-t",
+            tmux_environment["TMUX_PANE"],
+            "-T",
+            "* Nested Title",
+        ],
+        check=True,
+    )
+    session_name = subprocess.run(
+        [real_tmux, "-L", server, "display-message", "-p", "#S"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert session_name == "codex00-*-Nested-Title"
 
 
 @pytest.mark.parametrize(
