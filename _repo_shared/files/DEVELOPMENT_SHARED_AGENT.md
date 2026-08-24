@@ -67,9 +67,8 @@ apply.
   the full suite on that integrated tree, and re-run the per-commit gate as
   well: a replay rewrites every commit it carries over, so none of them has
   been gated in its new form. These are test gates only: rewritten commit SHAs
-  do not by themselves invalidate completed reviews. See
-  [Code review](#code-review) for the separate re-review triggers. Never merge
-  first and test afterward.
+  do not by themselves invalidate completed reviews. See the [re-review rule]
+  for the separate re-review triggers. Never merge first and test afterward.
 - **Look at file contents, not extensions.** Scripts that have
   `uv run --script` in their shebang are Python scripts, not shell scripts,
   regardless of file extension or lack thereof. Always open the file before
@@ -615,29 +614,8 @@ review from turning into a serial search where every amend starts another
 full-repo pass.
 
 After the review returns, address each finding directly in the commit (amend)
-and run the tests or gates affected by the fixes.
-
-The SHA is only a locator for a stable, committed review snapshot; changing it
-does not itself invalidate the review. Review follows the substantive change,
-not the commit object's identity. Once a review reports no P1/P2 findings and
-its other comments are addressed, consider that review complete. Do not repeat
-it merely because a commit message was edited, the commit was replayed onto a
-moved base without substantive conflict-resolution changes, or a lower commit
-in the stack was rewritten and therefore changed its descendants' SHAs. The
-replay and exact-candidate test gates still apply independently; rerunning them
-does not imply a new review.
-
-A fresh full re-review is required when post-review fixes materially change
-code or runtime behavior, including conflict resolution that requires logic
-changes, or address a P1/P2 finding. It is a full zero-context review of the
-amended commit, using the same protocol and prompt as the initial review. Like
-the initial review, it does not rerun the full suite.
-
-Continue the fix, full-suite, and full-review cycle while a review reports an
-actionable P1/P2 finding. Batch every review's findings; do not amend after the
-first issue and restart review before the reviewer finishes. Documentation,
-formatting, and other non-behavioral P3 fixes do not trigger another automatic
-review.
+and run the tests or gates affected by the fixes. Whether a fix also needs
+another review is settled per fix by the [re-review rule].
 
 Evaluate every P1/P2 finding against the user's original requirements and the
 approved plan, then try to address it within those constraints. A review
@@ -663,6 +641,50 @@ Findings the agent chooses NOT to address get appended to
 stays visible for the user's review. The agent cannot make that choice for a
 P1/P2 finding without stopping and obtaining user direction first; append it
 only if the user confirms that it should be rejected.
+
+### Re-review is triggered by the fix, not the finding
+
+A finding's severity says whether its fix ships before the commit does. It says
+nothing about whether the fix needs another review. That is decided per fix, by
+whether the amendment changes the commit's behavior enough that the completed
+review no longer covers it: a reworked or added code path, a changed contract
+that callers or users rely on, or a diff large enough to need a reader of its
+own. Such a fix gets a fresh full zero-context review of the amended commit,
+using the same protocol and prompt as the initial review; like the initial
+review, it does not rerun the full suite.
+
+Everything else is closed by amending and rerunning the affected tests or gates
+-- at any severity, P1 and P2 included:
+
+- Commit-message edits.
+- Documentation, docstring, and comment fixes.
+- Formatting and lint cleanups.
+- Adding tests, or tightening existing ones. A test relaxed or removed to clear
+  a finding is judged like the behavior it lets through.
+- Trivial logic changes: a corrected condition, an added guard, an off-by-one,
+  a fixed boundary -- anything a reader verifies from the amend's diff alone.
+- A replay onto a moved base, with its conflict resolution judged like any
+  other fix, and any other rewrite that changes the SHA and nothing else.
+
+When it is unclear whether a fix is notable enough, it is not. A marginal fix
+is a small delta on code the completed review already read, the affected tests
+have run against it, and the full suite runs on the exact candidate before
+merge; the cost of the other call is a full review cycle on every amend.
+
+The unit is the fix, never the commit or the stack. Four commits that each took
+a doc fix need zero re-reviews. A stack where one commit took a notable
+behavioral change needs one re-review, of that commit alone; its siblings, and
+the descendants whose SHAs moved because it was amended, keep their completed
+reviews. The SHA is only a locator for a stable snapshot -- review follows the
+substantive change, not the commit object's identity. The replay and
+exact-candidate test gates still apply on their own terms; rerunning them does
+not imply a new review.
+
+A review is complete once every finding it reported is fixed or rejected. The
+cycle continues only while a round of fixes contained one that triggered a
+re-review, which may report new findings that get the same per-fix treatment.
+Batch every review's findings; do not amend after the first issue and restart
+review before the reviewer finishes.
 
 ### Standing authorization: the spawn is already a user request
 
@@ -877,3 +899,5 @@ If a finding genuinely belongs in a separate follow-up commit (not just a
 rejection), surface that as an explicit suggestion to the user with the
 proposed scope, rather than self-rejecting. The user decides whether to fold it
 in or defer.
+
+[re-review rule]: #re-review-is-triggered-by-the-fix-not-the-finding
