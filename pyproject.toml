@@ -5,10 +5,22 @@ requires-python = ">=3.14"
 dependencies = [
     "epilatow-repo-shared",
     "pytest>=9.0.3",
+    # A libexec script reached through its `src/*.py` symlink is imported
+    # into this environment by its tests, so the environment has to carry
+    # what the script imports at module scope. The script itself resolves
+    # this from its own PEP 723 block when run.
+    "openpyxl",
 ]
 
 [tool.uv.sources]
 epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = "f895826ccb8e74e26a76b7124081d0e6b232b201" }
+
+[tool.mypy]
+# `tests/test_gas_prices_breakdown.py` imports its subject through the
+# `src/*.py` symlink, reaching it by extending sys.path at runtime. mypy
+# does not execute that, so the same directory has to be on its search
+# path for the import to resolve when the gate type-checks the test.
+mypy_path = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["_repo_shared/tests", "tests"]

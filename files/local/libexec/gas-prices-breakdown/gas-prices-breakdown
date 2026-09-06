@@ -28,17 +28,31 @@ Data sources used by add-snapshot:
   auction settlements (CARB_CCA_AUCTIONS), Washington CCA auction
   settlements (WA_CCA_AUCTIONS). The script logs a warning when an entry
   is older than CCA_STALE_DAYS.
+
+Exit status:
+  0  Success, including a run whose snapshot was already present.
+  1  A source was unreachable, or its content no longer parses. Each
+     fetch is retried (see HTTP_ATTEMPTS) before the run gives up, and
+     the failure is reported as one error line rather than a traceback.
+  2  Bad invocation, or a snapshot the arguments name that the file
+     does not contain.
+
+  Any other failure is a bug in this script and keeps its traceback.
 """
 
 from __future__ import annotations
 
 import argparse
 import gzip
+import http.client
 import logging
 import re
 import shutil
 import sys
+import time
+import urllib.error
 import urllib.request
+import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -196,12 +210,68 @@ TIMES = "\u00d7"
 log = logging.getLogger("gas-prices-breakdown")
 
 
+class SnapshotError(Exception):
+    """A run cannot produce a snapshot, for a reason worth reporting.
+
+    Covers an unreachable source and a source whose content no longer
+    has the shape the parsers expect. Both are conditions of the world
+    rather than bugs in this script, so `main` reports one as a single
+    error line and a nonzero exit; anything else keeps its traceback.
+    """
+
+
+class FetchError(SnapshotError):
+    """An HTTP source could not be read."""
+
+
+# Retry budget for a single URL. The scheduled run happens in a macOS
+# DarkWake window, where the host can drop back to sleep mid-request and
+# leave the connection reset on the far side; the retry is what turns
+# that into a delay instead of a failed run. Delays grow 5s, 15s, 45s.
+HTTP_ATTEMPTS = 4
+HTTP_BACKOFF_SEC = 5.0
+HTTP_BACKOFF_FACTOR = 3.0
+
+# Response codes worth another attempt. Everything else in the 4xx range
+# describes the request, which a retry would repeat unchanged.
+HTTP_RETRY_STATUSES = frozenset({408, 429})
+
+# Failures that say nothing about whether a later attempt would work:
+# DNS and connect errors (URLError), a connection dropped mid-response,
+# a read that timed out, a malformed or truncated HTTP response, and a
+# gzip body cut short by any of the above.
+TRANSIENT_ERRORS: tuple[type[Exception], ...] = (
+    urllib.error.URLError,
+    ConnectionError,
+    TimeoutError,
+    http.client.HTTPException,
+    gzip.BadGzipFile,
+)
+
+
+def _describe(exc: BaseException) -> str:
+    """Render `exc` as "Type: message".
+
+    The message alone is routinely ambiguous -- `[Errno 54] Connection
+    reset by peer` reads the same whoever raised it -- and the class is
+    what identifies the failure in a log.
+    """
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _retryable(exc: Exception) -> bool:
+    """Whether another identical request could plausibly succeed."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in HTTP_RETRY_STATUSES or exc.code >= 500
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Fetch helpers
 # ---------------------------------------------------------------------------
 
 
-def _http_bytes(url: str) -> bytes:
+def _http_bytes_once(url: str) -> bytes:
     """GET `url` and return the decompressed response body."""
     req = urllib.request.Request(
         url,
@@ -222,6 +292,37 @@ def _http_bytes(url: str) -> bytes:
     return body
 
 
+def _http_bytes(url: str) -> bytes:
+    """GET `url`, retrying transient failures, and return the body.
+
+    Raises `FetchError` once the attempts are spent, or immediately for
+    a failure that describes the request rather than the connection.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return _http_bytes_once(url)
+        except TRANSIENT_ERRORS as exc:
+            if not _retryable(exc):
+                raise FetchError(f"GET {url}: {_describe(exc)}") from exc
+            if attempt >= HTTP_ATTEMPTS:
+                raise FetchError(
+                    f"GET {url}: {_describe(exc)} "
+                    f"(giving up after {attempt} attempts)"
+                ) from exc
+            delay = HTTP_BACKOFF_SEC * HTTP_BACKOFF_FACTOR ** (attempt - 1)
+            log.warning(
+                "attempt %d/%d for %s failed (%s); retrying in %.0fs",
+                attempt,
+                HTTP_ATTEMPTS,
+                url,
+                _describe(exc),
+                delay,
+            )
+            time.sleep(delay)
+
+
 def _http_text(url: str) -> str:
     """GET `url` and decode the body as UTF-8, replacing bad bytes.
 
@@ -230,6 +331,38 @@ def _http_text(url: str) -> str:
     is preferable to failing the whole run on one bad byte.
     """
     return _http_bytes(url).decode("utf-8", errors="replace")
+
+
+def read_html(path: Path) -> str:
+    """Read the page every subcommand operates on.
+
+    The path is supplied on the command line -- by a scheduled job that
+    cannot answer a prompt -- so a missing or unreadable file is an
+    ordinary bad-input condition, not a defect worth a traceback.
+    """
+    try:
+        return path.read_text()
+    except OSError as exc:
+        raise SnapshotError(f"cannot read {path}: {_describe(exc)}") from exc
+
+
+def _load_workbook(path: Path, source: str) -> openpyxl.Workbook:
+    """Open a downloaded xlsx, naming `source` if it will not open.
+
+    A source that answers with an HTML error page instead of the
+    workbook still returns 200, so the substitution surfaces here as a
+    zip that will not open rather than as a failed fetch.
+    """
+    try:
+        return openpyxl.load_workbook(path, data_only=True)
+    # A body that is not a zip at all raises BadZipFile; one that is a
+    # zip without the parts an xlsx must have raises KeyError naming the
+    # first part openpyxl looked for. Both mean the same thing here.
+    except (zipfile.BadZipFile, KeyError) as exc:
+        raise SnapshotError(
+            f"{source}: downloaded file is not a readable xlsx "
+            f"({_describe(exc)})"
+        ) from exc
 
 
 def most_recent_thursday(today: date | None = None) -> date:
@@ -253,7 +386,7 @@ def fetch_aaa_retail() -> dict[str, float]:
         re.DOTALL,
     )
     if not table_match:
-        raise RuntimeError("AAA: sortable table not found on page")
+        raise SnapshotError("AAA: sortable table not found on page")
     rows = re.findall(r"<tr[^>]*>(.*?)</tr>", table_match.group(1), re.DOTALL)
     out: dict[str, float] = {}
     for tr in rows[1:]:
@@ -266,14 +399,14 @@ def fetch_aaa_retail() -> dict[str, float]:
         state = re.sub(r"\s+", " ", name_match.group(1)).strip()
         state = state.replace("&amp;", "&")
         if state not in STATE_CODE:
-            raise RuntimeError(f"AAA: unrecognized state {state!r}")
+            raise SnapshotError(f"AAA: unrecognized state {state!r}")
         if len(tds) < 2:
-            raise RuntimeError(f"AAA: missing price columns for {state}")
+            raise SnapshotError(f"AAA: missing price columns for {state}")
         clean = re.sub(r"<[^>]+>", "", tds[1])
         clean = re.sub(r"\s+", " ", clean).strip().lstrip("$")
         out[STATE_CODE[state]] = float(clean)
     if len(out) != 51:
-        raise RuntimeError(f"AAA: parsed {len(out)} states, expected 51")
+        raise SnapshotError(f"AAA: parsed {len(out)} states, expected 51")
     return out
 
 
@@ -300,7 +433,7 @@ def fetch_lcfs_for_target_date(target: date, cache_dir: Path) -> LcfsWeek:
         landing,
     )
     if not href_match:
-        raise RuntimeError("CARB LCFS: xlsx link not found on landing page")
+        raise SnapshotError("CARB LCFS: xlsx link not found on landing page")
     url = href_match.group(1)
     if url.startswith("/"):
         url = "https://ww2.arb.ca.gov" + url
@@ -315,17 +448,17 @@ def fetch_lcfs_for_target_date(target: date, cache_dir: Path) -> LcfsWeek:
         else:
             break
     if selected is None:
-        raise RuntimeError(f"CARB LCFS: no week with monday <= {cutoff}")
+        raise SnapshotError(f"CARB LCFS: no week with monday <= {cutoff}")
     return LcfsWeek(
         monday=selected[0], vwap_per_mt=selected[1], source_xlsx_url=url
     )
 
 
 def _read_lcfs_weekly(path: Path) -> list[tuple[date, float]]:
-    wb = openpyxl.load_workbook(path, data_only=True)
+    wb = _load_workbook(path, "CARB LCFS")
     sheet_name = "Weekly Average Credit Price"
     if sheet_name not in wb.sheetnames:
-        raise RuntimeError(f"CARB LCFS xlsx missing sheet {sheet_name!r}")
+        raise SnapshotError(f"CARB LCFS xlsx missing sheet {sheet_name!r}")
     sh = wb[sheet_name]
     weeks: list[tuple[date, float]] = []
     for row in sh.iter_rows(min_row=2, values_only=True):
@@ -343,7 +476,7 @@ def _read_lcfs_weekly(path: Path) -> list[tuple[date, float]]:
             continue
         weeks.append((monday, float(b)))
     if not weeks:
-        raise RuntimeError("CARB LCFS xlsx: no weekly rows parsed")
+        raise SnapshotError("CARB LCFS xlsx: no weekly rows parsed")
     return weeks
 
 
@@ -367,7 +500,7 @@ def latest_auction(
         if entry[0] <= target:
             selected = entry
     if selected is None:
-        raise RuntimeError("no auction entry before target")
+        raise SnapshotError("no auction entry before target")
     return AuctionSettlement(
         effective=selected[0], price=selected[1], label=selected[2]
     )
@@ -401,7 +534,7 @@ def fetch_or_cfp_for_target_date(target: date, cache_dir: Path) -> OrCfpMonth:
         if avail <= target:
             candidates.append(((y, m), price))
     if not candidates:
-        raise RuntimeError("OR CFP: no monthly value available as of target")
+        raise SnapshotError("OR CFP: no monthly value available as of target")
     (y, m), price = max(candidates, key=lambda t: t[0])
     return OrCfpMonth(
         year_month=f"{y}-{m:02d}",
@@ -411,10 +544,10 @@ def fetch_or_cfp_for_target_date(target: date, cache_dir: Path) -> OrCfpMonth:
 
 
 def _read_or_cfp_monthly(path: Path) -> dict[tuple[int, int], float]:
-    wb = openpyxl.load_workbook(path, data_only=True)
+    wb = _load_workbook(path, "OR CFP")
     sheet_name = "Monthly Credit Transfer Summary"
     if sheet_name not in wb.sheetnames:
-        raise RuntimeError(f"OR CFP xlsx missing sheet {sheet_name!r}")
+        raise SnapshotError(f"OR CFP xlsx missing sheet {sheet_name!r}")
     sh = wb[sheet_name]
     out: dict[tuple[int, int], float] = {}
     year: int | None = None
@@ -430,7 +563,7 @@ def _read_or_cfp_monthly(path: Path) -> dict[tuple[int, int], float]:
             continue
         out[(year, MONTHS[b])] = float(e)
     if not out:
-        raise RuntimeError("OR CFP xlsx: no monthly rows parsed")
+        raise SnapshotError("OR CFP xlsx: no monthly rows parsed")
     return out
 
 
@@ -460,7 +593,7 @@ def parse_snapshots(html_text: str) -> Snapshots:
     )
     matches = list(array_pattern.finditer(html_text))
     if len(matches) != 1:
-        raise RuntimeError(
+        raise SnapshotError(
             f"expected exactly one SNAPSHOTS array, found {len(matches)}"
         )
     array_body = matches[0].group(1)
@@ -556,7 +689,7 @@ def extract_data_block(snapshot_block: str) -> str:
         snapshot_block,
     )
     if not m:
-        raise RuntimeError("could not extract data array from snapshot block")
+        raise SnapshotError("could not extract data array from snapshot block")
     return m.group(1) + "\n"
 
 
@@ -570,14 +703,14 @@ def split_state_blocks(text: str) -> list[tuple[str, str]]:
         m.start() for m in re.finditer(r'^  \{ code:"', text, re.MULTILINE)
     ]
     if not starts:
-        raise RuntimeError("no per-state blocks found")
+        raise SnapshotError("no per-state blocks found")
     out: list[tuple[str, str]] = []
     for i, s in enumerate(starts):
         end = starts[i + 1] if i + 1 < len(starts) else len(text)
         chunk = text[s:end]
         m = re.match(r'  \{ code:"([A-Z]{2})"', chunk)
         if not m:
-            raise RuntimeError(f"bad per-state block prefix: {chunk[:60]!r}")
+            raise SnapshotError(f"bad per-state block prefix: {chunk[:60]!r}")
         out.append((m.group(1), chunk))
     return out
 
@@ -707,7 +840,7 @@ def build_data_block(
     out: list[str] = []
     for code, chunk in blocks:
         if code not in retail:
-            raise RuntimeError(f"missing retail price for {code}")
+            raise SnapshotError(f"missing retail price for {code}")
         chunk = replace_retail(chunk, retail[code])
         if code == "CA":
             chunk = swap_nontax(chunk, build_ca_nontax(target, lcfs, cca))
@@ -766,20 +899,22 @@ def build_snapshot_object(
 def sanity_check_snapshot(snapshot: str, target: date) -> None:
     n_states = len(re.findall(r'^  \{ code:"', snapshot, re.MULTILINE))
     if n_states != 51:
-        raise RuntimeError(f"sanity: expected 51 states, got {n_states}")
+        raise SnapshotError(f"sanity: expected 51 states, got {n_states}")
     m = re.search(r'date: "(\d{4}-\d{2}-\d{2})"', snapshot)
     if not m or m.group(1) != target.isoformat():
-        raise RuntimeError("sanity: date in built block does not match target")
+        raise SnapshotError(
+            "sanity: date in built block does not match target"
+        )
     retail_values = [
         float(v) for v in re.findall(r"retail:([0-9]+\.[0-9]+),", snapshot)
     ]
     if len(retail_values) != 51:
-        raise RuntimeError(
+        raise SnapshotError(
             f"sanity: expected 51 retail values, got {len(retail_values)}"
         )
     if not all(1.0 < v < 12.0 for v in retail_values):
         bad = [v for v in retail_values if not (1.0 < v < 12.0)]
-        raise RuntimeError(
+        raise SnapshotError(
             f"sanity: retail values outside plausible range: {bad}"
         )
 
@@ -834,7 +969,7 @@ def block_summary(block: str) -> tuple[str, int, str]:
 
 
 def cmd_list_snapshots(args: argparse.Namespace) -> int:
-    text = args.html.read_text()
+    text = read_html(args.html)
     snapshots = parse_snapshots(text)
     print(f"{len(snapshots.blocks)} snapshots in {args.html}:")
     print(f"  {'date':10s}  {'states':>6s}  notes")
@@ -851,14 +986,13 @@ def cmd_list_snapshots(args: argparse.Namespace) -> int:
 
 
 def cmd_add_snapshot(args: argparse.Namespace) -> int:
-    setup_logging()
     target = args.target or most_recent_thursday()
     log.info("target snapshot date: %s (%s)", target, target.strftime("%a"))
 
     cache_dir = Path.home() / ".cache" / "gas-prices-breakdown"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    html_text = args.html.read_text()
+    html_text = read_html(args.html)
     snapshots = parse_snapshots(html_text)
     log.info(
         "loaded %d existing snapshots from %s",
@@ -953,8 +1087,7 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
 
 
 def cmd_remove_snapshot(args: argparse.Namespace) -> int:
-    setup_logging()
-    text = args.html.read_text()
+    text = read_html(args.html)
     snapshots = parse_snapshots(text)
 
     needle = f'date: "{args.snapshot_date}"'
@@ -1003,11 +1136,10 @@ def cmd_remove_snapshot(args: argparse.Namespace) -> int:
 
 
 def cmd_extract_markdown(args: argparse.Namespace) -> int:
-    text = args.html.read_text()
+    text = read_html(args.html)
     match = re.search(r"const SPEC_MD = `([\s\S]*?)`;", text)
     if not match:
-        print(f"SPEC_MD not found in {args.html}", file=sys.stderr)
-        return 2
+        raise SnapshotError(f"SPEC_MD not found in {args.html}")
     # Reverse JS template-literal escapes: any '\X' in the source represents
     # 'X' in the rendered string. Backticks and dollar-signs (the two
     # template-literal sentinels) commonly appear escaped; '\\' compresses
@@ -1105,10 +1237,15 @@ def main(argv: list[str] | None = None) -> int:
     p_md.set_defaults(func=cmd_extract_markdown)
 
     args = parser.parse_args(argv)
+    setup_logging()
     # `func` reaches argparse as an opaque default, so its type has to
     # be restated here for the subcommand contract to be checked.
     handler: Callable[[argparse.Namespace], int] = args.func
-    return handler(args)
+    try:
+        return handler(args)
+    except SnapshotError as exc:
+        log.error("%s", exc)
+        return 1
 
 
 if __name__ == "__main__":
