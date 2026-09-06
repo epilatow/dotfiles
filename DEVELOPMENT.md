@@ -25,3 +25,13 @@ uv run pytest
 ```
 
 Repository-local tests live under `tests/`.
+
+### Reaching an extension-less script
+
+The tools under `files/local/libexec/` are shebang scripts with no `.py`
+extension, so the code-quality gate's `*.py` discovery cannot find them by
+name. Two ways to expose one:
+
+- `src/<module>.py`, a symlink to the script. The gate lints and type-checks it
+  through that path.
+- Its real path in `[tool.repo-shared.code-quality] python-targets`.

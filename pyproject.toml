@@ -14,6 +14,10 @@ epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = 
 testpaths = ["_repo_shared/tests", "tests"]
 
 [tool.repo-shared.code-quality]
+# The libexec entries are shebang scripts with no `.py` extension, which
+# the gate's `rglob("*.py")` discovery cannot see. Two ways to reach one:
+# a `src/<module>.py` symlink to it, which additionally gives the script
+# a module name, or an explicit path here.
 python-targets = [
     "files/local/libexec/tmux-agent-session-namer/tmux-agent-session-namer",
 ]
