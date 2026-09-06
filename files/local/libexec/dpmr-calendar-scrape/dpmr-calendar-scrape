@@ -16,6 +16,16 @@ iCal export endpoint and its agenda-action deep links are firewalled
 /calendar/exact_date~M-D-YYYY/, which shows roughly two weeks of events
 starting from the supplied date. We walk that 14 days at a time until
 we reach the horizon, dedupe by event instance id, and emit one .ics.
+
+Exit status:
+  0  Success, whether or not the output changed.
+  1  The site was unreachable, no events could be parsed from it, or
+     the output could not be read or written. Each window is retried
+     (see HTTP_ATTEMPTS) before the run gives up, and the failure is
+     reported as one error line rather than a traceback.
+  2  Bad invocation.
+
+  Any other failure is a bug in this script and keeps its traceback.
 """
 
 from __future__ import annotations
@@ -23,6 +33,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -49,6 +60,48 @@ TIME_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Retry budget for a single window. The scheduled run happens in a macOS
+# DarkWake window, where the host can drop back to sleep mid-request:
+# the process resumes onto a dead connection, and the request timeout
+# reports the whole sleep because nothing was running to enforce it any
+# earlier. The retry is what turns that into a delay rather than a
+# failed run. Delays grow 5s, 15s, 45s.
+HTTP_ATTEMPTS = 4
+HTTP_BACKOFF_SEC = 5.0
+HTTP_BACKOFF_FACTOR = 3.0
+
+# Response codes worth another attempt. Everything else the site refuses
+# with describes the request, which a retry would repeat unchanged.
+HTTP_RETRY_STATUSES = frozenset({408, 429})
+
+
+class ScrapeError(Exception):
+    """A run cannot produce a calendar, for a reason worth reporting.
+
+    Covers an unreachable site, a page whose markup no longer parses,
+    and an output path that cannot be written. All are conditions of
+    the world rather than bugs in this script, so `main` reports one as
+    a single line on stderr and a nonzero exit; anything else keeps its
+    traceback.
+    """
+
+
+class FetchError(ScrapeError):
+    """A calendar page could not be read."""
+
+
+def _describe(exc: BaseException) -> str:
+    """Render `exc` as "Type: message"."""
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _retryable(exc: requests.exceptions.RequestException) -> bool:
+    """Whether another identical request could plausibly succeed."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is None:
+        return True
+    return status in HTTP_RETRY_STATUSES or status >= 500
+
 
 @dataclass(frozen=True)
 class CalEvent:
@@ -64,9 +117,37 @@ class CalEvent:
 
 def fetch_window(session: CalendarSession, when: date) -> str:
     url = f"{BASE}/calendar/exact_date~{when.month}-{when.day}-{when.year}/"
-    resp = session.get(url, timeout=REQUEST_TIMEOUT_SEC)
-    resp.raise_for_status()  # type: ignore[no-untyped-call]
-    return resp.text
+    return _get_text(session, url)
+
+
+def _get_text(session: CalendarSession, url: str) -> str:
+    """GET `url`, retrying transient failures, and return the body.
+
+    Raises `FetchError` once the attempts are spent, or immediately for
+    a failure that describes the request rather than the connection.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            resp = session.get(url, timeout=REQUEST_TIMEOUT_SEC)
+            resp.raise_for_status()  # type: ignore[no-untyped-call]
+            return resp.text
+        except requests.exceptions.RequestException as exc:
+            if not _retryable(exc):
+                raise FetchError(f"GET {url}: {_describe(exc)}") from exc
+            if attempt >= HTTP_ATTEMPTS:
+                raise FetchError(
+                    f"GET {url}: {_describe(exc)} "
+                    f"(giving up after {attempt} attempts)"
+                ) from exc
+            delay = HTTP_BACKOFF_SEC * HTTP_BACKOFF_FACTOR ** (attempt - 1)
+            print(
+                f"attempt {attempt}/{HTTP_ATTEMPTS} for {url} failed "
+                f"({_describe(exc)}); retrying in {delay:.0f}s",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
 
 
 def parse_clock(h: int, m: int, ap: str) -> tuple[int, int]:
@@ -278,6 +359,33 @@ def _vevent_records(cal_bytes: bytes) -> dict[str, _VRecord]:
     return out
 
 
+def _read_existing(out_path: Path) -> bytes | None:
+    """Read the previous .ics, or None if there is not one yet.
+
+    The path is supplied on the command line -- by a scheduled job that
+    cannot answer a prompt -- so an unreadable file is an ordinary
+    bad-input condition, not a defect worth a traceback.
+    """
+    if not out_path.exists():
+        return None
+    try:
+        return out_path.read_bytes()
+    except OSError as exc:
+        raise ScrapeError(f"cannot read {out_path}: {_describe(exc)}") from exc
+
+
+def _publish(out_path: Path, new_bytes: bytes, *, write: bool) -> None:
+    """Write the feed when it changed, and pin its mode either way."""
+    try:
+        if write:
+            out_path.write_bytes(new_bytes)
+        out_path.chmod(0o644)
+    except OSError as exc:
+        raise ScrapeError(
+            f"cannot write {out_path}: {_describe(exc)}"
+        ) from exc
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -298,7 +406,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
+def run(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     out_path: Path = args.ics_path or (Path.cwd() / DEFAULT_FILENAME)
 
@@ -318,18 +426,14 @@ def main(argv: list[str] | None = None) -> int:
         fetch_date += timedelta(days=WINDOW_DAYS)
 
     if not by_instance:
-        print(
+        raise ScrapeError(
             "no events parsed; refusing to overwrite output (site format "
-            "may have changed)",
-            file=sys.stderr,
+            "may have changed)"
         )
-        return 1
 
     events = sorted(by_instance.values(), key=lambda e: e.start)
 
-    existing: bytes | None = (
-        out_path.read_bytes() if out_path.exists() else None
-    )
+    existing = _read_existing(out_path)
     cutoff = datetime.now(tz=EVENT_TZ).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
@@ -345,9 +449,7 @@ def main(argv: list[str] | None = None) -> int:
     unchanged = len(common) - len(updated)
 
     file_changed = existing != new_bytes
-    if file_changed:
-        out_path.write_bytes(new_bytes)
-    out_path.chmod(0o644)
+    _publish(out_path, new_bytes, write=file_changed)
 
     state = "wrote" if file_changed else "unchanged"
     print(
@@ -363,6 +465,14 @@ def main(argv: list[str] | None = None) -> int:
     for uid in sorted(updated, key=lambda u: new_records[u].start):
         print(f"  ~ {new_records[uid].label}")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return run(argv)
+    except ScrapeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

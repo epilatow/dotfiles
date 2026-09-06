@@ -7,9 +7,12 @@ dependencies = [
     "pytest>=9.0.3",
     # A libexec script reached through its `src/*.py` symlink is imported
     # into this environment by its tests, so the environment has to carry
-    # what the script imports at module scope. The script itself resolves
-    # this from its own PEP 723 block when run.
+    # what the script imports at module scope. Each script itself resolves
+    # these from its own PEP 723 block when run.
     "openpyxl",
+    "curl_cffi",
+    "beautifulsoup4",
+    "icalendar>=7.0",
 ]
 
 [tool.uv.sources]
