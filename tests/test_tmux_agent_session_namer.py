@@ -542,6 +542,7 @@ def test_crony_runs_one_shared_remote_control_app_server() -> None:
         "daemon": True,
         "uuid": "4c392a33-485b-4a2a-abd6-4d029d151769",
     }
+    assert config["defaults"]["keep-awake"] is True
     assert "codex-archive" not in config["job"]
     assert "u-hourly" not in config["job-group"]
     assert config["target"]["host"]["squee"]["jobs"] == [

@@ -14,6 +14,7 @@
 notify-channels      = ["ntfy"]
 notify-attach-log    = true
 notify-attach-max-kb = 256
+keep-awake           = true
 # timeout-sec          = 3600         # default: 1800 sec (30 min)
 # log-keep-runs        = 30
 
