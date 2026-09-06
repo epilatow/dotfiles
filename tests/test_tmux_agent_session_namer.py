@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -45,6 +46,9 @@ REFUSED_SLOT_COMMANDS = [
     "show-options -qv @agent_namer",
     "wait-for -U tmux-agent-session-namer-slots",
 ]
+# What `agent_stub` is running once its exec has replaced the shell.
+AGENT_STUB_COMMAND = "sleep"
+PANE_COMMAND_TIMEOUT_SEC = 10.0
 CODEX_HOOKS = REPO_ROOT / "files" / "codex" / "hooks.json"
 CRONY_CONFIG = REPO_ROOT / "files" / "config" / "crony" / "config.toml"
 ENVRC_ALIASES = REPO_ROOT / "files" / "envrc.aliases"
@@ -208,11 +212,56 @@ def agent_stub(bin_dir: Path, name: str) -> Path:
     It execs, the way tcodex's launcher becomes codex, so a session
     built from one holds a pane whose running command is no longer the
     command tmux recorded starting it with.
+
+    Rewriting the file is deliberately skipped when the content already
+    matches: `write_text` truncates, and truncating a script that a
+    previously started session's shell has not finished reading kills
+    that session.
     """
     stub = bin_dir / name
-    stub.write_text("#!/bin/sh\nexec sleep 300\n")
-    stub.chmod(0o755)
+    body = f"#!/bin/sh\nexec {AGENT_STUB_COMMAND} 300\n"
+    if not stub.exists() or stub.read_text() != body:
+        stub.write_text(body)
+        stub.chmod(0o755)
     return stub
+
+
+def wait_for_pane_command(
+    real_tmux_server: tuple[str, str], pane_id: str, expected: str
+) -> None:
+    """Block until `pane_id` reports `expected` as its running command.
+
+    A pane tmux has just started is still running the stub's shell for a
+    moment, until the `exec` replaces it. Every caller here cares about
+    the state after that, so waiting for it is what makes the session
+    settled rather than merely created.
+    """
+    real_tmux, server = real_tmux_server
+    deadline = time.monotonic() + PANE_COMMAND_TIMEOUT_SEC
+    while True:
+        running = subprocess.run(
+            [
+                real_tmux,
+                "-L",
+                server,
+                "display-message",
+                "-p",
+                "-t",
+                pane_id,
+                "#{pane_current_command}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if running == expected:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"pane {pane_id} still running {running!r} after "
+                f"{PANE_COMMAND_TIMEOUT_SEC}s; expected {expected!r}"
+            )
+        time.sleep(0.01)
 
 
 def create_tmux_session(
@@ -250,6 +299,8 @@ def create_tmux_session(
         text=True,
     ).stdout.strip()
     socket_path, pid, session_id, pane_id = details.split(",")
+    if command is not None:
+        wait_for_pane_command(real_tmux_server, pane_id, AGENT_STUB_COMMAND)
     return {
         "TMUX": f"{socket_path},{pid},{session_id.removeprefix('$')}",
         "TMUX_PANE": pane_id,
@@ -1253,7 +1304,7 @@ def test_a_session_is_named_from_the_command_tmux_started_it_with(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    assert running == "sleep"
+    assert running == AGENT_STUB_COMMAND
     subprocess.run(
         [
             real_tmux,
