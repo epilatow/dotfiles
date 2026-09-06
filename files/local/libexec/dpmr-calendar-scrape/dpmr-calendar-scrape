@@ -28,20 +28,25 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from curl_cffi import requests
 from icalendar import Calendar, Event, Timezone
+
+# The session type is generic over the response class it hands back;
+# naming the default parameterization once keeps the annotations short.
+CalendarSession = requests.Session[requests.Response]
 
 BASE = "https://donnerpartymountainrunners.com"
 WINDOW_DAYS = 14
 HORIZON_DAYS = 183
+REQUEST_TIMEOUT_SEC = 30
 DEFAULT_FILENAME = "donner-party-mountain-runners.ics"
 EVENT_TZ = ZoneInfo("America/Los_Angeles")
 TIME_RE = re.compile(
     r"(?P<sh>\d{1,2}):(?P<sm>\d{2})\s*(?P<sap>am|pm)"
     r"\s*[-\u2013]\s*"
     r"(?P<eh>\d{1,2}):(?P<em>\d{2})\s*(?P<eap>am|pm)",
-    re.I,
+    re.IGNORECASE,
 )
 
 
@@ -57,13 +62,10 @@ class CalEvent:
     url: str | None
 
 
-def fetch_window(session: requests.Session, when: date) -> str:
-    url = (
-        f"{BASE}/calendar/"
-        f"exact_date~{when.month}-{when.day}-{when.year}/"
-    )
-    resp = session.get(url, timeout=30)
-    resp.raise_for_status()
+def fetch_window(session: CalendarSession, when: date) -> str:
+    url = f"{BASE}/calendar/exact_date~{when.month}-{when.day}-{when.year}/"
+    resp = session.get(url, timeout=REQUEST_TIMEOUT_SEC)
+    resp.raise_for_status()  # type: ignore[no-untyped-call]
     return resp.text
 
 
@@ -78,10 +80,10 @@ def extract_events(html: str) -> list[CalEvent]:
     soup = BeautifulSoup(html, "html.parser")
     out: list[CalEvent] = []
     for div in soup.select("div.ai1ec-event"):
-        classes = div.get("class") or []
+        classes = _attr_list(div, "class")
         instance_id = _strip_class(classes, "ai1ec-event-instance-id-")
         event_id = _strip_class(classes, "ai1ec-event-id-")
-        end_attr = div.get("data-end")
+        end_attr = _attr_str(div, "data-end")
         if not instance_id or not event_id or not end_attr:
             continue
         end_dt = datetime.fromisoformat(end_attr)
@@ -107,9 +109,7 @@ def extract_events(html: str) -> list[CalEvent]:
         if m is None:
             start_dt = end_dt.replace(hour=0, minute=0, second=0)
         else:
-            sh, sm = parse_clock(
-                int(m["sh"]), int(m["sm"]), m["sap"]
-            )
+            sh, sm = parse_clock(int(m["sh"]), int(m["sm"]), m["sap"])
             start_dt = end_dt.replace(hour=sh, minute=sm, second=0)
             if start_dt > end_dt:
                 start_dt -= timedelta(days=1)
@@ -146,8 +146,31 @@ def extract_events(html: str) -> list[CalEvent]:
 def _strip_class(classes: list[str], prefix: str) -> str | None:
     for c in classes:
         if c.startswith(prefix):
-            return c[len(prefix):]
+            return c[len(prefix) :]
     return None
+
+
+def _attr_list(tag: Tag, name: str) -> list[str]:
+    """Read a multi-valued tag attribute as a list of strings.
+
+    bs4 splits some attributes (`class`) into a list and leaves others
+    as one string, depending on the parser and the attribute; callers
+    here only ever want to iterate the values.
+    """
+    value = tag.get(name)
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(v) for v in value]
+
+
+def _attr_str(tag: Tag, name: str) -> str | None:
+    """Read a single-valued tag attribute as a string."""
+    value = tag.get(name)
+    if value is None:
+        return None
+    return value if isinstance(value, str) else " ".join(str(v) for v in value)
 
 
 def _make_vevent(ev: CalEvent) -> Event:
@@ -187,7 +210,9 @@ def build_ics(
     cal.add("prodid", "-//drymartini.org//DPMR calendar mirror//EN")
     cal.add("version", "2.0")
     cal.add("x-wr-calname", "Donner Party Mountain Runners")
-    cal.add("x-wr-caldesc", "Mirror of donnerpartymountainrunners.com/calendar/")
+    cal.add(
+        "x-wr-caldesc", "Mirror of donnerpartymountainrunners.com/calendar/"
+    )
     cal.add("x-wr-timezone", str(EVENT_TZ))
     cal.add_component(Timezone.from_tzinfo(EVENT_TZ))
 
@@ -203,7 +228,7 @@ def build_ics(
     vevents.sort(key=_vevent_sort_key)
     for ve in vevents:
         cal.add_component(ve)
-    return cal.to_ical()
+    return bytes(cal.to_ical())
 
 
 @dataclass(frozen=True)
@@ -225,6 +250,9 @@ def _past_vevents(cal_bytes: bytes | None, cutoff: datetime) -> list[Event]:
     cal = Calendar.from_ical(cal_bytes)
     out: list[Event] = []
     for ve in cal.walk("VEVENT"):
+        # `walk` is typed as returning the Component base class; the
+        # name filter is what makes each one an Event.
+        assert isinstance(ve, Event)
         start = ve.decoded("dtstart")
         if isinstance(start, datetime):
             if start < cutoff:
@@ -274,9 +302,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     out_path: Path = args.ics_path or (Path.cwd() / DEFAULT_FILENAME)
 
-    session = requests.Session(impersonate="chrome")
+    session: CalendarSession = requests.Session(impersonate="chrome")
 
-    today = date.today()
+    # The agenda pages are addressed by the calendar's own local date,
+    # and the cutoff below already works in that zone, so anchoring the
+    # scrape window there keeps a run consistent wherever it happens.
+    today = datetime.now(tz=EVENT_TZ).date()
     horizon = today + timedelta(days=HORIZON_DAYS)
     by_instance: dict[str, CalEvent] = {}
     fetch_date = today
@@ -310,9 +341,7 @@ def main(argv: list[str] | None = None) -> int:
     added = new_records.keys() - old_records.keys()
     removed = old_records.keys() - new_records.keys()
     common = new_records.keys() & old_records.keys()
-    updated = {
-        u for u in common if new_records[u].body != old_records[u].body
-    }
+    updated = {u for u in common if new_records[u].body != old_records[u].body}
     unchanged = len(common) - len(updated)
 
     file_changed = existing != new_bytes
