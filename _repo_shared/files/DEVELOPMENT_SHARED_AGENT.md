@@ -28,6 +28,20 @@ apply.
   additions, do not run tests or begin a review until those changes are
   committed. Amend that commit with incremental fixes before each retest or
   re-review rather than validating an uncommitted working tree.
+- **Self-review every commit before independent review.** Once the work is
+  committed and before the pre-review gate runs, read each commit as its
+  reviewer will, against the checklist in
+  [the review prompt](#the-review-prompt-verbatim), and fix what you find. In
+  particular, check that every claim in the docs, comments, and commit message
+  matches what the code does; that every instance of the problem is fixed (see
+  [Finish the work everywhere it applies]); and that the change is consistent
+  with the code around it. Ask whether the commit combines logically separable
+  changes; smaller cohesive commits review faster and keep a fix for one
+  concern from disturbing another. Split only when each result is complete,
+  independently understandable, and testable, and keep tightly coupled
+  implementation, tests, and documentation together. The reviewer confirms the
+  analysis; it does not do it for you. Edge cases and code paths a reviewer
+  finds are ones the self-review should have found.
 - **A green implementer-owned full-suite gate precedes review.** After
   committing, the implementing agent runs the repo's full local test suite and
   applicable quality gates and gets a green result before spawning a review
@@ -45,14 +59,6 @@ apply.
   this: an intermediate breakage hides precisely where the subset stops
   looking. Walk the stack in a gate worktree (see below) rather than in the
   branch's own, which would detach its HEAD.
-- **Evaluate large commits before review.** After development and the green
-  pre-review gate, pause before spawning the reviewer and ask whether a large
-  commit combines logically separable changes. Smaller cohesive commits can
-  shorten review cycles and keep fixes for one concern from introducing issues
-  in another. Split only when each result is complete, independently
-  understandable, and testable; keep tightly coupled implementation, tests, and
-  documentation together. If a split changes the stack, rerun the full
-  per-commit gate before review.
 - **An independent code review precedes handoff.** Once the gates are green,
   the implementing agent spawns the reviewer itself, unasked. An unreviewed
   branch is not ready to hand off as finished. See [Code review](#code-review).
@@ -140,6 +146,37 @@ Batching is not dangerous because chains fail. It is dangerous because they
 succeed: a destructive command sent alongside four routine ones has already run
 by the time its block of output is read, and the line that should have stopped
 you is indistinguishable from the expected ones.
+
+## Run commands to completion
+
+Never pipe a command through a filter to watch or trim it -- `tail`, `head`,
+`grep`, `tee`, anything of shape `<command> | <filter>`. The pipeline's exit
+status is the filter's, not the command's, so a failed run reports 0, and
+`head` closes the pipe once it has its lines, so the command is cut short as
+well as misreported -- a truncated test suite reads as a green one. Run the
+command on its own and read its exit code. When the output is too long,
+redirect it to a file under `$REPO/tmp/` or the session's scratch directory and
+read that file; `tail` on a file the command has finished writing is fine, as
+is a tool's own limit flag (`git log -20`) in place of a filter.
+
+## Other agents share this repo and machine
+
+Assume other agents, and the user, are working in this repo and on this machine
+at the same time. Their branches, worktrees, scratch files, and processes look
+like leftovers from inside your session, and are not. Never delete or rewrite a
+branch, worktree, or untracked file you did not create (see
+[Delete from a list, never from a pattern]), and never kill a process that is
+not yours (see [Process management](#process-management)). When something that
+looks abandoned is in your way, ask.
+
+## Delete from a list, never from a pattern
+
+Never delete by glob, pattern, or sweep -- `rm -rf .wt/*`, `find tmp -delete`,
+`git clean -fdx`, `git stash clear`, any pipeline of shape
+`<pattern-query> | <delete>`. Each takes whatever is there when it runs,
+including what another agent put there since you last looked. Build the list of
+targets first (`ls`, `git branch --list`, `git worktree list`), read it, and
+delete exactly those entries by name.
 
 ## Process management
 
@@ -257,12 +294,11 @@ per-commit gate, where `<SHA>` is the tip of the stack being walked. One gate
 worktree serves the whole walk -- check out each commit inside it in turn, so
 the suite's dependencies are installed once rather than per commit -- and it is
 removed when the walk ends, not left for the merge. Keeping it off the
-review-worktree path matters: the review protocol reuses and then deletes
-`code-review-<SHA>`, and would take a gate worktree with it. Be sure that
-.gitignore contains .wt/. Once the user has approved the merge and the work has
-landed on `main`, remove the worktree and any branches you created as part of
-the development effort (but don't touch other branches which may belong to
-other users or agents).
+review-worktree path matters: the review protocol reuses a `code-review-<SHA>`
+this session created and deletes it afterwards, which would take a gate
+worktree with it. Be sure that .gitignore contains .wt/. Once the user has
+approved the merge and the work has landed on `main`, remove the worktree and
+any branches you created as part of the development effort.
 
 **Set the working directory at the start of every command or block of
 commands** -- `cd <abs-path> && <command>`, or `git -C <abs-path>` per command.
@@ -385,12 +421,9 @@ branch HEAD is *not* expected to be empty -- it should show exactly what the
 new base introduces plus any conflict resolutions you made, and nothing else.
 Anything more means a commit was dropped, duplicated, or mis-resolved.
 
-To fold a later commit into an earlier one specifically, use the same
-backup-branch + reset + cherry-pick technique. Do **not** use
-`git commit --fixup` + `git rebase -i --autosquash` -- the "review the todo in
-the editor" safety only holds for a human at the terminal, not for an agent
-invocation, and a stale `--fixup=<sha>` can silently land in the wrong commit
-or be dropped.
+To fold a later commit into an earlier one, use the same technique;
+`git commit --fixup` + `git rebase -i --autosquash` is a rebase, and
+[Never use `git rebase`](#never-use-git-rebase) covers it.
 
 ### Renames
 
@@ -519,13 +552,10 @@ rule for identifiers of every kind.
 
 ## Comment-message hygiene
 
-A code comment is read by someone looking at the *current* version of the file.
-It must describe what is there now -- not what was there before, what was
-deleted, what got renamed, or what got lifted into a helper. The canonical rule
-lives in `DEVELOPMENT_SHARED.md`'s "Comments" subsection; the agent-specific
-failure mode is repeating the commit-message rationale inside the source.
-
-Concretely, never write comments like:
+`DEVELOPMENT_SHARED.md`'s "Comments" subsection is the canonical rule: a
+comment describes the current code, never what was there before. The
+agent-specific failure mode is repeating the commit-message rationale inside
+the source. Concretely, never write comments like:
 
 - `# The legacy _FooBar shim is gone -- now uses helpers.foo.`
 - `# Wrappers have all been deleted; the dispatcher derives this directly.`
@@ -533,22 +563,18 @@ Concretely, never write comments like:
 - `# Replaced the per-call-site try / except with the shared guard.`
 - `# Per the plan, this lives in helpers_runtime instead of helpers_lifecycle.`
 
-The diff and commit message capture migrations. The comment captures the
-*current* code only -- describe what the function does now and the constraint
-it enforces. If the comment cannot be written without referencing something
-that no longer exists, the comment isn't earning its keep; delete it.
-
 The same applies to docstrings ("formerly known as `_FooBar`", "ported from the
 legacy framework"), CHANGELOG-style banners at the top of files, and
 `# TODO: remove once X` markers that name something already removed. If a
 comment's content reads like a footnote on the diff, it belongs in the commit
-message, not the file.
+message, not the file; if it cannot be written without naming something that no
+longer exists, delete it.
 
 Example lists in this file (the bullets above, the "do NOT include" list under
-Commit-message hygiene in `DEVELOPMENT_SHARED.md`) are illustrative, not
-exhaustive. They're samples of patterns to recognise, not authoritative
-enumerations -- when a similar-but-not-included entry shows up, the list
-doesn't need to be extended for the rule to apply.
+"Commit messages" in `DEVELOPMENT_SHARED.md`) are illustrative, not exhaustive.
+They're samples of patterns to recognise, not authoritative enumerations --
+when a similar-but-not-included entry shows up, the list doesn't need to be
+extended for the rule to apply.
 
 ## Supervising a subagent
 
@@ -558,50 +584,53 @@ parent, interactive or not. An attended parent owes its subagents the same
 supervision: a wedged one is discovered exactly as late either way, because in
 neither case was anyone watching it.
 
-Every spawned subagent needs a deadline the controller enforces and a way to
-end it: a cancellation handle where the parent holds one, or the PID and
-process group where the subagent runs as an external process. Pick the deadline
-when the subagent starts, from what the task plausibly takes, and record it
-beside the handle -- one reconstructed afterwards is a rationalization, and a
-deadline written only in the prompt is not enforcement at all. A `running`
-status is not completion.
+Every spawned subagent needs a way to watch it and a way to end it: a
+cancellation handle where the parent holds one, or the PID and process group
+where the subagent runs as an external process. Record the handle at spawn
+time. A `running` status is not completion.
 
-**Poll the subagent at least every five minutes**, unless the spawn is one that
-blocks the parent -- covered below. A completion signal fires only when the
-subagent completes, so one that wedges never emits it and the parent waits on
-an event that is not coming. The poll is what turns the deadline from a number
-into something enforced: without it, nothing looks at the clock.
+Do not put a timeout on the run. How long a subagent takes is not predictable
+from its task, and a deadline picked at spawn time ends a healthy subagent
+partway through and loses everything it did. Supervise by watching instead:
+**check on the subagent at least every five minutes** and decide from what you
+see whether it has finished, is still working, has died, or is stuck. A
+completion signal fires only when the subagent completes, so one that wedges
+never emits it and the parent waits on an event that is not coming; the check
+is what catches that.
 
-Run the poll off something that outlives the spawn and fires whether or not the
-parent remembers: a scheduled wake-up where the harness offers one, otherwise a
-watchdog holding the subagent's handle. A sleep chained onto the spawning
-command is neither, and an intention to check back is less. Where the spawn
-blocks the parent there is no turn in which to poll, and the controller's
-timeout on that call is the whole of the supervision, so it has to actually
-exist. A subagent that can neither be watched nor stopped -- no poll and no
-timeout, or nothing to end it with -- does not get started; report that as a
-blocked gate.
+Run the check off something that outlives the spawn and fires whether or not
+the parent remembers: a scheduled wake-up where the harness offers one,
+otherwise a watchdog holding the subagent's handle. A sleep chained onto the
+spawning command is neither, and an intention to check back is less. Never
+spawn a subagent through a call that blocks the parent: a blocked parent has no
+turn in which to check, and a timeout on the blocking call is the deadline this
+section rules out. A subagent that cannot be both watched and stopped does not
+get started; report that as a blocked gate.
 
-Cancellation is triggered by the deadline, never by a quiet poll. A subagent
-routinely surfaces nothing between spawn and answer: no intermediate step, no
-partial output. Silence is therefore not evidence of a hang, and killing on it
-would trade a rare wedge for the routine destruction of healthy work. Where a
-subagent does report progress, a stall is worth mentioning rather than acting
-on.
+Silence is not evidence of a hang. A subagent routinely surfaces nothing
+between spawn and answer: no intermediate step, no partial output. Ending one
+on a quiet check would trade a rare wedge for the routine destruction of
+healthy work. Dead is a subagent that has exited without signalling completion.
+Stuck is evidence from the subagent itself -- output that stopped growing, a
+transcript sitting on the same tool call, a process idle across checks -- and
+it has to hold across more than one check before it counts. Where a subagent
+does report progress, a stall is worth mentioning before acting on. A run that
+offers nothing to read at all -- no output, transcript, or process to observe
+-- across several checks is neither working nor stuck on the evidence: say so
+and ask the user how to proceed rather than end it or wait in silence.
 
-End a subagent that passes its deadline, through the handle recorded for it.
-One the poll finds already dead, having never signalled completion, needs no
-ending but gets the same treatment otherwise. Either way, leave its worktree
-untouched for inspection and say so promptly -- a gate it was holding is
-blocked, and [When the review will not run](#when-the-review-will-not-run) sets
-the schedule for announcing that. A review counts only once its explicit
-response has been saved under [Protocol](#protocol).
+End a stuck subagent, and only on that evidence, through the handle recorded
+for it. Dead or ended, leave its worktree untouched for inspection and say so
+promptly -- a gate it was holding is blocked, and
+[When the review will not run](#when-the-review-will-not-run) sets the schedule
+for announcing that. A review counts only once its explicit response has been
+saved under [Protocol](#protocol).
 
 ## Code review
 
-After each agent-driven develop / commit / green full-suite pre-review gate,
-the implementing agent spawns one code-review subagent against the
-just-committed branch -- doc-only and lint-config commits included. It is a
+After each agent-driven develop / commit / self-review / green full-suite
+pre-review gate, the implementing agent spawns one code-review subagent against
+the just-committed branch -- doc-only and lint-config commits included. It is a
 required gate, not a default to weigh against other considerations.
 Agent-driven reviews like this run BEFORE the user reviews the commit. The
 review agent inspects the test coverage and may run focused tests to
@@ -629,6 +658,12 @@ same issue recurs, a fix requires new authority, or repeated cycles otherwise
 fail to converge. Resume only after the user provides direction. Do not leave a
 known actionable P1/P2 finding unresolved merely because a particular number of
 review cycles has completed.
+
+A P1/P2 finding is also a verdict on the process that produced the commit: the
+analysis or planning stopped short of the case the reviewer found. Before
+fixing it, return to that analysis and look for what else the same gap let
+through -- adjacent code paths, other instances, the edge cases the fix implies
+-- and address those in the same amend, not just the case the reviewer named.
 
 Any change the user requests after agent review counts as user review feedback,
 including small follow-up edits during handoff. Amend the requested change and
@@ -723,8 +758,8 @@ not launch the child; report its gate as blocked.
 A session may be unable to spawn the reviewer, or barred from doing so: no
 subagent tool exposed, session configuration barring subagents categorically
 rather than gating them on a user request, a permission denial, an error, or no
-way to bound the subagent's run once it starts -- neither a poll nor a
-controller timeout. Any of them is a blocked gate, not a waived one.
+way to watch or end the subagent once it starts. Any of them is a blocked gate,
+not a waived one.
 
 Say so as early as it is known. A bar visible in the session's own
 configuration is known before any work starts, so it belongs in the first
@@ -759,8 +794,10 @@ neutrally; the review agent's job is to evaluate independently.
 ### Protocol
 
 1. Create a clean detached review worktree at `$REPO/.wt/code-review-<SHA>`,
-   where `<SHA>` is the full commit SHA. Reuse an existing path only when it is
-   clean, detached, and at that exact commit. Never put a human-authored
+   where `<SHA>` is the full commit SHA. Reuse an existing path only when this
+   session created it and it is clean, detached, and at that exact commit; one
+   another session created is in use (see
+   [Other agents share this repo and machine]). Never put a human-authored
    purpose or branch name in the review worktree path.
 2. Spawn the review subagent with the prompt below, substituting `<SHA>` and
    `<REPO>` with the commit SHA and detached review-worktree path. Hand the
@@ -878,26 +915,23 @@ direction. Examples of *valid* rejections:
 The following rationales are NEVER valid for rejecting a finding -- they are
 rationalizations for shipping a half-job:
 
-- "The existing X is already incomplete / stale / broken, so fixing only the
-  new piece would be inconsistent and a thorough sweep is out of scope." Past
-  staleness is never a license for new staleness. If the change touched the
-  stale surface (added entries to a list, modified a classification, edited a
-  section), do the full work to leave it correct, including the pre-existing
-  gaps the diff exposed.
+- "The existing X was already stale" and "doing it thoroughly is out of scope".
+  [Finish the work everywhere it applies] already rules these out: if the diff
+  touched the surface, the agent owns leaving it correct, pre-existing gaps
+  included.
 - "It's only nice-to-have / P3, so it's optional." The P-tag indicates
   ship-blocking severity, not whether to do the work. P3 findings local to the
   diff still get fixed.
 - "Adding it would be defensive against an unrelated future regression." If the
   surface is in the diff's blast radius, the agent owns making it correct now,
   not punting it to a hypothetical future agent.
-- "Doing it thoroughly is out of scope." If the work is in the diff's blast
-  radius, scope expanded the moment the diff touched the surface. Either do the
-  full work or be specific about *which sub-task* is genuinely separable and
-  offer a follow-up.
 
 If a finding genuinely belongs in a separate follow-up commit (not just a
 rejection), surface that as an explicit suggestion to the user with the
 proposed scope, rather than self-rejecting. The user decides whether to fold it
 in or defer.
 
+[delete from a list, never from a pattern]: #delete-from-a-list-never-from-a-pattern
+[finish the work everywhere it applies]: #finish-the-work-everywhere-it-applies
+[other agents share this repo and machine]: #other-agents-share-this-repo-and-machine
 [re-review rule]: #re-review-is-triggered-by-the-fix-not-the-finding
