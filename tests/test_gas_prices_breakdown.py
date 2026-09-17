@@ -509,3 +509,66 @@ def test_or_cfp_workbook_with_nothing_published_yet_is_reported(
     ):
         gpb.fetch_or_cfp_for_target_date(date(2026, 8, 1), tmp_path)
     assert "no monthly value available" in str(caught.value)
+
+
+# ---------------------------------------------------------------------------
+# Hand-maintained auction tables
+# ---------------------------------------------------------------------------
+#
+# These are the only inputs a human has to top up, which makes a missed
+# update the likeliest way a wrong number reaches the page: the lookup
+# keeps answering with the last entry, and nothing about that looks like
+# a failure.
+
+AUCTIONS = [
+    (date(2026, 2, 18), 27.94, "Feb 2026 #46"),
+    (date(2026, 5, 20), 28.81, "May 2026 #47"),
+    (date(2026, 8, 19), 32.48, "Aug 2026 #48"),
+]
+
+
+def test_auction_is_not_used_before_its_results_publish() -> None:
+    """A settlement is unknowable until it is certified a week later."""
+    lag = gpb.CCA_PUBLICATION_LAG_DAYS
+    auction = date(2026, 8, 19)
+    day_before = gpb.latest_auction(
+        AUCTIONS, auction + timedelta(days=lag - 1), program="T"
+    )
+    assert day_before.label == "May 2026 #47"
+    on_publication = gpb.latest_auction(
+        AUCTIONS, auction + timedelta(days=lag), program="T"
+    )
+    assert on_publication.label == "Aug 2026 #48"
+
+
+def test_stale_auction_table_fails_the_run() -> None:
+    """An un-topped-up table must not keep answering with its last entry."""
+    target = date(2026, 8, 19) + timedelta(days=gpb.CCA_STALE_DAYS + 1)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.latest_auction(AUCTIONS, target, program="WA CCA")
+    message = str(caught.value)
+    assert "WA CCA" in message
+    assert "days old" in message
+
+
+def test_auction_table_inside_the_limit_still_answers() -> None:
+    """The bound has to tolerate a normal quarterly gap."""
+    target = date(2026, 8, 19) + timedelta(days=gpb.CCA_STALE_DAYS)
+    assert gpb.latest_auction(AUCTIONS, target, program="T").price == 32.48
+
+
+def test_target_before_any_published_auction_is_reported() -> None:
+    """Nothing to fall back on is a source failure, not a silent zero."""
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.latest_auction(AUCTIONS, date(2026, 1, 1), program="CARB CCA")
+    assert "CARB CCA" in str(caught.value)
+
+
+@pytest.mark.parametrize("name", sorted(gpb.CCA_AUCTION_TABLES))
+def test_shipped_tables_are_ordered_and_unique(name: str) -> None:
+    """The lookup walks the table in order and keeps the last match."""
+    table = gpb.CCA_AUCTION_TABLES[name]
+    dates = [row[0] for row in table]
+    assert dates == sorted(dates), f"{name} is out of order"
+    assert len(set(dates)) == len(dates), f"{name} has a duplicate date"
+    assert all(row[1] > 0 for row in table), f"{name} has a bad price"

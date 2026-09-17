@@ -26,12 +26,13 @@ Data sources used by add-snapshot:
 
   Hand-maintained tables (need quarterly human update): CARB cap-and-trade
   auction settlements (CARB_CCA_AUCTIONS), Washington CCA auction
-  settlements (WA_CCA_AUCTIONS). The script logs a warning when an entry
-  is older than CCA_STALE_DAYS.
+  settlements (WA_CCA_AUCTIONS). A run fails rather than publish from a
+  table whose newest entry is older than CCA_STALE_DAYS.
 
 Exit status:
   0  Success, including a run whose snapshot was already present.
-  1  A source was unreachable, or its content no longer parses. Each
+  1  A source was unreachable, its content no longer parses, or the data
+     it offers is too old to describe the date being snapshotted. Each
      fetch is retried (see HTTP_ATTEMPTS) before the run gives up, and
      the failure is reported as one error line rather than a traceback.
   2  Bad invocation, or a snapshot the arguments name that the file
@@ -79,31 +80,65 @@ USER_AGENT = (
     "Chrome/137.0.0.0 Safari/537.36"
 )
 
-# CARB cap-and-trade joint-auction current-vintage settlement prices.
-# Source: ARB "Summary of California-Quebec Joint Auction Settlement Prices
-# and Results" (results_summary.pdf at the CARB auction-information page).
-# Update this list quarterly when a new auction settles (Feb / May / Aug /
-# Nov). The script logs a warning when the most recent entry is older than
-# CCA_STALE_DAYS.
+# Both auction tables are keyed by the date the auction was held, which
+# is the date each program publishes alongside its settlement price.
+# Neither program releases the price on the day: results are certified
+# and posted about a week later, and a snapshot taken in between can
+# only know the previous auction's price. CCA_PUBLICATION_LAG_DAYS is
+# what keeps the lookup from reaching for a price that was not yet
+# knowable on the date being snapshotted.
+
+# CARB Cap-and-Invest joint-auction current-vintage settlement prices.
+# Source: ARB "Summary of California-Quebec Joint Auction Settlement
+# Prices and Results" (results_summary.pdf at the CARB auction-information
+# page). Auctions run Feb / May / Aug / Nov; add the new settlement here
+# within the quarter, or the next run fails (see CCA_STALE_DAYS).
 CARB_CCA_AUCTIONS: list[tuple[date, float, str]] = [
     (date(2025, 11, 19), 28.32, "Nov 2025 Joint Auction #45"),
     (date(2026, 2, 18), 27.94, "Feb 2026 Joint Auction #46"),
+    (date(2026, 5, 20), 28.81, "May 2026 Joint Auction #47"),
+    (date(2026, 8, 19), 32.48, "Aug 2026 Joint Auction #48"),
 ]
 
 # Washington Climate Commitment Act allowance auction settlements.
 # Source: ecology.wa.gov/air-climate/climate-commitment-act/cap-and-invest
-# /auctions-and-market. WA results are typically certified ~7 days after the
-# auction; this script keys off the certification date.
+# /auctions-and-market, whose per-auction Summary Report carries the
+# settlement price, the auction date, and the certification date.
+# Quarterly; same maintenance obligation as the CARB table above.
 WA_CCA_AUCTIONS: list[tuple[date, float, str]] = [
     (date(2025, 12, 3), 70.86, "WA Auction #12 (Dec 3, 2025)"),
-    (
-        date(2026, 3, 11),
-        65.26,
-        "WA Auction #13 (Mar 4, 2026), certified Mar 11",
-    ),
+    (date(2026, 3, 4), 65.26, "WA Auction #13 (Mar 4, 2026)"),
+    (date(2026, 6, 3), 64.56, "WA Auction #14 (Jun 3, 2026)"),
+    (date(2026, 9, 2), 39.50, "WA Auction #15 (Sep 2, 2026)"),
 ]
 
-CCA_STALE_DAYS = 130  # warn if newest auction entry is older than this
+# Each table with the name a maintainer greps for when a run tells them
+# it has gone stale. Binding the two here keeps an error message from
+# naming the wrong table, and lets a test cover every shipped table
+# rather than whichever ones someone remembered to list.
+CCA_AUCTION_TABLES: dict[str, list[tuple[date, float, str]]] = {
+    "CARB_CCA_AUCTIONS": CARB_CCA_AUCTIONS,
+    "WA_CCA_AUCTIONS": WA_CCA_AUCTIONS,
+}
+
+# Both programs have certified every recent auction exactly seven days
+# out: CARB refreshed its results summary on May 27 for the May 20
+# auction, and Washington issued its Summary Reports on Mar 11, Jun 10,
+# and Sep 9 for the Mar 4, Jun 3, and Sep 2 auctions.
+CCA_PUBLICATION_LAG_DAYS = 7
+
+# A hand-maintained table goes stale silently -- the lookup keeps
+# returning its last entry while the market moves away from it. Auctions
+# are quarterly, so an entry older than this is a missed update rather
+# than one merely pending, and the run fails instead of publishing a
+# price nobody has checked.
+#
+# The margin is deliberate rather than tight. A quarter plus the
+# publication lag legitimately reaches about 97 days, and the widest gap
+# either program has run is longer, so a limit near that would fail on
+# a late auction rather than a missed update. The cost is that a genuine
+# miss keeps publishing for a few weeks before the run stops.
+CCA_STALE_DAYS = 130
 
 # Per-gallon conversion factors. Each is back-derived from a documented data
 # point in the existing baseline snapshot so the units stay consistent with
@@ -490,20 +525,47 @@ def _read_lcfs_weekly(path: Path) -> list[tuple[date, float]]:
 
 @dataclass(frozen=True)
 class AuctionSettlement:
+    # The date the auction was held, not the date its result was
+    # published; `CCA_PUBLICATION_LAG_DAYS` covers the gap between them.
     effective: date
     price: float
     label: str
 
 
 def latest_auction(
-    table: list[tuple[date, float, str]], target: date
+    table: list[tuple[date, float, str]],
+    target: date,
+    *,
+    program: str,
 ) -> AuctionSettlement:
+    """Return the newest settlement `target` could have known about.
+
+    `table` must be in ascending date order: the scan keeps the last
+    entry that qualifies rather than comparing dates, which is what
+    makes "newest" true. `CCA_AUCTION_TABLES` holds the shipped tables
+    and a test pins the ordering of each.
+
+    Raises `SnapshotError` when the table has no usable entry, and when
+    its newest one is stale enough to mean a quarterly update was
+    missed -- a table nobody has topped up is indistinguishable from a
+    market that has not moved, and only one of those is true.
+    """
+    cutoff = target - timedelta(days=CCA_PUBLICATION_LAG_DAYS)
     selected: tuple[date, float, str] | None = None
     for entry in table:
-        if entry[0] <= target:
+        if entry[0] <= cutoff:
             selected = entry
     if selected is None:
-        raise SnapshotError("no auction entry before target")
+        raise SnapshotError(
+            f"{program}: no auction settled and published as of {target}"
+        )
+    age = (target - selected[0]).days
+    if age > CCA_STALE_DAYS:
+        raise SnapshotError(
+            f"{program}: newest auction ({selected[2]}) is {age} days old, "
+            f"over the {CCA_STALE_DAYS}-day limit; a newer auction has "
+            f"almost certainly settled and the table needs updating"
+        )
     return AuctionSettlement(
         effective=selected[0], price=selected[1], label=selected[2]
     )
@@ -1012,6 +1074,14 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
         log.error("baseline snapshot %s not found", args.baseline)
         return 2
 
+    # The auction tables are local and their staleness is deterministic,
+    # so settle them before spending any fetches on a run that cannot
+    # produce a snapshot anyway.
+    cca = latest_auction(
+        CARB_CCA_AUCTIONS, target, program="CARB_CCA_AUCTIONS"
+    )
+    wa = latest_auction(WA_CCA_AUCTIONS, target, program="WA_CCA_AUCTIONS")
+
     log.info("fetching AAA retail (live)...")
     retail = fetch_aaa_retail()
     log.info(
@@ -1031,23 +1101,8 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
         lcfs.source_xlsx_url,
     )
 
-    cca = latest_auction(CARB_CCA_AUCTIONS, target)
     log.info("CARB CCA: %s, $%.2f/allowance", cca.label, cca.price)
-    if (target - cca.effective).days > CCA_STALE_DAYS:
-        log.warning(
-            "CARB CCA settlement is %d days old (newer auction may exist; "
-            "update CARB_CCA_AUCTIONS)",
-            (target - cca.effective).days,
-        )
-
-    wa = latest_auction(WA_CCA_AUCTIONS, target)
     log.info("WA CCA: %s, $%.2f/allowance", wa.label, wa.price)
-    if (target - wa.effective).days > CCA_STALE_DAYS:
-        log.warning(
-            "WA CCA settlement is %d days old (newer auction may exist; "
-            "update WA_CCA_AUCTIONS)",
-            (target - wa.effective).days,
-        )
 
     log.info("fetching Oregon CFP...")
     orm = fetch_or_cfp_for_target_date(target, cache_dir)
