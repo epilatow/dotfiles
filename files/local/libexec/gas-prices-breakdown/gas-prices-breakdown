@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["openpyxl"]
+# dependencies = ["openpyxl", "xlrd"]
 # ///
 """Manage SNAPSHOTS and embedded markdown in gas-price-breakdown.html.
 
@@ -21,8 +21,11 @@ Subcommands:
       Write the embedded SPEC_MD spec text to PATH (or stdout).
 
 Data sources used by add-snapshot:
-  Fetched live: AAA state-averages (retail), CARB weekly LCFS xlsx,
-  Oregon DEQ CFP credit-transfer xlsx.
+  Fetched live: AAA state-averages (retail), the daily California LCFS
+  credit assessment (see LCFS_MONITOR_URL for why it is not CARB's own
+  series), Oregon DEQ CFP credit-transfer xlsx. The LCFS assessment
+  carries a freshness bound; a run fails rather than publish a price too
+  old to describe the date being snapshotted.
 
   Hand-maintained tables (need quarterly human update): CARB cap-and-trade
   auction settlements (CARB_CCA_AUCTIONS), Washington CCA auction
@@ -60,6 +63,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import openpyxl  # type: ignore[import-untyped]
+import xlrd  # type: ignore[import-untyped]
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -67,9 +71,10 @@ import openpyxl  # type: ignore[import-untyped]
 
 BASELINE_DATE = "2026-04-26"
 
-# CARB's WAF (ww2.arb.ca.gov) returns 403 to requests with a non-browser
+# AAA (gasprices.aaa.com) returns 403 to requests with a non-browser
 # User-Agent, so the fetch helpers present a mainstream desktop-browser
-# identity. AAA and Oregon DEQ accept any UA; this string is harmless there.
+# identity. Oregon DEQ and the LCFS monitor accept any UA; this string is
+# harmless there.
 # This is the exact UA current Chrome on macOS sends: the Mozilla / AppleWebKit
 # / KHTML / Safari tokens are all frozen legacy markers every browser carries,
 # and Chrome pins the macOS version at 10_15_7. Bump the Chrome version
@@ -152,11 +157,40 @@ OR_FACTOR = 0.10 / 43.73  # OR: $/gal per $/credit (Jan 2025 anchor)
 IN_SUSPENSION_START = date(2026, 4, 8)
 IN_SUSPENSION_END = date(2026, 5, 8)
 
-# CARB weekly LCFS landing page; the script reads the current xlsx URL from it.
-CARB_LCFS_LANDING = (
-    "https://ww2.arb.ca.gov/resources/documents/"
-    "weekly-lcfs-credit-transfer-activity-reports"
+# California LCFS credit price.
+#
+# CARB's own weekly credit transfer reports are the authoritative series
+# -- a volume-weighted average of transfers that actually completed --
+# and they are what this script used until CARB stopped publishing them.
+# The last report covers the week of 2026-07-20, and the monthly series
+# and the LCFS Data Dashboard stop at the same point. Nothing newer has
+# appeared on any of the three.
+#
+# So the price comes instead from the daily Argus assessment that Neste
+# republishes in its LCFS monitor, which offers an export of the series.
+# That is a broker assessment rather than a transacted average, and the
+# two do not agree exactly: over the weeks where both existed the
+# assessment ran a few percent above CARB. A few percent of a component
+# that is itself around three percent of the pump price is far smaller
+# than the error in quoting a July price in September, which is the only
+# alternative CARB's silence leaves.
+#
+# If CARB resumes publishing, whether to switch back is worth revisiting
+# -- this is not meant as a permanent replacement for the regulator's own
+# numbers.
+LCFS_LAST_CARB_WEEK = date(2026, 7, 20)
+LCFS_MONITOR_URL = "https://ir-service.appspot.com/v/nesteoil/monitor/LCFS/en"
+# `r` is the monitor's cache-buster, not a revision of the series: any
+# value returns the same bytes, so it is not pinning an old export.
+LCFS_MONITOR_XLS = (
+    "https://ir-service.appspot.com/share/nesteoil/English/"
+    "price_monitor.xls?name=ArgusLCFS&r=13032&type=xls"
 )
+
+# The assessment is published every trading day, so a gap longer than a
+# holiday weekend means the source has gone quiet rather than merely
+# skipped a session.
+LCFS_STALE_DAYS = 7
 
 # AAA live state-averages page.
 AAA_URL = "https://gasprices.aaa.com/state-gas-price-averages/"
@@ -449,73 +483,90 @@ def fetch_aaa_retail() -> dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# CARB LCFS weekly
+# California LCFS credit price
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class LcfsWeek:
-    monday: date
-    vwap_per_mt: float
-    source_xlsx_url: str
+class LcfsQuote:
+    as_of: date
+    usd_per_mt: float
+    source_url: str
 
 
-def fetch_lcfs_for_target_date(target: date, cache_dir: Path) -> LcfsWeek:
-    """Return the most recent LCFS weekly VWAP available as of `target`.
+def fetch_lcfs_for_target_date(target: date, cache_dir: Path) -> LcfsQuote:
+    """Return the newest LCFS credit assessment as of `target`.
 
-    CARB reports cover Mon-Sun and are published the following Tuesday;
-    target date D can use the week-of-Monday X iff X + 8 days <= D."""
-    landing = _http_text(CARB_LCFS_LANDING)
-    href_match = re.search(
-        r'href="([^"]*Weekly[^"]*\.xlsx)"',
-        landing,
-    )
-    if not href_match:
-        raise SnapshotError("CARB LCFS: xlsx link not found on landing page")
-    url = href_match.group(1)
-    if url.startswith("/"):
-        url = "https://ww2.arb.ca.gov" + url
-    xlsx_path = cache_dir / "lcfs.xlsx"
-    xlsx_path.write_bytes(_http_bytes(url))
-    weeks = _read_lcfs_weekly(xlsx_path)
-    cutoff = target - timedelta(days=8)
-    selected: tuple[date, float] | None = None
-    for monday, vwap in weeks:
-        if monday <= cutoff:
-            selected = (monday, vwap)
-        else:
-            break
-    if selected is None:
-        raise SnapshotError(f"CARB LCFS: no week with monday <= {cutoff}")
-    return LcfsWeek(
-        monday=selected[0], vwap_per_mt=selected[1], source_xlsx_url=url
+    The series is assessed each trading day, so unlike the quarterly
+    auction tables there is no publication lag to apply: the quote for a
+    date is the quote for that date. Gaps are weekends and holidays,
+    which `LCFS_STALE_DAYS` is sized to absorb.
+    """
+    xls_path = cache_dir / "lcfs.xls"
+    xls_path.write_bytes(_http_bytes(LCFS_MONITOR_XLS))
+    quotes = _read_lcfs_daily(xls_path)
+    usable = [q for q in quotes if q[0] <= target]
+    if not usable:
+        raise SnapshotError(
+            f"CA LCFS: no assessment on or before {target}; the series "
+            f"starts at {quotes[0][0]}"
+        )
+    as_of, price = usable[-1]
+    age = (target - as_of).days
+    if age > LCFS_STALE_DAYS:
+        raise SnapshotError(
+            f"CA LCFS: newest assessment ({as_of}) is {age} days old, over "
+            f"the {LCFS_STALE_DAYS}-day limit; the source has stopped "
+            f"updating and its last price no longer describes {target}"
+        )
+    return LcfsQuote(
+        as_of=as_of, usd_per_mt=price, source_url=LCFS_MONITOR_XLS
     )
 
 
-def _read_lcfs_weekly(path: Path) -> list[tuple[date, float]]:
-    wb = _load_workbook(path, "CARB LCFS")
-    sheet_name = "Weekly Average Credit Price"
-    if sheet_name not in wb.sheetnames:
-        raise SnapshotError(f"CARB LCFS xlsx missing sheet {sheet_name!r}")
-    sh = wb[sheet_name]
-    weeks: list[tuple[date, float]] = []
-    for row in sh.iter_rows(min_row=2, values_only=True):
-        a = row[0]
-        # openpyxl hands back a datetime for a date-formatted cell;
-        # anything else in the column is a header or a spacer row.
-        if isinstance(a, datetime):
-            monday = a.date()
-        elif isinstance(a, date):
-            monday = a
-        else:
+def _read_lcfs_daily(path: Path) -> list[tuple[date, float]]:
+    """Read the monitor's export as ascending (date, price) pairs.
+
+    The export is a legacy single-sheet .xls holding an ISO date and a
+    price per row. Its dates arrive as text rather than as Excel serial
+    numbers, so they are parsed rather than converted.
+    """
+    # xlrd reports a damaged .xls through whichever layer notices first,
+    # and only the innermost is an XLRDError: a body that is not a
+    # workbook at all raises XLRDError, a corrupt OLE2 header raises
+    # CompDocError, and one truncated mid-transfer -- the likeliest way
+    # an HTTP fetch goes wrong -- raises IndexError from the sector
+    # walk. A workbook with no sheets shows up on the access below.
+    try:
+        book = xlrd.open_workbook(str(path))
+        sheet = book.sheet_by_index(0)
+    except (
+        xlrd.XLRDError,
+        xlrd.compdoc.CompDocError,
+        IndexError,
+        OSError,
+    ) as exc:
+        raise SnapshotError(
+            f"CA LCFS: export is not a readable workbook: {_describe(exc)}"
+        ) from exc
+    quotes: list[tuple[date, float]] = []
+    for row in range(sheet.nrows):
+        raw_day = sheet.cell_value(row, 0)
+        raw_price = sheet.cell_value(row, 1) if sheet.ncols > 1 else None
+        if not isinstance(raw_day, str) or not isinstance(
+            raw_price, (int, float)
+        ):
             continue
-        b = row[1]
-        if not isinstance(b, (int, float)):
+        try:
+            day = date.fromisoformat(raw_day.strip())
+        except ValueError:
+            # The header row, and anything else not a date, is not a quote.
             continue
-        weeks.append((monday, float(b)))
-    if not weeks:
-        raise SnapshotError("CARB LCFS xlsx: no weekly rows parsed")
-    return weeks
+        quotes.append((day, float(raw_price)))
+    if not quotes:
+        raise SnapshotError("CA LCFS export: no dated rows parsed")
+    quotes.sort()
+    return quotes
 
 
 # ---------------------------------------------------------------------------
@@ -806,17 +857,21 @@ def swap_nontax(chunk: str, replacement: str) -> str:
     return chunk[:i] + replacement + chunk[j:]
 
 
-def build_ca_nontax(d: date, lcfs: LcfsWeek, cca: AuctionSettlement) -> str:
-    lcfs_pass = round(lcfs.vwap_per_mt * LCFS_FACTOR, 4)
+def build_ca_nontax(d: date, lcfs: LcfsQuote, cca: AuctionSettlement) -> str:
+    lcfs_pass = round(lcfs.usd_per_mt * LCFS_FACTOR, 4)
     cca_pass = round(cca.price * CCA_FACTOR_MT_PER_GAL, 4)
     total = round(lcfs_pass + cca_pass, 4)
     return (
         f"nontax:{{ total:{total:.4f}, parts:[\n"
         f'      {{n:"LCFS pass-through", v:{lcfs_pass:.4f}, '
-        f'src:"https://ww2.arb.ca.gov/resources/documents/'
-        f'weekly-lcfs-credit-transfer-activity-reports", '
-        f'note:"Credit ${lcfs.vwap_per_mt:.2f}/MT (week of '
-        f'{lcfs.monday.isoformat()}) {TIMES} {LCFS_FACTOR:.6f}"}},\n'
+        f'src:"{LCFS_MONITOR_URL}", '
+        f'note:"Credit ${lcfs.usd_per_mt:.2f}/MT ({lcfs.as_of.isoformat()}) '
+        f"{TIMES} {LCFS_FACTOR:.6f}. Daily Argus assessment, via Neste's "
+        f"LCFS monitor. An assessed market price, not CARB's "
+        f"volume-weighted average of completed transfers, so it is close "
+        f"but not exact. Used because CARB stopped publishing its weekly "
+        f"credit transfer reports after the week of "
+        f'{LCFS_LAST_CARB_WEEK.isoformat()}."}},\n'
         f'      {{n:"Cap-and-Trade pass-through", v:{cca_pass:.4f}, '
         f'src:"https://ww2.arb.ca.gov/our-work/programs/'
         f'cap-and-trade-program/auction-information", '
@@ -896,7 +951,7 @@ def build_data_block(
     baseline_data: str,
     target: date,
     retail: dict[str, float],
-    lcfs: LcfsWeek,
+    lcfs: LcfsQuote,
     cca: AuctionSettlement,
     wa: AuctionSettlement,
     orm: OrCfpMonth,
@@ -923,7 +978,7 @@ def build_snapshot_object(
     target: date,
     baseline_block: str,
     retail: dict[str, float],
-    lcfs: LcfsWeek,
+    lcfs: LcfsQuote,
     cca: AuctionSettlement,
     wa: AuctionSettlement,
     orm: OrCfpMonth,
@@ -934,8 +989,9 @@ def build_snapshot_object(
         "Auto-generated weekly snapshot. Retail (col 2) from live AAA "
         f"state-averages page on {target.isoformat()}. State taxes (cols 3-4) "
         f"inherited from {BASELINE_DATE} baseline. Non-tax pass-throughs: "
-        f"CA LCFS week of {lcfs.monday.isoformat()} "
-        f"(${lcfs.vwap_per_mt:.2f}/MT); CA cap-and-trade {cca.label}; "
+        f"CA LCFS {lcfs.as_of.isoformat()} "
+        f"(${lcfs.usd_per_mt:.2f}/MT, Argus via Neste monitor); "
+        f"CA cap-and-trade {cca.label}; "
         f"WA CCA {wa.label}; OR CFP {orm.year_month} "
         f"(${orm.vwap_per_credit:.2f}/credit). IN gasoline use tax handled "
         "per-date."
@@ -1092,13 +1148,13 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
         max(retail.values()),
     )
 
-    log.info("fetching CARB LCFS weekly...")
+    log.info("fetching CA LCFS assessment...")
     lcfs = fetch_lcfs_for_target_date(target, cache_dir)
     log.info(
-        "CARB LCFS: week of %s VWAP $%.2f/MT (xlsx %s)",
-        lcfs.monday,
-        lcfs.vwap_per_mt,
-        lcfs.source_xlsx_url,
+        "CA LCFS: %s $%.2f/MT (%s)",
+        lcfs.as_of,
+        lcfs.usd_per_mt,
+        lcfs.source_url,
     )
 
     log.info("CARB CCA: %s, $%.2f/allowance", cca.label, cca.price)

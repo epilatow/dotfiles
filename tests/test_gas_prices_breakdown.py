@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import gzip
 import http.client
+import re
 import subprocess
 import sys
 import time
@@ -16,6 +17,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
+import xlrd  # type: ignore[import-untyped]
 
 REPO_ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -192,8 +194,8 @@ def test_valid_zip_that_is_not_a_workbook_is_reported(tmp_path: Path) -> None:
     with zipfile.ZipFile(not_a_workbook, "w") as archive:
         archive.writestr("readme.txt", "not a spreadsheet")
     with pytest.raises(gpb.SnapshotError) as caught:
-        gpb._load_workbook(not_a_workbook, "CARB LCFS")
-    assert "CARB LCFS" in str(caught.value)
+        gpb._load_workbook(not_a_workbook, "OR CFP")
+    assert "OR CFP" in str(caught.value)
 
 
 def test_missing_spec_md_exits_one_not_two(tmp_path: Path) -> None:
@@ -342,102 +344,166 @@ def test_aaa_parses_every_mapped_state() -> None:
     assert retail["CA"] == 3.50
 
 
-def test_lcfs_landing_without_an_xlsx_link_is_reported(
+class _FakeSheet:
+    """The two-column shape xlrd exposes for the monitor's export."""
+
+    def __init__(self, rows: list[list[object]]) -> None:
+        self._rows = rows
+        self.nrows = len(rows)
+        self.ncols = max((len(r) for r in rows), default=0)
+
+    def cell_value(self, row: int, col: int) -> object:
+        cells = self._rows[row]
+        return cells[col] if col < len(cells) else ""
+
+
+class _FakeBook:
+    def __init__(self, rows: list[list[object]]) -> None:
+        self._sheet = _FakeSheet(rows)
+
+    def sheet_by_index(self, index: int) -> _FakeSheet:
+        assert index == 0
+        return self._sheet
+
+
+@contextlib.contextmanager
+def _lcfs_export(rows: list[list[object]]) -> Iterator[None]:
+    """Stand in for xlrd reading the downloaded export."""
+    with patch.object(
+        xlrd, "open_workbook", autospec=True, return_value=_FakeBook(rows)
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def _lcfs_quotes(quotes: list[tuple[date, float]]) -> Iterator[None]:
+    """Stand in for the monitor download and its parsed series."""
+    with (
+        patch.object(gpb, "_http_bytes", autospec=True, return_value=b"xls"),
+        patch.object(
+            gpb, "_read_lcfs_daily", autospec=True, return_value=quotes
+        ),
+    ):
+        yield
+
+
+def test_lcfs_uses_the_newest_quote_on_or_before_the_target(
     tmp_path: Path,
 ) -> None:
-    """CARB serving anything but the report index stops the run cleanly.
+    """The assessment is daily, so the target's own quote is the one."""
+    with _lcfs_quotes(
+        [
+            (date(2026, 9, 14), 84.50),
+            (date(2026, 9, 15), 84.65),
+            (date(2026, 9, 16), 84.75),
+        ]
+    ):
+        quote = gpb.fetch_lcfs_for_target_date(date(2026, 9, 16), tmp_path)
+    assert quote.as_of == date(2026, 9, 16)
+    assert quote.usd_per_mt == 84.75
 
-    The link is discovered by pattern on every run rather than pinned,
-    so a page that renders without one -- an interstitial, an outage
-    notice -- has to surface as a source failure.
-    """
+
+def test_lcfs_does_not_use_a_quote_from_after_the_target(
+    tmp_path: Path,
+) -> None:
+    """Re-running an old snapshot must not reach for a later price."""
+    with _lcfs_quotes(
+        [(date(2026, 9, 14), 84.50), (date(2026, 9, 16), 84.75)]
+    ):
+        quote = gpb.fetch_lcfs_for_target_date(date(2026, 9, 15), tmp_path)
+    assert quote.as_of == date(2026, 9, 14)
+
+
+def test_lcfs_tolerates_a_weekend_gap(tmp_path: Path) -> None:
+    """Quotes stop on non-trading days; that is not the source going quiet."""
+    with _lcfs_quotes([(date(2026, 9, 11), 84.35)]):
+        quote = gpb.fetch_lcfs_for_target_date(date(2026, 9, 14), tmp_path)
+    assert quote.as_of == date(2026, 9, 11)
+
+
+def test_lcfs_source_gone_quiet_fails_the_run(tmp_path: Path) -> None:
+    """A source that stopped updating cannot describe the target date."""
+    target = date(2026, 9, 17)
+    stale = target - timedelta(days=gpb.LCFS_STALE_DAYS + 1)
     with (
-        patch.object(
-            gpb,
-            "_http_text",
-            autospec=True,
-            return_value="<html><body>No reports here</body></html>",
-        ),
+        _lcfs_quotes([(stale, 71.96)]),
         pytest.raises(gpb.SnapshotError) as caught,
     ):
-        gpb.fetch_lcfs_for_target_date(date(2026, 8, 7), tmp_path)
-    assert "xlsx link not found" in str(caught.value)
+        gpb.fetch_lcfs_for_target_date(target, tmp_path)
+    message = str(caught.value)
+    assert "CA LCFS" in message
+    assert "days old" in message
 
 
-def test_lcfs_relative_link_resolves_against_the_carb_host(
+def test_lcfs_at_the_freshness_limit_still_answers(tmp_path: Path) -> None:
+    """The bound is inclusive, so a run on the limit is not a failure."""
+    target = date(2026, 9, 17)
+    edge = target - timedelta(days=gpb.LCFS_STALE_DAYS)
+    with _lcfs_quotes([(edge, 71.96)]):
+        assert gpb.fetch_lcfs_for_target_date(target, tmp_path).as_of == edge
+
+
+def test_lcfs_target_before_the_series_starts_is_reported(
     tmp_path: Path,
 ) -> None:
-    """CARB publishes the href site-relative, so it needs a scheme and host."""
-    href = "/sites/default/files/2026-07/Weekly%20LCFS%20Credit.xlsx"
-    landing = f'<html><a href="{href}">report</a></html>'
+    """The export is a rolling window; older targets are off its front."""
     with (
-        patch.object(gpb, "_http_text", autospec=True, return_value=landing),
-        patch.object(
-            gpb, "_http_bytes", autospec=True, return_value=b"xlsx"
-        ) as fetched,
-        patch.object(
-            gpb,
-            "_read_lcfs_weekly",
-            autospec=True,
-            return_value=[(date(2026, 7, 13), 72.61)],
-        ),
-    ):
-        week = gpb.fetch_lcfs_for_target_date(date(2026, 8, 7), tmp_path)
-    assert fetched.call_args.args[0] == "https://ww2.arb.ca.gov" + href
-    assert week.source_xlsx_url.startswith("https://ww2.arb.ca.gov/")
-    assert week.vwap_per_mt == 72.61
-
-
-def test_lcfs_picks_the_newest_published_week(tmp_path: Path) -> None:
-    """A week counts only once its report has had time to be published.
-
-    The rows run oldest first, as the workbook's own sheet order does;
-    the selection stops at the first week past the cutoff rather than
-    scanning the rest, so feeding it any other order would exercise
-    something the reader never produces.
-    """
-    weeks = [
-        (date(2026, 7, 6), 70.0),
-        (date(2026, 7, 13), 72.61),
-        (date(2026, 7, 20), 75.0),
-    ]
-    landing = '<html><a href="https://x.invalid/Weekly.xlsx">r</a></html>'
-    with (
-        patch.object(gpb, "_http_text", autospec=True, return_value=landing),
-        patch.object(gpb, "_http_bytes", autospec=True, return_value=b"xlsx"),
-        patch.object(
-            gpb, "_read_lcfs_weekly", autospec=True, return_value=weeks
-        ),
-    ):
-        # Target is 8 days past the 13th and 1 day past the 20th, so the
-        # 20th is not yet reportable and the 13th is the newest usable.
-        week = gpb.fetch_lcfs_for_target_date(date(2026, 7, 21), tmp_path)
-    assert week.monday == date(2026, 7, 13)
-
-
-def test_lcfs_workbook_with_no_reportable_week_is_reported(
-    tmp_path: Path,
-) -> None:
-    """Every week in the workbook still being unpublishable is a failure.
-
-    The same publication lag that picks the newest usable week can
-    disqualify all of them, and a run that cannot name a week has to
-    say so rather than reach for one whose report is not out yet.
-    """
-    landing = '<html><a href="https://x.invalid/Weekly.xlsx">r</a></html>'
-    with (
-        patch.object(gpb, "_http_text", autospec=True, return_value=landing),
-        patch.object(gpb, "_http_bytes", autospec=True, return_value=b"xlsx"),
-        patch.object(
-            gpb,
-            "_read_lcfs_weekly",
-            autospec=True,
-            return_value=[(date(2026, 7, 20), 75.0)],
-        ),
+        _lcfs_quotes([(date(2026, 9, 16), 84.75)]),
         pytest.raises(gpb.SnapshotError) as caught,
     ):
-        gpb.fetch_lcfs_for_target_date(date(2026, 7, 21), tmp_path)
-    assert "no week with monday" in str(caught.value)
+        gpb.fetch_lcfs_for_target_date(date(2026, 1, 5), tmp_path)
+    assert "CA LCFS" in str(caught.value)
+
+
+def test_lcfs_export_rows_are_read_in_date_order(tmp_path: Path) -> None:
+    """The caller takes the last usable row, so order is load-bearing."""
+    with _lcfs_export(
+        [
+            ["Date", "California LCFS Carbon Credit (USD/ton)"],
+            ["2026-09-16", 84.75],
+            ["2026-09-14", 84.50],
+            ["2026-09-15", 84.65],
+        ]
+    ):
+        assert gpb._read_lcfs_daily(tmp_path / "lcfs.xls") == [
+            (date(2026, 9, 14), 84.50),
+            (date(2026, 9, 15), 84.65),
+            (date(2026, 9, 16), 84.75),
+        ]
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [["Date", "Price"]],
+        [["Date", "Price"], ["not a date", 84.75]],
+        [["Date", "Price"], ["2026-09-16", "n/a"]],
+        [["2026-09-16"]],
+        [],
+    ],
+    ids=["header_only", "bad_date", "bad_price", "missing_column", "empty"],
+)
+def test_lcfs_export_without_usable_rows_is_reported(
+    tmp_path: Path, rows: list[list[object]]
+) -> None:
+    """A reshaped export must not read as an empty price series."""
+    with (
+        _lcfs_export(rows),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb._read_lcfs_daily(tmp_path / "lcfs.xls")
+    assert "no dated rows" in str(caught.value)
+
+
+def test_lcfs_export_that_is_not_a_workbook_is_reported(
+    tmp_path: Path,
+) -> None:
+    """A source answering 200 with an error page is still bad input."""
+    book = tmp_path / "lcfs.xls"
+    book.write_text("<html>503 Service Unavailable</html>")
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._read_lcfs_daily(book)
+    assert "CA LCFS" in str(caught.value)
 
 
 @contextlib.contextmanager
@@ -572,3 +638,62 @@ def test_shipped_tables_are_ordered_and_unique(name: str) -> None:
     assert dates == sorted(dates), f"{name} is out of order"
     assert len(set(dates)) == len(dates), f"{name} has a duplicate date"
     assert all(row[1] > 0 for row in table), f"{name} has a bad price"
+
+
+@pytest.mark.parametrize(
+    "blob",
+    [
+        b"",
+        b"<html>503 Service Unavailable</html>",
+        b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 600,
+    ],
+    ids=["empty", "error_page", "corrupt_ole2"],
+)
+def test_lcfs_damaged_export_is_reported_not_raised(
+    tmp_path: Path, blob: bytes
+) -> None:
+    """xlrd signals damage through several unrelated exception types.
+
+    Only the innermost is an `XLRDError`; a corrupt container and a
+    truncated transfer surface as other classes entirely, and any of
+    them escaping would be a traceback where the tool promises one
+    reported line.
+    """
+    book = tmp_path / "lcfs.xls"
+    book.write_bytes(blob)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._read_lcfs_daily(book)
+    assert "CA LCFS" in str(caught.value)
+
+
+def test_lcfs_missing_export_is_reported_not_raised(tmp_path: Path) -> None:
+    """A download that never landed is bad input, not a crash."""
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._read_lcfs_daily(tmp_path / "never-written.xls")
+    assert "CA LCFS" in str(caught.value)
+
+
+def test_emitted_ca_nontax_fragment_is_well_formed() -> None:
+    """The note is prose inside a quoted JS literal, so it has to escape.
+
+    An unescaped quote or brace here would corrupt the snapshot array
+    for every reader of the page, and the damage would not show up in
+    any value this script checks.
+    """
+    fragment = gpb.build_ca_nontax(
+        date(2026, 9, 17),
+        gpb.LcfsQuote(date(2026, 9, 16), 84.75, "https://example.invalid"),
+        gpb.AuctionSettlement(date(2026, 8, 19), 32.48, "Aug 2026 #48"),
+    )
+    assert fragment.count("{") == fragment.count("}")
+    assert fragment.count("[") == fragment.count("]")
+    # Every double quote must open or close a field, never sit loose
+    # inside the prose.
+    assert fragment.count('"') % 2 == 0
+    for field in ("src:", "note:", "asOf:"):
+        assert field in fragment
+    note = re.search(r'note:"((?:[^"\\]|\\.)*)"', fragment)
+    assert note is not None, "note field is not a parseable string literal"
+    assert "Argus" in note.group(1)
+    assert "not exact" in note.group(1)
+    assert gpb.LCFS_LAST_CARB_WEEK.isoformat() in note.group(1)
