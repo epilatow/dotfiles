@@ -10,7 +10,8 @@ from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
 import pytest
-from curl_cffi import requests
+from curl_cffi import CurlECode, requests
+from curl_cffi.requests.exceptions import CODE2ERROR
 
 REPO_ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -54,37 +55,70 @@ def _http_error(status: int) -> requests.exceptions.HTTPError:
     return exc
 
 
+def _curl_error(code: CurlECode) -> requests.exceptions.RequestException:
+    """Build the exception curl_cffi raises for a curl failure code.
+
+    A request that died before a status line arrived still comes back
+    with the parsed response attached, carrying `status_code == 0`
+    rather than nothing at all; a bare `Timeout("...")` answers None
+    instead, a shape the library never produces. The class comes from
+    the library's own `CODE2ERROR` table, so the cases below stay
+    honest about which failures it routes to an `HTTPError` subclass.
+    """
+    exc_type = CODE2ERROR.get(code, requests.exceptions.RequestException)
+    response = requests.Response()
+    response.status_code = 0
+    return exc_type(f"Failed to perform, curl: ({int(code)})", code, response)
+
+
+# Curl failures that never reached a status line: the connection died,
+# the name did not resolve, the transfer was cut short, the HTTP/2
+# session broke. The session impersonates Chrome and so negotiates
+# HTTP/2, which puts the protocol-level codes in reach of a real run.
+TRANSPORT_CURL_CODES = [
+    CurlECode.OPERATION_TIMEDOUT,
+    CurlECode.COULDNT_RESOLVE_HOST,
+    CurlECode.COULDNT_CONNECT,
+    CurlECode.RECV_ERROR,
+    CurlECode.SEND_ERROR,
+    CurlECode.GOT_NOTHING,
+    CurlECode.PARTIAL_FILE,
+    CurlECode.HTTP2,
+    CurlECode.HTTP2_STREAM,
+]
+
+
 # ---------------------------------------------------------------------------
 # Retry classification
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "exc",
-    [
-        requests.exceptions.Timeout("Operation timed out"),
-        requests.exceptions.ConnectionError("connection reset by peer"),
-        _http_error(500),
-        _http_error(502),
-        _http_error(503),
-        _http_error(429),
-        _http_error(408),
-    ],
-    ids=[
-        "Timeout",
-        "ConnectionError",
-        "HTTPError500",
-        "HTTPError502",
-        "HTTPError503",
-        "HTTPError429",
-        "HTTPError408",
-    ],
+    "code", TRANSPORT_CURL_CODES, ids=lambda code: code.name
 )
-def test_transient_failures_are_retried(
-    exc: Exception, no_backoff_sleep: list[float]
+def test_failures_without_a_status_are_retried(
+    code: CurlECode, no_backoff_sleep: list[float]
 ) -> None:
-    """A failure that says nothing about the request gets another go."""
-    session = _session(exc, "<html>ok</html>")
+    """No status line arrived, so there is no verdict to obey.
+
+    Runs against the class curl_cffi itself maps each code to, which is
+    the fact worth pinning: the library routes several of these
+    transport failures to `HTTPError` subclasses, so the exception type
+    alone does not establish that the site answered. Only a nonzero
+    status does.
+    """
+    session = _session(_curl_error(code), "<html>ok</html>")
+    assert dcs._get_text(session, URL) == "<html>ok</html>"
+    assert session.get.call_count == 2
+    assert no_backoff_sleep == [dcs.HTTP_BACKOFF_SEC]
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 429, 408])
+def test_retryable_statuses_are_retried(
+    status: int, no_backoff_sleep: list[float]
+) -> None:
+    """A status the site could answer differently gets another go."""
+    session = _session(_http_error(status), "<html>ok</html>")
     assert dcs._get_text(session, URL) == "<html>ok</html>"
     assert session.get.call_count == 2
     assert no_backoff_sleep == [dcs.HTTP_BACKOFF_SEC]
@@ -107,8 +141,12 @@ def test_retries_are_exhausted_then_reported(
     no_backoff_sleep: list[float],
 ) -> None:
     """A site down for the whole run fails as FetchError, not a curl error."""
-    exc = requests.exceptions.Timeout("Operation timed out after 992057 ms")
-    session = _session(*[exc] * dcs.HTTP_ATTEMPTS)
+    session = _session(
+        *[
+            _curl_error(CurlECode.OPERATION_TIMEDOUT)
+            for _ in range(dcs.HTTP_ATTEMPTS)
+        ]
+    )
     with pytest.raises(dcs.FetchError) as caught:
         dcs._get_text(session, URL)
     assert session.get.call_count == dcs.HTTP_ATTEMPTS
@@ -118,14 +156,22 @@ def test_retries_are_exhausted_then_reported(
     assert f"giving up after {dcs.HTTP_ATTEMPTS} attempts" in message
 
 
-def test_backoff_grows_between_attempts(no_backoff_sleep: list[float]) -> None:
-    """Successive waits widen, so a slow recovery still gets caught."""
-    exc = requests.exceptions.ConnectionError("down")
-    session = _session(*[exc] * dcs.HTTP_ATTEMPTS)
+def test_backoff_sequence_spans_the_budgeted_window(
+    no_backoff_sleep: list[float],
+) -> None:
+    """The delays the budget is reasoned about, pinned to their values.
+
+    `HTTP_ATTEMPTS` is documented in terms of how long the attempts
+    span, so a change to the count or the growth factor that silently
+    shortens the window has to fail here rather than leave the comment
+    describing a budget the code no longer has.
+    """
+    session = _session(
+        *[_curl_error(CurlECode.RECV_ERROR) for _ in range(dcs.HTTP_ATTEMPTS)]
+    )
     with pytest.raises(dcs.FetchError):
         dcs._get_text(session, URL)
-    assert no_backoff_sleep == sorted(no_backoff_sleep)
-    assert len(set(no_backoff_sleep)) == len(no_backoff_sleep)
+    assert no_backoff_sleep == [5.0, 15.0, 45.0, 135.0]
 
 
 def test_first_attempt_success_does_not_wait(
@@ -140,7 +186,9 @@ def test_first_attempt_success_does_not_wait(
 
 def test_fetch_window_retries_through_its_url() -> None:
     """Every window walked by a run goes through the retrying helper."""
-    session = _session(requests.exceptions.Timeout("slow"), "<html>ok</html>")
+    session = _session(
+        _curl_error(CurlECode.OPERATION_TIMEDOUT), "<html>ok</html>"
+    )
     assert dcs.fetch_window(session, date(2026, 9, 4)) == "<html>ok</html>"
     assert session.get.call_count == 2
     requested = session.get.call_args.args[0]

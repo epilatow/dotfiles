@@ -60,13 +60,16 @@ TIME_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Retry budget for a single window. The scheduled run happens in a macOS
-# DarkWake window, where the host can drop back to sleep mid-request:
-# the process resumes onto a dead connection, and the request timeout
-# reports the whole sleep because nothing was running to enforce it any
-# earlier. The retry is what turns that into a delay rather than a
-# failed run. Delays grow 5s, 15s, 45s.
-HTTP_ATTEMPTS = 4
+# Retry budget for a single window. The site intermittently stops
+# answering -- stalling until the request timeout, or returning 500 --
+# and recovers on its own, and the scheduled run lands in the small
+# hours when it is most prone to that. The budget is sized to outlast
+# an outage spanning more than a single attempt rather than to ride
+# out one dropped packet: delays grow 5s, 15s, 45s, 135s, which with
+# the attempts' own timeouts puts one window's worst case near six
+# minutes -- well inside the job timeout. A window that never comes
+# back fails the run without walking the rest.
+HTTP_ATTEMPTS = 5
 HTTP_BACKOFF_SEC = 5.0
 HTTP_BACKOFF_FACTOR = 3.0
 
@@ -96,9 +99,26 @@ def _describe(exc: BaseException) -> str:
 
 
 def _retryable(exc: requests.exceptions.RequestException) -> bool:
-    """Whether another identical request could plausibly succeed."""
-    status = getattr(getattr(exc, "response", None), "status_code", None)
-    if status is None:
+    """Whether another identical request could plausibly succeed.
+
+    Only a status line the site actually sent is a verdict on the
+    request; every other failure describes the transport and says
+    nothing about how a later attempt would fare. Both tests below are
+    needed to tell those apart, because neither the exception type nor
+    the status code identifies a verdict on its own.
+
+    curl_cffi attaches the parsed response to every exception raised
+    from a performed request, so a timeout answers `.response` just as
+    a refusal does -- with `status_code == 0`, since no status line
+    arrived. It also raises some purely transport-level failures as
+    `HTTPError` subclasses: an HTTP/2 stream error, a body truncated
+    mid-transfer. Those carry the same zero, which is the absence of a
+    verdict rather than a refusal to honor the request.
+    """
+    if not isinstance(exc, requests.exceptions.HTTPError):
+        return True
+    status = getattr(exc.response, "status_code", None)
+    if status in (None, 0):
         return True
     return status in HTTP_RETRY_STATUSES or status >= 500
 
