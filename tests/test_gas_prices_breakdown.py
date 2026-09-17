@@ -844,3 +844,301 @@ def test_or_cfp_one_day_past_the_limit_fails(tmp_path: Path) -> None:
     ):
         gpb.fetch_or_cfp_for_target_date(target, tmp_path)
     assert "OR CFP" in str(caught.value)
+
+
+# ---------------------------------------------------------------------------
+# Restating past snapshots
+# ---------------------------------------------------------------------------
+#
+# Retail is the reason this rewrites in place rather than regenerating:
+# AAA publishes only today's averages, so a past snapshot's retail column
+# cannot be fetched again and has to survive untouched.
+
+
+def _state_chunk(code: str, retail: str, nontax: str) -> str:
+    return (
+        f'  {{ code:"{code}", state:"{code}", retail:{retail},\n'
+        f'    fixed:{{ total:0.100, parts:[], asOf:"Jul 2025"}},\n'
+        f'    adval:{{ pct:0, parts:[], asOf:""}},\n'
+        f"    nontax:{nontax}}}"
+    )
+
+
+def _snapshot(day: str, *, trailing_newline: bool) -> str:
+    chunks = [
+        _state_chunk("CA", "6.085", '{ total:0.4530, parts:[], asOf:"x"}'),
+        _state_chunk("OR", "4.200", '{ total:0.3708, parts:[], asOf:"x"}'),
+        _state_chunk("WA", "4.900", '{ total:0.5200, parts:[], asOf:"x"}'),
+        _state_chunk("TX", "2.800", '{ total:0, parts:[], asOf:""}'),
+    ]
+    body = ",\n".join(chunks) + ","
+    close = "\n  ]\n}" if trailing_newline else "  ]\n}"
+    notes = (
+        "Backfill snapshot. Retail (col 2) reconstructed from somewhere. "
+        f"{gpb.PASSTHROUGH_NOTES_MARKER}CA LCFS week of 2026-07-13 "
+        "($72.61/MT); CA cap-and-trade Feb 2026 Joint Auction #46; "
+        "WA CCA WA Auction #13; OR CFP 2026-06 ($151.26/credit)."
+    )
+    return (
+        f'{{\n  date: "{day}",\n  notes: "{notes}",\n  data: [\n{body}{close}'
+    )
+
+
+def _rebased(block: str) -> tuple[str, dict[str, tuple[float, float]]]:
+    return gpb.rebase_snapshot_passthroughs(
+        block,
+        gpb.LcfsQuote(date(2026, 9, 16), 84.75, "https://example.invalid"),
+        gpb.AuctionSettlement(date(2026, 8, 19), 32.48, "Aug 2026 #48"),
+        gpb.AuctionSettlement(date(2026, 9, 2), 39.50, "WA #15"),
+        gpb.OrCfpMonth("2026-07", 161.01, "https://example.invalid"),
+    )
+
+
+@pytest.mark.parametrize(
+    "trailing_newline", [True, False], ids=["generated", "hand_built"]
+)
+def test_rebase_handles_both_snapshot_layouts(trailing_newline: bool) -> None:
+    """Snapshots predating this script close their array differently."""
+    block = _snapshot("2026-09-17", trailing_newline=trailing_newline)
+    rebuilt, moved = _rebased(block)
+    assert set(moved) == {"CA", "OR", "WA"}
+    assert rebuilt.endswith("}")
+    assert rebuilt.count("{") == rebuilt.count("}")
+
+
+def test_rebase_leaves_retail_and_other_states_alone() -> None:
+    """The columns that cannot be re-fetched must survive verbatim."""
+    block = _snapshot("2026-09-17", trailing_newline=True)
+    rebuilt, moved = _rebased(block)
+    for code, retail in (
+        ("CA", "6.085"),
+        ("OR", "4.200"),
+        ("WA", "4.900"),
+        ("TX", "2.800"),
+    ):
+        assert f'code:"{code}", state:"{code}", retail:{retail}' in rebuilt
+    assert "TX" not in moved
+    assert 'nontax:{ total:0, parts:[], asOf:""}' in rebuilt
+    assert "fixed:{ total:0.100" in rebuilt
+
+
+def test_rebase_reports_the_totals_it_moved() -> None:
+    """The dry-run report is what a reviewer approves the rewrite from."""
+    block = _snapshot("2026-09-17", trailing_newline=True)
+    _, moved = _rebased(block)
+    assert moved["CA"][0] == 0.4530
+    assert moved["CA"][1] == pytest.approx(
+        round(84.75 * gpb.LCFS_FACTOR, 4)
+        + round(32.48 * gpb.CCA_FACTOR_MT_PER_GAL, 4)
+    )
+    assert moved["WA"][0] == 0.5200
+
+
+def test_rebase_of_an_unchanged_snapshot_reports_nothing() -> None:
+    """Re-running against settled data must not churn the file."""
+    block = _snapshot("2026-09-17", trailing_newline=True)
+    once, _ = _rebased(block)
+    twice, moved = _rebased(once)
+    assert twice == once
+    assert moved == {}
+
+
+def test_rebase_without_a_date_is_reported() -> None:
+    """A block the parser cannot place has no sources to select."""
+    with pytest.raises(gpb.SnapshotError) as caught:
+        _rebased("{\n  data: [\n  ]\n}")
+    assert "no date" in str(caught.value)
+
+
+def test_rebase_without_a_data_array_is_reported() -> None:
+    """A reshaped snapshot must not silently pass through unrewritten."""
+    with pytest.raises(gpb.SnapshotError) as caught:
+        _rebased('{\n  date: "2026-09-17",\n  notes: "x"\n}')
+    assert "data array" in str(caught.value)
+
+
+@contextlib.contextmanager
+def _rebase_sources() -> Iterator[None]:
+    """Stand in for both series the restate command downloads."""
+    with (
+        patch.object(
+            gpb,
+            "load_lcfs_series",
+            autospec=True,
+            return_value=[(date(2026, 9, 16), 84.75)],
+        ),
+        patch.object(
+            gpb,
+            "load_or_cfp_series",
+            autospec=True,
+            return_value={(2026, 7): 161.01},
+        ),
+    ):
+        yield
+
+
+def _page(*blocks: str) -> str:
+    joined = ",\n".join(blocks)
+    return f"const SNAPSHOTS = [\n{joined}\n];\n"
+
+
+def test_rebase_command_rewrites_the_file(tmp_path: Path) -> None:
+    """The end-to-end path a restatement actually runs through."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot("2026-09-17", trailing_newline=True)))
+    before = html.read_text()
+    with _rebase_sources():
+        assert gpb.main(["rebase-passthroughs", str(html)]) == 0
+    after = html.read_text()
+    assert after != before
+    assert "Argus via Neste monitor" in after
+    assert html.stat().st_mode & 0o777 == 0o644
+
+
+def test_rebase_command_dry_run_leaves_the_file_alone(tmp_path: Path) -> None:
+    """A dry run is what the rewrite gets approved from; it must not write."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot("2026-09-17", trailing_newline=True)))
+    before = html.read_text()
+    with _rebase_sources():
+        assert gpb.main(["rebase-passthroughs", "--dry-run", str(html)]) == 0
+    assert html.read_text() == before
+
+
+def test_rebase_command_is_idempotent(tmp_path: Path) -> None:
+    """Re-running against settled data must not churn the file."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot("2026-09-17", trailing_newline=True)))
+    with _rebase_sources():
+        gpb.main(["rebase-passthroughs", str(html)])
+    once = html.read_text()
+    with _rebase_sources():
+        assert gpb.main(["rebase-passthroughs", str(html)]) == 0
+    assert html.read_text() == once
+
+
+def test_rebase_command_rewrites_attribution_only_changes(
+    tmp_path: Path,
+) -> None:
+    """A restatement that moves no total still has to reach the page.
+
+    Switching a source rewrites the src link and the note while the
+    rounded total can land on the same four decimals. Keying the write
+    on the total would drop exactly those snapshots and leave a retired
+    source cited.
+    """
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot("2026-09-17", trailing_newline=True)))
+    with _rebase_sources():
+        gpb.main(["rebase-passthroughs", str(html)])
+    settled = html.read_text()
+    # Put a retired source back while leaving every total untouched.
+    stale = settled.replace(gpb.LCFS_MONITOR_URL, "https://retired.invalid")
+    assert stale != settled
+    html.write_text(stale)
+    with _rebase_sources():
+        assert gpb.main(["rebase-passthroughs", str(html)]) == 0
+    assert "https://retired.invalid" not in html.read_text()
+
+
+def test_rebase_command_reports_a_source_failure(tmp_path: Path) -> None:
+    """A snapshot the sources cannot cover fails without writing."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot("2020-01-02", trailing_newline=True)))
+    before = html.read_text()
+    with _rebase_sources():
+        assert gpb.main(["rebase-passthroughs", str(html)]) == 1
+    assert html.read_text() == before
+
+
+def test_rebase_keeps_the_provenance_half_of_the_notes() -> None:
+    """Where a snapshot's retail came from is captured, not derived.
+
+    Only the pass-through description is the restater's to rewrite; the
+    sentence recording the archive URL a backfill pulled retail from
+    cannot be reconstructed and has to survive.
+    """
+    block = _snapshot("2026-09-17", trailing_newline=True)
+    rebuilt, _ = _rebased(block)
+    notes = re.search(r'notes:\s*"((?:[^"\\]|\\.)*)"', rebuilt)
+    assert notes is not None
+    head = notes.group(1).split(gpb.PASSTHROUGH_NOTES_MARKER)[0]
+    assert head.startswith("Backfill snapshot.")
+    assert "reconstructed from somewhere" in head
+    assert "Argus via Neste monitor" in notes.group(1)
+    assert notes.group(1).count(gpb.PASSTHROUGH_NOTES_MARKER) == 1
+
+
+def test_rebase_describes_notes_that_never_did() -> None:
+    """The original baseline never described its pass-throughs."""
+    block = _snapshot("2026-09-17", trailing_newline=True)
+    bare = re.sub(
+        r'notes:\s*"(?:[^"\\]|\\.)*"',
+        'notes:"Tax rates from state DOR pages."',
+        block,
+        count=1,
+    )
+    rebuilt, _ = _rebased(bare)
+    notes = re.search(r'notes:\s*"((?:[^"\\]|\\.)*)"', rebuilt)
+    assert notes is not None
+    assert notes.group(1).startswith("Tax rates from state DOR pages. ")
+    assert gpb.PASSTHROUGH_NOTES_MARKER in notes.group(1)
+
+
+def test_rebase_refuses_a_snapshot_missing_a_priced_state() -> None:
+    """A dropped state must not read as 'already correct'."""
+    block = _snapshot("2026-09-17", trailing_newline=True)
+    without_wa = re.sub(
+        r'  \{ code:"WA".*?\}\},\n', "", block, count=1, flags=re.DOTALL
+    )
+    assert 'code:"WA"' not in without_wa
+    with pytest.raises(gpb.SnapshotError) as caught:
+        _rebased(without_wa)
+    assert "WA" in str(caught.value)
+
+
+def test_rebase_refuses_to_disturb_retail() -> None:
+    """The guard that stands between a bad splice and irreplaceable data."""
+    block = _snapshot("2026-09-17", trailing_newline=True)
+    tampered = block.replace("retail:6.085", "retail:9.999", 1)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._assert_only_nontax_changed(block, tampered, date(2026, 9, 17))
+    assert "retail" in str(caught.value)
+
+
+def test_rebase_command_reports_every_unreachable_snapshot(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One snapshot off the front of the sources must not hide the others."""
+    html = tmp_path / "page.html"
+    html.write_text(
+        _page(
+            _snapshot("2020-01-02", trailing_newline=True),
+            _snapshot("2019-01-03", trailing_newline=True),
+        )
+    )
+    before = html.read_text()
+    with _rebase_sources(), caplog.at_level("ERROR"):
+        assert gpb.main(["rebase-passthroughs", str(html)]) == 1
+    assert html.read_text() == before
+    reported = caplog.text
+    assert "2020-01-02" in reported
+    assert "2019-01-03" in reported
+
+
+def test_rebase_command_names_attribution_only_runs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The dry-run report is what the rewrite gets approved from."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot("2026-09-17", trailing_newline=True)))
+    with _rebase_sources():
+        gpb.main(["rebase-passthroughs", str(html)])
+    stale = html.read_text().replace(
+        gpb.LCFS_MONITOR_URL, "https://retired.invalid"
+    )
+    html.write_text(stale)
+    with _rebase_sources(), caplog.at_level("INFO"):
+        assert gpb.main(["rebase-passthroughs", "--dry-run", str(html)]) == 0
+    assert "attribution only" in caplog.text
+    assert html.read_text() == stale
