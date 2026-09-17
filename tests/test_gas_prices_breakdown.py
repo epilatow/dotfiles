@@ -291,8 +291,15 @@ def test_process_exits_one_with_no_traceback(tmp_path: Path) -> None:
 # alternative is writing a plausible-looking number nobody can trace.
 
 
+AAA_TODAY = date(2026, 9, 17)
+
+
 def _aaa_page(rows: str) -> str:
-    return f'<html><table id="sortable"><tr><th>State</th></tr>{rows}</table>'
+    return (
+        f"<html>as of {AAA_TODAY.month}/{AAA_TODAY.day}/"
+        f"{AAA_TODAY.year % 100:02d} "
+        f'<table id="sortable"><tr><th>State</th></tr>{rows}</table>'
+    )
 
 
 def _aaa_row(state: str, price: str) -> str:
@@ -303,11 +310,14 @@ def test_aaa_missing_table_is_reported() -> None:
     """The page rendering without its table is a source failure."""
     with (
         patch.object(
-            gpb, "_http_text", autospec=True, return_value="<html>maintenance"
+            gpb,
+            "_http_text",
+            autospec=True,
+            return_value="<html>as of 9/17/26 maintenance",
         ),
         pytest.raises(gpb.SnapshotError) as caught,
     ):
-        gpb.fetch_aaa_retail()
+        gpb.fetch_aaa_retail(AAA_TODAY)
     assert "sortable table not found" in str(caught.value)
 
 
@@ -318,7 +328,7 @@ def test_aaa_short_table_is_reported() -> None:
         patch.object(gpb, "_http_text", autospec=True, return_value=page),
         pytest.raises(gpb.SnapshotError) as caught,
     ):
-        gpb.fetch_aaa_retail()
+        gpb.fetch_aaa_retail(AAA_TODAY)
     assert "expected 51" in str(caught.value)
 
 
@@ -329,7 +339,7 @@ def test_aaa_unknown_state_name_is_reported() -> None:
         patch.object(gpb, "_http_text", autospec=True, return_value=page),
         pytest.raises(gpb.SnapshotError) as caught,
     ):
-        gpb.fetch_aaa_retail()
+        gpb.fetch_aaa_retail(AAA_TODAY)
     assert "unrecognized state" in str(caught.value)
 
 
@@ -339,7 +349,7 @@ def test_aaa_parses_every_mapped_state() -> None:
     with patch.object(
         gpb, "_http_text", autospec=True, return_value=_aaa_page(rows)
     ):
-        retail = gpb.fetch_aaa_retail()
+        retail = gpb.fetch_aaa_retail(AAA_TODAY)
     assert len(retail) == 51
     assert retail["CA"] == 3.50
 
@@ -697,3 +707,140 @@ def test_emitted_ca_nontax_fragment_is_well_formed() -> None:
     assert "Argus" in note.group(1)
     assert "not exact" in note.group(1)
     assert gpb.LCFS_LAST_CARB_WEEK.isoformat() in note.group(1)
+
+
+# ---------------------------------------------------------------------------
+# Freshness of the remaining live sources
+# ---------------------------------------------------------------------------
+
+
+def test_aaa_page_gone_stale_fails_the_run() -> None:
+    """Frozen averages look identical to fresh ones without the date."""
+    stale = AAA_TODAY - timedelta(days=gpb.AAA_STALE_DAYS + 1)
+    page = (
+        f"<html>as of {stale.month}/{stale.day}/{stale.year % 100:02d} "
+        f'<table id="sortable"><tr><th>State</th></tr></table>'
+    )
+    with (
+        patch.object(gpb, "_http_text", autospec=True, return_value=page),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb.fetch_aaa_retail(AAA_TODAY)
+    message = str(caught.value)
+    assert "AAA" in message
+    assert str(stale) in message
+
+
+def test_aaa_page_without_an_as_of_date_is_reported() -> None:
+    """The freshness check cannot be skipped just because the stamp moved."""
+    rows = "".join(_aaa_row(name, "3.50") for name in sorted(gpb.STATE_CODE))
+    page = f'<html><table id="sortable"><tr><th>S</th></tr>{rows}</table>'
+    with (
+        patch.object(gpb, "_http_text", autospec=True, return_value=page),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb.fetch_aaa_retail(AAA_TODAY)
+    assert "no 'as of' date" in str(caught.value)
+
+
+def test_aaa_page_dated_within_the_limit_still_answers() -> None:
+    """A weekend-old page is normal, not a failure."""
+    recent = AAA_TODAY - timedelta(days=gpb.AAA_STALE_DAYS)
+    rows = "".join(_aaa_row(name, "3.50") for name in sorted(gpb.STATE_CODE))
+    page = (
+        f"<html>as of {recent.month}/{recent.day}/{recent.year % 100:02d} "
+        f'<table id="sortable"><tr><th>S</th></tr>{rows}</table>'
+    )
+    with patch.object(gpb, "_http_text", autospec=True, return_value=page):
+        assert len(gpb.fetch_aaa_retail(AAA_TODAY)) == 51
+
+
+def test_or_cfp_source_gone_quiet_fails_the_run(tmp_path: Path) -> None:
+    """DEQ publishing nothing new must not read as an unchanged market."""
+    with (
+        _or_cfp_sources({(2025, 1): 120.0}),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb.fetch_or_cfp_for_target_date(date(2026, 9, 17), tmp_path)
+    message = str(caught.value)
+    assert "OR CFP" in message
+    assert "days before" in message
+
+
+def test_or_cfp_normal_publication_lag_is_not_stale(tmp_path: Path) -> None:
+    """The bound has to clear the widest gap the +2 month rule produces."""
+    # Aug becomes available Oct 1, so a Sep 30 run still has to accept
+    # July -- the longest a correctly-published month is ever behind.
+    with _or_cfp_sources({(2026, 7): 161.01}):
+        month = gpb.fetch_or_cfp_for_target_date(date(2026, 9, 30), tmp_path)
+    assert month.year_month == "2026-07"
+
+
+def test_aaa_page_from_after_the_target_fails_the_run() -> None:
+    """Backfilling must not take today's prices for a past date.
+
+    The page serves only current averages, so a run for an old target
+    would otherwise stamp a months-old snapshot with this morning's
+    numbers while its notes claim they are the target's.
+    """
+    ahead = AAA_TODAY + timedelta(days=gpb.AAA_STALE_DAYS + 1)
+    rows = "".join(_aaa_row(name, "3.50") for name in sorted(gpb.STATE_CODE))
+    page = (
+        f"<html>as of {ahead.month}/{ahead.day}/{ahead.year % 100:02d} "
+        f'<table id="sortable"><tr><th>S</th></tr>{rows}</table>'
+    )
+    with (
+        patch.object(gpb, "_http_text", autospec=True, return_value=page),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb.fetch_aaa_retail(AAA_TODAY)
+    message = str(caught.value)
+    assert "AAA" in message
+    assert "after" in message
+
+
+def test_aaa_page_slightly_ahead_of_the_target_is_fine() -> None:
+    """A catch-up run days later is normal and must still publish."""
+    ahead = AAA_TODAY + timedelta(days=gpb.AAA_STALE_DAYS)
+    rows = "".join(_aaa_row(name, "3.50") for name in sorted(gpb.STATE_CODE))
+    page = (
+        f"<html>as of {ahead.month}/{ahead.day}/{ahead.year % 100:02d} "
+        f'<table id="sortable"><tr><th>S</th></tr>{rows}</table>'
+    )
+    with patch.object(gpb, "_http_text", autospec=True, return_value=page):
+        assert len(gpb.fetch_aaa_retail(AAA_TODAY)) == 51
+
+
+@pytest.mark.parametrize(
+    "stamp", ["as of 13/45/26", "as of 2/30/26"], ids=["month", "day"]
+)
+def test_aaa_unparseable_date_is_reported(stamp: str) -> None:
+    """A date-shaped string that is not a date must not reach the check."""
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._aaa_as_of(f"<html>{stamp} <table id='sortable'></table>")
+    assert "unreadable" in str(caught.value)
+
+
+def test_or_cfp_at_the_freshness_limit_still_answers(tmp_path: Path) -> None:
+    """The bound is inclusive, so a run on the limit is not a failure.
+
+    Age is measured from the first of the published month, so the target
+    is derived from the month rather than the other way round.
+    """
+    month = date(2026, 5, 1)
+    target = month + timedelta(days=gpb.OR_CFP_STALE_DAYS)
+    with _or_cfp_sources({(month.year, month.month): 150.0}):
+        got = gpb.fetch_or_cfp_for_target_date(target, tmp_path)
+    assert got.year_month == "2026-05"
+
+
+def test_or_cfp_one_day_past_the_limit_fails(tmp_path: Path) -> None:
+    """Pins the constant itself, not merely some value far outside it."""
+    month = date(2026, 5, 1)
+    target = month + timedelta(days=gpb.OR_CFP_STALE_DAYS + 1)
+    with (
+        _or_cfp_sources({(month.year, month.month): 150.0}),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb.fetch_or_cfp_for_target_date(target, tmp_path)
+    assert "OR CFP" in str(caught.value)

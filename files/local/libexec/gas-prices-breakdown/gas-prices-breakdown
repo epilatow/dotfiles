@@ -192,10 +192,18 @@ LCFS_MONITOR_XLS = (
 # skipped a session.
 LCFS_STALE_DAYS = 7
 
-# AAA live state-averages page.
+# AAA live state-averages page. The averages are restated daily and the
+# page stamps itself with the date they are good for, so anything more
+# than a long weekend behind the snapshot means the feed has stopped.
 AAA_URL = "https://gasprices.aaa.com/state-gas-price-averages/"
+AAA_STALE_DAYS = 3
 
 # Oregon DEQ Clean Fuels Program credit transfer activity xlsx (rolling).
+# DEQ publishes month M by the end of M+1, so the newest usable month
+# starts between 59 and 91 days behind the snapshot depending on where
+# in the month it falls. The limit sits about a month past that worst
+# case, which is enough to tell a late publication from a stopped one.
+OR_CFP_STALE_DAYS = 125
 OR_CFP_URL = (
     "https://www.oregon.gov/deq/ghgp/Documents/"
     "CFPCreditTransferActivityReport.xlsx"
@@ -450,8 +458,53 @@ def most_recent_thursday(today: date | None = None) -> date:
 # ---------------------------------------------------------------------------
 
 
-def fetch_aaa_retail() -> dict[str, float]:
+def _aaa_as_of(html: str) -> date:
+    """Read the date AAA stamps its averages with.
+
+    It is the only thing distinguishing fresh prices from a page that
+    has stopped updating, since the table itself looks the same either
+    way.
+
+    The pattern is deliberately narrow: a two-digit year, matched
+    case-sensitively, anywhere in the document. The page renders the
+    phrase more than once and the copies agree, so the first match is
+    taken. A four-digit year or a capitalised "As of" fails here rather
+    than parsing to something plausible, which is the right way round
+    for a check whose whole job is to notice the page changing.
+    """
+    match = re.search(r"as of (\d{1,2})/(\d{1,2})/(\d{2})\b", html)
+    if not match:
+        raise SnapshotError("AAA: no 'as of' date found on page")
+    month, day, year = (int(part) for part in match.groups())
+    try:
+        return date(2000 + year, month, day)
+    except ValueError as exc:
+        raise SnapshotError(
+            f"AAA: unreadable 'as of' date {match.group(0)!r}: "
+            f"{_describe(exc)}"
+        ) from exc
+
+
+def fetch_aaa_retail(target: date) -> dict[str, float]:
+    """Return per-state retail averages good for `target`.
+
+    The page only ever serves today's averages, so the check is on the
+    distance between its stamp and `target` in either direction: too far
+    behind means the feed stopped, and too far ahead means the snapshot
+    is being backfilled for a date these prices never described. The
+    snapshot's own notes claim the retail is as of its date, and this is
+    what keeps that true.
+    """
     html = _http_text(AAA_URL)
+    as_of = _aaa_as_of(html)
+    drift = (target - as_of).days
+    if abs(drift) > AAA_STALE_DAYS:
+        direction = "before" if drift > 0 else "after"
+        raise SnapshotError(
+            f"AAA: page is dated {as_of}, {abs(drift)} days {direction} "
+            f"{target}, over the {AAA_STALE_DAYS}-day limit; these averages "
+            f"do not describe {target}"
+        )
     table_match = re.search(
         r'<table[^>]*id="sortable"[^>]*>(.*?)</table>',
         html,
@@ -638,7 +691,13 @@ def fetch_or_cfp_for_target_date(target: date, cache_dir: Path) -> OrCfpMonth:
     """Return the most recent OR CFP monthly VWAP available as of target.
 
     DEQ publishes month M's VWAP by the last day of month M+1; the script
-    treats month M as available from the first day of month M+2."""
+    treats month M as available from the first day of month M+2.
+
+    Raises `SnapshotError` when nothing is published yet for `target`,
+    and when the newest month that is published sits further back than
+    `OR_CFP_STALE_DAYS` -- a workbook DEQ has stopped updating keeps
+    answering with its last month and looks no different from a market
+    that has not moved."""
     xlsx_path = cache_dir / "oregon-cfp.xlsx"
     xlsx_path.write_bytes(_http_bytes(OR_CFP_URL))
     monthly = _read_or_cfp_monthly(xlsx_path)
@@ -652,6 +711,13 @@ def fetch_or_cfp_for_target_date(target: date, cache_dir: Path) -> OrCfpMonth:
     if not candidates:
         raise SnapshotError("OR CFP: no monthly value available as of target")
     (y, m), price = max(candidates, key=lambda t: t[0])
+    age = (target - date(y, m, 1)).days
+    if age > OR_CFP_STALE_DAYS:
+        raise SnapshotError(
+            f"OR CFP: newest available month is {y}-{m:02d}, {age} days "
+            f"before {target}, over the {OR_CFP_STALE_DAYS}-day limit; DEQ "
+            f"has stopped publishing"
+        )
     return OrCfpMonth(
         year_month=f"{y}-{m:02d}",
         vwap_per_credit=price,
@@ -1139,7 +1205,7 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
     wa = latest_auction(WA_CCA_AUCTIONS, target, program="WA_CCA_AUCTIONS")
 
     log.info("fetching AAA retail (live)...")
-    retail = fetch_aaa_retail()
+    retail = fetch_aaa_retail(target)
     log.info(
         "AAA: %d states; CA $%.2f, US-min $%.2f, US-max $%.2f",
         len(retail),
