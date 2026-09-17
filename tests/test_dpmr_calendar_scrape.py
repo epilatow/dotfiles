@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import time
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
@@ -298,3 +299,293 @@ def test_empty_scrape_refuses_to_overwrite(
     assert exit_code == 1
     assert existing.read_bytes() == before
     assert "no events parsed" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Parsing the agenda markup
+# ---------------------------------------------------------------------------
+
+# The plugin renders the separator in a time range as an en dash, which
+# `TIME_RE` accepts alongside a hyphen. Built with chr() so this file
+# stays ASCII while the fixture carries the character the site sends.
+EN_DASH = chr(0x2013)
+
+
+def _event_div(
+    *,
+    instance_id: str | None = "27431",
+    event_id: str | None = "630674",
+    end: str | None = "2026-09-17T19:15:00-07:00",
+    title: str = "Hill Workout",
+    location: str | None = None,
+    time_text: str | None = f"Sep 17 @ 6:00 pm {EN_DASH} 7:15 pm",
+    description: str | None = "Weekly hills.",
+    href: str | None = (
+        "https://example.invalid/event/hill/?instance_id=27431"
+    ),
+) -> str:
+    """Render one agenda entry in the shape the plugin emits.
+
+    The class list carries both ids and the end timestamp rides on
+    `data-end`; the location, when present, is a span nested inside the
+    title rather than a field of its own.
+    """
+    classes = ["ai1ec-event"]
+    if event_id is not None:
+        classes.append(f"ai1ec-event-id-{event_id}")
+    if instance_id is not None:
+        classes.append(f"ai1ec-event-instance-id-{instance_id}")
+    end_attr = f' data-end="{end}"' if end is not None else ""
+    loc_span = (
+        f'<span class="ai1ec-event-location">@ {location}</span>'
+        if location is not None
+        else ""
+    )
+    time_div = (
+        f'<div class="ai1ec-event-time">{time_text}</div>'
+        if time_text is not None
+        else ""
+    )
+    desc_div = (
+        f'<div class="ai1ec-event-description"><p>{description}</p></div>'
+        if description is not None
+        else ""
+    )
+    link = (
+        f'<a class="ai1ec-load-event" href="{href}">details</a>'
+        if href is not None
+        else ""
+    )
+    return (
+        f'<div class="{" ".join(classes)}"{end_attr}>'
+        f'<span class="ai1ec-event-title">{title}{loc_span}</span>'
+        f"{time_div}{desc_div}{link}"
+        f"</div>"
+    )
+
+
+def test_event_fields_are_extracted() -> None:
+    """Every field the .ics carries comes off the agenda entry."""
+    (ev,) = dcs.extract_events(_event_div(location="Sierra Bakehouse"))
+    assert ev.instance_id == "27431"
+    assert ev.event_id == "630674"
+    assert ev.title == "Hill Workout"
+    assert ev.location == "Sierra Bakehouse"
+    assert ev.description == "Weekly hills."
+    assert ev.url == "https://example.invalid/event/hill/?instance_id=27431"
+    assert (ev.start.hour, ev.start.minute) == (18, 0)
+    assert (ev.end.hour, ev.end.minute) == (19, 15)
+
+
+def test_location_span_is_lifted_out_of_the_title() -> None:
+    """The venue is its own .ics field, not part of the summary."""
+    (ev,) = dcs.extract_events(
+        _event_div(title="Tuesday Track", location="Truckee High Track")
+    )
+    assert ev.title == "Tuesday Track"
+    assert ev.location == "Truckee High Track"
+
+
+def test_at_sign_in_a_plain_title_is_left_alone() -> None:
+    """Some entries name the venue in the title with no location span.
+
+    Stripping on the character rather than the markup would truncate
+    these, so the whole string has to survive as the summary.
+    """
+    title = "Tuesday Social Run @ Trout Creek Pocket"
+    (ev,) = dcs.extract_events(_event_div(title=title, location=None))
+    assert ev.title == title
+    assert ev.location is None
+
+
+def test_hyphen_separated_times_parse_too() -> None:
+    """The separator is not guaranteed to be the en dash."""
+    (ev,) = dcs.extract_events(
+        _event_div(time_text="Sep 17 @ 6:00 pm - 7:15 pm")
+    )
+    assert (ev.start.hour, ev.start.minute) == (18, 0)
+
+
+@pytest.mark.parametrize(
+    "time_text",
+    [None, "Sep 17", "all day", "6 pm onwards"],
+    ids=["absent", "date_only", "all_day", "unparseable"],
+)
+def test_entry_with_no_readable_range_starts_at_midnight(
+    time_text: str | None,
+) -> None:
+    """With no range to read, the start falls back to the end date's 00:00.
+
+    The end timestamp is the only instant such an entry supplies, so
+    the event is dated from it either way and keeps a start that
+    precedes its end.
+    """
+    (ev,) = dcs.extract_events(_event_div(time_text=time_text))
+    assert (ev.start.hour, ev.start.minute, ev.start.second) == (0, 0, 0)
+    assert ev.start.date() == ev.end.date()
+    assert ev.start <= ev.end
+
+
+def test_overnight_event_starts_the_day_before_it_ends() -> None:
+    """A range that wraps midnight is anchored off the end timestamp.
+
+    Both clock times render against the end date, so a start later than
+    the end means the event began the previous day.
+    """
+    (ev,) = dcs.extract_events(
+        _event_div(
+            end="2026-09-18T02:00:00-07:00",
+            time_text=f"Sep 17 @ 10:00 pm {EN_DASH} 2:00 am",
+        )
+    )
+    assert ev.start.hour == 22
+    assert ev.start.date() < ev.end.date()
+    assert ev.start < ev.end
+
+
+def test_noon_and_midnight_clocks_convert() -> None:
+    """12am is hour 0 and 12pm is hour 12, not 12 and 24."""
+    assert dcs.parse_clock(12, 30, "am") == (0, 30)
+    assert dcs.parse_clock(12, 30, "pm") == (12, 30)
+    assert dcs.parse_clock(1, 5, "pm") == (13, 5)
+
+
+def test_times_are_reanchored_to_the_named_zone() -> None:
+    """The feed declares a TZID, so instants carry that zone, not an offset."""
+    (ev,) = dcs.extract_events(_event_div())
+    assert ev.start.tzinfo is dcs.EVENT_TZ
+    assert ev.end.tzinfo is dcs.EVENT_TZ
+
+
+@pytest.mark.parametrize(
+    "div",
+    [
+        _event_div(instance_id=None),
+        _event_div(event_id=None),
+        _event_div(end=None),
+    ],
+    ids=["no_instance_id", "no_event_id", "no_end"],
+)
+def test_entries_missing_an_identifier_are_skipped(div: str) -> None:
+    """A half-rendered entry is dropped rather than parsed into junk."""
+    assert dcs.extract_events(div) == []
+
+
+def test_unrelated_markup_yields_no_events() -> None:
+    """The empty-scrape guard depends on a clean page parsing as zero."""
+    assert dcs.extract_events("<html><body><p>hi</p></body></html>") == []
+
+
+# ---------------------------------------------------------------------------
+# Assembling the calendar
+# ---------------------------------------------------------------------------
+
+
+def _cal_event(
+    instance_id: str,
+    start: datetime,
+    *,
+    title: str = "Run",
+    hours: int = 1,
+) -> dcs.CalEvent:
+    return dcs.CalEvent(
+        instance_id=instance_id,
+        event_id="630674",
+        title=title,
+        start=start,
+        end=start + timedelta(hours=hours),
+        location=None,
+        description=None,
+        url=None,
+    )
+
+
+def _at(year: int, month: int, day: int, hour: int = 18) -> datetime:
+    return datetime(year, month, day, hour, tzinfo=dcs.EVENT_TZ)
+
+
+def _summaries(ics: bytes) -> list[str]:
+    """The SUMMARY values in file order.
+
+    RFC 5545 separates lines with CRLF, so the captures are rstripped
+    rather than matched to end of line.
+    """
+    found = re.findall(rb"^SUMMARY:(.*)$", ics, re.MULTILINE)
+    return [value.decode().rstrip("\r") for value in found]
+
+
+def test_events_are_emitted_in_start_order() -> None:
+    """Subscribers read the feed in order, so the file is sorted."""
+    ics = dcs.build_ics(
+        [
+            _cal_event("c", _at(2026, 9, 20), title="third"),
+            _cal_event("a", _at(2026, 9, 18), title="first"),
+            _cal_event("b", _at(2026, 9, 19), title="second"),
+        ]
+    )
+    assert _summaries(ics) == ["first", "second", "third"]
+
+
+def test_identical_input_produces_identical_bytes() -> None:
+    """Rebuilding an unchanged calendar must not churn the published file."""
+    events = [_cal_event("a", _at(2026, 9, 18))]
+    assert dcs.build_ics(events) == dcs.build_ics(events)
+
+
+def test_past_events_are_carried_across_a_rebuild() -> None:
+    """The agenda only looks forward, so history lives in the old file."""
+    cutoff = _at(2026, 9, 17, hour=0)
+    old = dcs.build_ics(
+        [_cal_event("gone", _at(2026, 9, 10), title="last week")]
+    )
+    past = dcs._past_vevents(old, cutoff)
+    rebuilt = dcs.build_ics(
+        [_cal_event("new", _at(2026, 9, 24), title="next week")], past=past
+    )
+    assert _summaries(rebuilt) == ["last week", "next week"]
+
+
+def test_events_at_or_after_the_cutoff_are_not_preserved() -> None:
+    """Anything the scrape still covers comes from the site, not the file.
+
+    The cutoff is midnight of the day being scraped, and the scrape
+    starts at that same day, so an event landing exactly on it is one
+    the site will supply again. Preserving it too would let a stale
+    copy outlive the entry it duplicates.
+    """
+    cutoff = _at(2026, 9, 17, hour=0)
+    old = dcs.build_ics(
+        [
+            _cal_event("before", _at(2026, 9, 16)),
+            _cal_event("oncutoff", _at(2026, 9, 17, hour=0)),
+            _cal_event("after", _at(2026, 9, 18)),
+        ]
+    )
+    preserved = {str(ve["uid"]) for ve in dcs._past_vevents(old, cutoff)}
+    assert any("before" in uid for uid in preserved)
+    assert not any("oncutoff" in uid for uid in preserved)
+    assert not any("after" in uid for uid in preserved)
+
+
+def test_a_rescraped_event_wins_over_its_preserved_copy() -> None:
+    """The site is authoritative for any instance still in its window."""
+    start = _at(2026, 9, 16)
+    old = dcs.build_ics([_cal_event("dup", start, title="old name")])
+    past = dcs._past_vevents(old, _at(2026, 9, 17, hour=0))
+    rebuilt = dcs.build_ics(
+        [_cal_event("dup", start, title="new name")], past=past
+    )
+    assert _summaries(rebuilt) == ["new name"]
+
+
+def test_missing_previous_file_preserves_nothing() -> None:
+    """A first run has no history, and must not fail reaching for it."""
+    assert dcs._past_vevents(None, _at(2026, 9, 17, hour=0)) == []
+
+
+def test_feed_declares_the_named_timezone() -> None:
+    """Clients need the VTIMEZONE that the events' TZID refers to."""
+    ics = dcs.build_ics([_cal_event("a", _at(2026, 9, 18))])
+    assert b"BEGIN:VTIMEZONE" in ics
+    assert b"TZID:America/Los_Angeles" in ics
+    assert b"DTSTART;TZID=America/Los_Angeles:" in ics
