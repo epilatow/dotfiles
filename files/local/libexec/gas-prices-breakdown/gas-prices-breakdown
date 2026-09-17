@@ -224,10 +224,13 @@ class FetchError(SnapshotError):
     """An HTTP source could not be read."""
 
 
-# Retry budget for a single URL. The scheduled run happens in a macOS
-# DarkWake window, where the host can drop back to sleep mid-request and
-# leave the connection reset on the far side; the retry is what turns
-# that into a delay instead of a failed run. Delays grow 5s, 15s, 45s.
+# Retry budget for a single URL. A run reads four sources in sequence
+# and any one of them failing ends it, so a source that is briefly
+# unreachable costs the whole day's snapshot unless the run waits it
+# out. Delays grow 5s, 15s, 45s, which with the attempts' own timeouts
+# bounds one URL at about five minutes and a run whose every source
+# needs retrying at about twenty -- inside the job timeout, so a slow
+# recovery still finishes rather than being killed partway.
 HTTP_ATTEMPTS = 4
 HTTP_BACKOFF_SEC = 5.0
 HTTP_BACKOFF_FACTOR = 3.0
