@@ -214,6 +214,27 @@ OR_CFP_URL = (
     "CFPCreditTransferActivityReport.xlsx"
 )
 
+# EIA's federal and state motor fuel tax table, one sheet per January 1
+# and July 1 back to 2015. A state gas tax is a step function that steps
+# on a statutory date, and those are the dates it steps on, so a sheet
+# is the exact rate for its half-year rather than a sample of a moving
+# series -- measured across the shipped history, 22 states changed twice
+# or fewer since 2015 and 11 never changed.
+#
+# The exceptions are states that adjust faster than the sheets appear.
+# Kentucky and New Jersey read as quarterly in the table's own notes but
+# move only in July and only on January 1 respectively, so the sheets
+# still land them exactly. Indiana genuinely recalculates monthly, which
+# is why it is sourced from the state instead.
+EIA_FUELTAXES_URL = (
+    "https://www.eia.gov/petroleum/marketing/monthly/xls/fueltaxes.xlsx"
+)
+# A sheet covers the half-year that follows it, so the one in force is
+# legitimately up to ~184 days behind the date it describes. The limit
+# sits a quarter past that, far enough to tell a late edition from a
+# table EIA has stopped publishing.
+EIA_TAX_STALE_DAYS = 275
+
 STATE_CODE: dict[str, str] = {
     "Alabama": "AL",
     "Alaska": "AK",
@@ -543,6 +564,174 @@ def fetch_aaa_retail(target: date) -> dict[str, float]:
     if len(out) != 51:
         raise SnapshotError(f"AAA: parsed {len(out)} states, expected 51")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Federal and state motor fuel tax
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TaxPeriod:
+    """The federal and per-state gasoline tax in force for a half-year.
+
+    `per_state` is keyed by postal code and carries every state's Total
+    State column: the excise plus the sales, inspection and
+    environmental charges EIA groups beside it. Both it and `federal`
+    are dollars per gallon, matching what the page stores.
+
+    Four states are knowingly short here. EIA excludes taxes levied on
+    gross or net receipts, which leaves out Connecticut's PGET,
+    Delaware's HSCA, Ohio's PAT and Hawaii's GET; the supplement that
+    restores them is applied by the caller, not baked in, so this stays
+    a faithful reading of the published table.
+
+    `missing` names the states whose rate cell the sheet left blank.
+    EIA blanks a rate during a tax holiday, but it reads the same as a
+    figure nobody filled in, so the two are not distinguished here and
+    a period is refused rather than guessed at when it is used.
+    """
+
+    period: date
+    per_state: dict[str, float]
+    federal: float
+    source_url: str
+    missing: tuple[str, ...]
+
+
+# Sheets are named for the month they take effect, sometimes carrying a
+# revision marker or stray whitespace ("January 2021_revised",
+# "July 2026 (revised)", "January 2019 ").
+_TAX_SHEET_RE = re.compile(r"^\s*(January|July)\s+(\d{4})")
+
+
+def load_tax_periods(cache_dir: Path) -> list[TaxPeriod]:
+    """Download EIA's tax workbook and read every half-year it holds."""
+    xlsx_path = cache_dir / "fueltaxes.xlsx"
+    xlsx_path.write_bytes(_http_bytes(EIA_FUELTAXES_URL))
+    return _read_tax_periods(xlsx_path)
+
+
+def select_tax_period(periods: list[TaxPeriod], target: date) -> TaxPeriod:
+    """Return the tax rates in force on `target`.
+
+    Raises `SnapshotError` when the workbook does not reach back to
+    `target`, when even its newest sheet is too far behind to describe
+    it -- a table EIA has stopped revising keeps answering with its last
+    half-year and looks no different from a set of rates that have not
+    moved -- and when the sheet in force is missing a state.
+
+    Blanks are checked here rather than at read time so that a hole in
+    one half-year does not make the other twenty-three unreadable.
+    """
+    usable = [p for p in periods if p.period <= target]
+    if not usable:
+        raise SnapshotError(
+            f"EIA tax: no sheet in force on {target}; the workbook "
+            f"starts at {periods[0].period}"
+        )
+    chosen = max(usable, key=lambda p: p.period)
+    age = (target - chosen.period).days
+    if age > EIA_TAX_STALE_DAYS:
+        raise SnapshotError(
+            f"EIA tax: newest sheet in force ({chosen.period}) is {age} "
+            f"days before {target}, over the {EIA_TAX_STALE_DAYS}-day "
+            f"limit; EIA has stopped publishing the table"
+        )
+    if chosen.missing:
+        raise SnapshotError(
+            f"EIA tax: the {chosen.period} sheet leaves "
+            f"{', '.join(chosen.missing)} blank, so it cannot price "
+            f"{target}; check whether the tax is suspended"
+        )
+    return chosen
+
+
+def fetch_tax_period_for_target_date(
+    target: date, cache_dir: Path
+) -> TaxPeriod:
+    """Download the tax workbook and pick the half-year for `target`."""
+    return select_tax_period(load_tax_periods(cache_dir), target)
+
+
+def _read_tax_periods(path: Path) -> list[TaxPeriod]:
+    wb = _load_workbook(path, "EIA tax")
+    periods: list[TaxPeriod] = []
+    for name in wb.sheetnames:
+        match = _TAX_SHEET_RE.match(name)
+        if not match:
+            continue
+        period = date(
+            int(match.group(2)), 1 if match.group(1) == "January" else 7, 1
+        )
+        periods.append(_read_tax_sheet(wb, name, period))
+    if not periods:
+        raise SnapshotError("EIA tax: workbook has no dated sheets")
+    periods.sort(key=lambda p: p.period)
+    return periods
+
+
+def _read_tax_sheet(
+    wb: openpyxl.Workbook, sheet_name: str, period: date
+) -> TaxPeriod:
+    """Read one half-year sheet into per-state and federal rates.
+
+    Rows are located by their own label rather than by position: the
+    federal row sits above the per-state block and carries its total in
+    a different column, and the state block's first row has shifted
+    between editions.
+    """
+    per_state: dict[str, float] = {}
+    federal: float | None = None
+    seen: set[str] = set()
+    for row in wb[sheet_name].iter_rows(values_only=True):
+        if not row or not isinstance(row[0], str):
+            continue
+        label = _tax_label(row[0])
+        if label == "Federal":
+            federal = _tax_cell(row, 4)
+            continue
+        code = STATE_CODE.get(label)
+        if code is None:
+            continue
+        seen.add(code)
+        rate = _tax_cell(row, 3)
+        if rate is not None:
+            per_state[code] = rate
+    if federal is None:
+        raise SnapshotError(
+            f"EIA tax {period}: no Federal row, or its total is blank"
+        )
+    absent = sorted(set(STATE_CODE.values()) - seen)
+    if absent:
+        raise SnapshotError(
+            f"EIA tax {period}: no row for {', '.join(absent)}"
+        )
+    return TaxPeriod(
+        period=period,
+        per_state=per_state,
+        federal=federal,
+        source_url=EIA_FUELTAXES_URL,
+        missing=tuple(sorted(seen - set(per_state))),
+    )
+
+
+def _tax_label(raw: str) -> str:
+    """Reduce a row label to the bare state name.
+
+    Editions decorate the name in two ways that carry no meaning here: a
+    footnote marker appended in brackets, and a leading asterisk marking
+    the row as changed since the previous edition.
+    """
+    return raw.split("[")[0].lstrip("* ").strip()
+
+
+def _tax_cell(row: tuple[object, ...], index: int) -> float | None:
+    """Read one rate cell, or None where the sheet leaves it blank."""
+    value = row[index] if index < len(row) else None
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return float(value)
 
 
 # ---------------------------------------------------------------------------

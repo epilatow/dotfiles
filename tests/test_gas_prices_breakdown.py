@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+import openpyxl  # type: ignore[import-untyped]
 import pytest
 import xlrd  # type: ignore[import-untyped]
 
@@ -875,6 +876,248 @@ def test_or_cfp_one_day_past_the_limit_fails(tmp_path: Path) -> None:
     ):
         gpb.fetch_or_cfp_for_target_date(target, tmp_path)
     assert "OR CFP" in str(caught.value)
+
+
+# ---------------------------------------------------------------------------
+# Federal and state motor fuel tax
+# ---------------------------------------------------------------------------
+
+
+def _tax_sheet(
+    wb: openpyxl.Workbook,
+    title: str,
+    rates: dict[str, float | None],
+    federal: float,
+) -> None:
+    """Add one half-year sheet in the shape EIA publishes.
+
+    The federal row sits above the state block and carries its total one
+    column further right, which is the layout the reader has to cope
+    with rather than an artefact of this fixture.
+    """
+    ws = wb.create_sheet(title)
+    ws.append(["Federal and state motor fuel taxes"])
+    ws.append(["Federal", 0.183, 0.001, None, federal])
+    ws.append([])
+    ws.append(["State tax", "Other", "Total State", "State & Federal"])
+    for name, code in sorted(gpb.STATE_CODE.items()):
+        ws.append([name, None, None, rates.get(code)])
+
+
+def _tax_workbook(
+    path: Path, sheets: dict[str, dict[str, float | None]], federal: float
+) -> None:
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    for title, rates in sheets.items():
+        _tax_sheet(wb, title, rates, federal)
+    wb.save(path)
+
+
+def _flat_rates(value: float = 0.30) -> dict[str, float | None]:
+    return dict.fromkeys(gpb.STATE_CODE.values(), value)
+
+
+def _periods(
+    tmp_path: Path,
+    sheets: dict[str, dict[str, float | None]],
+    federal: float = 0.184,
+) -> list[gpb.TaxPeriod]:
+    book = tmp_path / "fueltaxes.xlsx"
+    _tax_workbook(book, sheets, federal)
+    return gpb._read_tax_periods(book)
+
+
+def test_tax_sheets_are_keyed_by_the_date_they_take_effect(
+    tmp_path: Path,
+) -> None:
+    """January and July sheets are the half-years they open."""
+    periods = _periods(
+        tmp_path, {"July 2026": _flat_rates(), "January 2026": _flat_rates()}
+    )
+    assert [p.period for p in periods] == [date(2026, 1, 1), date(2026, 7, 1)]
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "January 2026 (revised)",
+        "January 2021_revised",
+        "January 2019 ",
+    ],
+)
+def test_tax_sheet_revision_markers_do_not_hide_a_period(
+    tmp_path: Path, title: str
+) -> None:
+    """Editions decorate their own tab names; the period still parses."""
+    periods = _periods(tmp_path, {title: _flat_rates()})
+    assert periods[0].period.month == 1
+
+
+def test_tax_state_names_survive_footnotes_and_change_markers(
+    tmp_path: Path,
+) -> None:
+    """EIA brackets footnotes onto names and stars rows that changed."""
+    book = tmp_path / "fueltaxes.xlsx"
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    ws = wb.create_sheet("July 2026")
+    ws.append(["Federal", 0.183, 0.001, None, 0.184])
+    for name, code in sorted(gpb.STATE_CODE.items()):
+        decorated = {"CA": f"{name}[4]  ", "OH": f"* {name} "}.get(name, name)
+        ws.append([decorated, None, None, 0.30 if code != "CA" else 0.7364])
+    wb.save(book)
+    period = gpb._read_tax_periods(book)[0]
+    assert period.per_state["CA"] == 0.7364
+    assert period.per_state["OH"] == 0.30
+
+
+def test_tax_period_in_force_is_the_newest_one_already_started(
+    tmp_path: Path,
+) -> None:
+    """A rate steps on its effective date and holds until the next."""
+    periods = _periods(
+        tmp_path,
+        {
+            "January 2026": _flat_rates(0.5350),
+            "July 2026": _flat_rates(0.6450),
+        },
+    )
+    assert gpb.select_tax_period(periods, date(2026, 6, 30)).period == date(
+        2026, 1, 1
+    )
+    assert gpb.select_tax_period(periods, date(2026, 7, 1)).period == date(
+        2026, 7, 1
+    )
+
+
+def test_tax_target_before_the_workbook_starts_is_reported(
+    tmp_path: Path,
+) -> None:
+    """A backfill reaching past the published history must not guess."""
+    periods = _periods(tmp_path, {"July 2026": _flat_rates()})
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.select_tax_period(periods, date(2015, 1, 1))
+    assert "starts at" in str(caught.value)
+
+
+def test_tax_table_gone_quiet_fails_the_run(tmp_path: Path) -> None:
+    """A table EIA stopped revising answers with its last half-year."""
+    periods = _periods(tmp_path, {"January 2026": _flat_rates()})
+    target = date(2026, 1, 1) + timedelta(days=gpb.EIA_TAX_STALE_DAYS + 1)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.select_tax_period(periods, target)
+    assert "stopped publishing" in str(caught.value)
+
+
+def test_tax_table_at_the_freshness_limit_still_answers(
+    tmp_path: Path,
+) -> None:
+    """Pins the constant itself, not merely some value far inside it."""
+    periods = _periods(tmp_path, {"January 2026": _flat_rates()})
+    target = date(2026, 1, 1) + timedelta(days=gpb.EIA_TAX_STALE_DAYS)
+    assert gpb.select_tax_period(periods, target).period == date(2026, 1, 1)
+
+
+def test_tax_holiday_blank_does_not_make_other_periods_unreadable(
+    tmp_path: Path,
+) -> None:
+    """One half-year's hole must not cost the other twenty-three."""
+    holed = _flat_rates()
+    holed["CT"] = None
+    periods = _periods(
+        tmp_path, {"July 2022": holed, "July 2026": _flat_rates()}
+    )
+    assert [p.missing for p in periods] == [("CT",), ()]
+    assert gpb.select_tax_period(periods, date(2026, 9, 17)).missing == ()
+
+
+def test_tax_period_missing_a_state_is_refused_when_used(
+    tmp_path: Path,
+) -> None:
+    """A blank reads the same as a holiday, so it is never guessed at."""
+    holed = _flat_rates()
+    holed["CT"] = None
+    periods = _periods(tmp_path, {"July 2022": holed})
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.select_tax_period(periods, date(2022, 8, 1))
+    assert "CT" in str(caught.value)
+    assert "suspended" in str(caught.value)
+
+
+def test_tax_sheet_missing_a_state_row_is_reported(tmp_path: Path) -> None:
+    """A dropped row is a reshaped source, not a suspended tax."""
+    book = tmp_path / "fueltaxes.xlsx"
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    ws = wb.create_sheet("July 2026")
+    ws.append(["Federal", 0.183, 0.001, None, 0.184])
+    for name, code in sorted(gpb.STATE_CODE.items()):
+        if code != "WY":
+            ws.append([name, None, None, 0.30])
+    wb.save(book)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._read_tax_periods(book)
+    assert "no row for WY" in str(caught.value)
+
+
+def test_tax_sheet_without_a_federal_row_is_reported(
+    tmp_path: Path,
+) -> None:
+    """The federal rate rides the same sheet and is equally required."""
+    book = tmp_path / "fueltaxes.xlsx"
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    ws = wb.create_sheet("July 2026")
+    for name in sorted(gpb.STATE_CODE):
+        ws.append([name, None, None, 0.30])
+    wb.save(book)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._read_tax_periods(book)
+    assert "Federal" in str(caught.value)
+
+
+def test_tax_workbook_without_dated_sheets_is_reported(
+    tmp_path: Path,
+) -> None:
+    """A reshaped workbook must not read as an empty history."""
+    book = tmp_path / "fueltaxes.xlsx"
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    wb.create_sheet("Contents")
+    wb.save(book)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._read_tax_periods(book)
+    assert "no dated sheets" in str(caught.value)
+
+
+def test_tax_workbook_that_is_not_a_workbook_is_reported(
+    tmp_path: Path,
+) -> None:
+    """A source answering 200 with an error page is still bad input."""
+    book = tmp_path / "fueltaxes.xlsx"
+    book.write_text("<html>503 Service Unavailable</html>")
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._read_tax_periods(book)
+    assert "EIA tax" in str(caught.value)
+
+
+def test_tax_fetch_downloads_then_selects(tmp_path: Path) -> None:
+    """The wrapper the snapshot builder calls, end to end."""
+    book = tmp_path / "built.xlsx"
+    _tax_workbook(
+        book,
+        {"January 2026": _flat_rates(0.5350), "July 2026": _flat_rates(0.645)},
+        federal=0.184,
+    )
+    with patch.object(
+        gpb, "_http_bytes", autospec=True, return_value=book.read_bytes()
+    ):
+        got = gpb.fetch_tax_period_for_target_date(date(2026, 9, 17), tmp_path)
+    assert got.period == date(2026, 7, 1)
+    assert got.per_state["CA"] == 0.645
+    assert got.federal == 0.184
+    assert got.source_url == gpb.EIA_FUELTAXES_URL
 
 
 # ---------------------------------------------------------------------------
