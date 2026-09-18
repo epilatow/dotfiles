@@ -59,6 +59,18 @@ def _http_error(code: int) -> urllib.error.HTTPError:
     )
 
 
+def _sample_sources() -> tuple[
+    gpb.LcfsQuote, gpb.AuctionSettlement, gpb.AuctionSettlement, gpb.OrCfpMonth
+]:
+    """The priced-program values every emitting test builds against."""
+    return (
+        gpb.LcfsQuote(date(2026, 9, 16), 84.75, "https://example.invalid"),
+        gpb.AuctionSettlement(date(2026, 8, 19), 32.48, "Aug 2026 #48"),
+        gpb.AuctionSettlement(date(2026, 9, 2), 39.50, "WA #15"),
+        gpb.OrCfpMonth("2026-07", 161.01, "https://example.invalid"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Retry classification
 # ---------------------------------------------------------------------------
@@ -650,6 +662,28 @@ def test_shipped_tables_are_ordered_and_unique(name: str) -> None:
     assert all(row[1] > 0 for row in table), f"{name} has a bad price"
 
 
+def test_emitted_program_name_is_current_and_not_half_renamed() -> None:
+    """CARB renamed the program; the page should not lag its own source.
+
+    The name appears in the state block's part label and again in the
+    snapshot's notes, written by different functions, so a partial
+    rename leaves a snapshot disagreeing with itself. Both the presence
+    of the new name and the absence of the old one are asserted, since
+    only the pair rules out a half-applied rename.
+    """
+    lcfs, cca, wa, orm = _sample_sources()
+    fragment = gpb.build_ca_nontax(date(2026, 9, 17), lcfs, cca)
+    notes = gpb.passthrough_notes(lcfs, cca, wa, orm)
+    assert 'n:"Cap-and-Invest pass-through"' in fragment
+    assert "Cap-and-Trade pass-through" not in fragment
+    assert "CA cap-and-invest" in notes
+    assert "cap-and-trade" not in notes
+    # CARB still serves its pages under the legacy path, so this one
+    # deliberately does not track the rename; a blanket search and
+    # replace over the file would break the link.
+    assert "cap-and-trade-program/auction-information" in fragment
+
+
 @pytest.mark.parametrize(
     "blob",
     [
@@ -690,11 +724,8 @@ def test_emitted_ca_nontax_fragment_is_well_formed() -> None:
     for every reader of the page, and the damage would not show up in
     any value this script checks.
     """
-    fragment = gpb.build_ca_nontax(
-        date(2026, 9, 17),
-        gpb.LcfsQuote(date(2026, 9, 16), 84.75, "https://example.invalid"),
-        gpb.AuctionSettlement(date(2026, 8, 19), 32.48, "Aug 2026 #48"),
-    )
+    lcfs, cca, _wa, _orm = _sample_sources()
+    fragment = gpb.build_ca_nontax(date(2026, 9, 17), lcfs, cca)
     assert fragment.count("{") == fragment.count("}")
     assert fragment.count("[") == fragment.count("]")
     # Every double quote must open or close a field, never sit loose
@@ -876,7 +907,7 @@ def _snapshot(day: str, *, trailing_newline: bool) -> str:
     notes = (
         "Backfill snapshot. Retail (col 2) reconstructed from somewhere. "
         f"{gpb.PASSTHROUGH_NOTES_MARKER}CA LCFS week of 2026-07-13 "
-        "($72.61/MT); CA cap-and-trade Feb 2026 Joint Auction #46; "
+        "($72.61/MT); CA cap-and-invest Feb 2026 Joint Auction #46; "
         "WA CCA WA Auction #13; OR CFP 2026-06 ($151.26/credit)."
     )
     return (
@@ -885,13 +916,7 @@ def _snapshot(day: str, *, trailing_newline: bool) -> str:
 
 
 def _rebased(block: str) -> tuple[str, dict[str, tuple[float, float]]]:
-    return gpb.rebase_snapshot_passthroughs(
-        block,
-        gpb.LcfsQuote(date(2026, 9, 16), 84.75, "https://example.invalid"),
-        gpb.AuctionSettlement(date(2026, 8, 19), 32.48, "Aug 2026 #48"),
-        gpb.AuctionSettlement(date(2026, 9, 2), 39.50, "WA #15"),
-        gpb.OrCfpMonth("2026-07", 161.01, "https://example.invalid"),
-    )
+    return gpb.rebase_snapshot_passthroughs(block, *_sample_sources())
 
 
 @pytest.mark.parametrize(

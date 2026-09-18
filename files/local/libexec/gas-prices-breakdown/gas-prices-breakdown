@@ -34,7 +34,7 @@ Data sources:
   carries a freshness bound; a run fails rather than publish a price too
   old to describe the date being snapshotted.
 
-  Hand-maintained tables (need quarterly human update): CARB cap-and-trade
+  Hand-maintained tables (need quarterly human update): CARB cap-and-invest
   auction settlements (CARB_CCA_AUCTIONS), Washington CCA auction
   settlements (WA_CCA_AUCTIONS). A run fails rather than publish from a
   table whose newest entry is older than CCA_STALE_DAYS.
@@ -990,7 +990,7 @@ def passthrough_notes(
         f"{PASSTHROUGH_NOTES_MARKER}"
         f"CA LCFS {lcfs.as_of.isoformat()} "
         f"(${lcfs.usd_per_mt:.2f}/MT, Argus via Neste monitor); "
-        f"CA cap-and-trade {cca.label}; "
+        f"CA cap-and-invest {cca.label}; "
         f"WA CCA {wa.label}; OR CFP {orm.year_month} "
         f"(${orm.vwap_per_credit:.2f}/credit). IN gasoline use tax handled "
         "per-date."
@@ -1012,7 +1012,7 @@ def build_ca_nontax(d: date, lcfs: LcfsQuote, cca: AuctionSettlement) -> str:
         f"but not exact. Used because CARB stopped publishing its weekly "
         f"credit transfer reports after the week of "
         f'{LCFS_LAST_CARB_WEEK.isoformat()}."}},\n'
-        f'      {{n:"Cap-and-Trade pass-through", v:{cca_pass:.4f}, '
+        f'      {{n:"Cap-and-Invest pass-through", v:{cca_pass:.4f}, '
         f'src:"https://ww2.arb.ca.gov/our-work/programs/'
         f'cap-and-trade-program/auction-information", '
         f'note:"${cca.price:.2f}/allowance ({cca.label}) {TIMES} '
