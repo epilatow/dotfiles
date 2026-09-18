@@ -38,8 +38,9 @@ Data sources:
   Hand-maintained and checked by date rather than by age: the tax
   suspensions, holidays and reductions (STATE_TAX_ADJUSTMENTS, plus
   IN_EXCISE_SUSPENSIONS and IN_GUT_SUSPENSIONS for the one state whose
-  two taxes were suspended separately), and Delaware's annually reset
-  gross-receipts rate (DE_HSCA_RATES). A published rate table says what
+  two taxes were suspended separately). Delaware's annually reset
+  gross-receipts rate (DE_HSCA_RATES) is hand-maintained too, but
+  bounded by age like the fetched sources. A published rate table says what
   a tax is, not whether anyone is collecting it, and its notes are not
   a reliable index of the difference, so these are swept for directly.
   A run outside TAX_ADJUSTMENTS_CHECKED_FROM..THROUGH fails rather than
@@ -77,7 +78,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -281,7 +282,7 @@ IN_GUT_STALE_DAYS = 70
 # reconcile: their "other" is the previous month's use tax plus this.
 IN_OIL_INSPECTION_FEE = 0.01
 IN_OIL_INSPECTION_SOURCE_URL = (
-    "https://law.justia.com/codes/indiana/title-16/article-44/chapter-2/"
+    "https://iga.in.gov/laws/2024/ic/titles/16#16-44-2-18"
 )
 IN_EXCISE_SOURCE_URL = (
     "https://www.in.gov/dor/business-tax/fuel-tax/gasoline-tax/"
@@ -402,6 +403,10 @@ DE_HSCA_RATES: list[tuple[date, float]] = [
     (date(2025, 1, 1), 0.01120),
     (date(2026, 1, 1), 0.011902),
 ]
+# A rate holds for its calendar year, so the one in force is at most
+# 365 days old. The limit sits just past that: one missed January and
+# the run stops rather than price a year from the prior rate.
+DE_HSCA_STALE_DAYS = 400
 CT_PGET_RATE = 0.081
 # Gross earnings from the first sale of gasoline are capped at $3.00 a
 # gallon by CGS 12-587(a)(4), so above that the tax is a constant 24.3
@@ -1249,7 +1254,7 @@ def select_spot(
     age = (target - date(year, month, 1)).days
     if age > EIA_SPOT_STALE_DAYS:
         raise SnapshotError(
-            f"EIA spot {series}: newest closed month is {year_month}, "
+            f"EIA spot {series}: newest published month is {year_month}, "
             f"{age} days before {target}, over the "
             f"{EIA_SPOT_STALE_DAYS}-day limit; the series has stopped"
         )
@@ -1265,20 +1270,24 @@ def select_de_hsca_rate(day: date) -> float:
     fails rather than silently reusing the last one -- the same reason
     every other hand-maintained figure here carries a bound.
     """
-    usable = [rate for start, rate in DE_HSCA_RATES if start <= day]
+    usable = [(start, rate) for start, rate in DE_HSCA_RATES if start <= day]
     if not usable:
         raise SnapshotError(
             f"DE HSCA: no rate recorded for {day}; the table starts at "
-            f"{DE_HSCA_RATES[0][0]}"
+            f"{min(start for start, _ in DE_HSCA_RATES)}"
         )
-    newest = max(start for start, _ in DE_HSCA_RATES if start <= day)
-    if (day - newest).days > 400:
+    # One max() rather than an index, so the rate returned and the rate
+    # whose age is checked cannot be different entries.
+    start, rate = max(usable)
+    age = (day - start).days
+    if age > DE_HSCA_STALE_DAYS:
         raise SnapshotError(
-            f"DE HSCA: newest recorded rate takes effect {newest}, over a "
-            f"year before {day}; Delaware resets it each January 1, so "
-            f"the table needs the intervening years"
+            f"DE HSCA: newest recorded rate takes effect {start}, {age} "
+            f"days before {day}, over the {DE_HSCA_STALE_DAYS}-day limit; "
+            f"Delaware resets it each January 1, so the table is missing "
+            f"a year"
         )
-    return usable[-1]
+    return rate
 
 
 def resolve_gross_receipts(
@@ -1810,15 +1819,37 @@ PASSTHROUGH_NOTES_MARKER = "Non-tax pass-throughs: "
 STATE_TAX_NOTES_MARKER = "State tax: "
 
 
-def state_tax_notes(period: TaxPeriod, in_gut: InGutRate) -> str:
-    """Summarise where a snapshot's state-tax column came from."""
+def _and_list(items: Sequence[str]) -> str:
+    """Join for prose: 'A', 'A and B', 'A, B and C'."""
+    if len(items) < 2:
+        return "".join(items)
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def state_tax_notes(period: TaxPeriod, in_gut: InGutRate, day: date) -> str:
+    """Summarise where a snapshot's state-tax column came from.
+
+    The override list is derived for `day` rather than written out, so
+    the sentence cannot claim a suspension that had lapsed or miss one
+    that had started.
+    """
+    overridden = sorted(
+        {e.state for e in STATE_TAX_ADJUSTMENTS if e.start <= day <= e.end}
+    )
+    override_clause = (
+        f"{_and_list(overridden)} carrying a suspension or reduction the "
+        f"table does not reflect; "
+        if overridden
+        else ""
+    )
     return (
         f"{STATE_TAX_NOTES_MARKER}EIA federal and state motor fuel tax "
         f"table, {period.period} edition; IN composed from its excise, "
         f"oil inspection fee and {in_gut.month_start:%b %Y} gasoline use "
-        f"tax, with suspensions applied; "
-        f"{', '.join(GROSS_RECEIPTS_STATES)} add the "
-        f"gross-receipts taxes that table excludes. "
+        f"tax, with its own suspensions applied; "
+        f"{override_clause}"
+        f"{_and_list(GROSS_RECEIPTS_STATES)} adding the gross-receipts "
+        f"taxes the table excludes. "
     )
 
 
@@ -1978,6 +2009,16 @@ def compose_state_tax(
     override = adjustment_on(code, day)
     if override is not None:
         total = round(total + override.usd_per_gal, 4)
+        # Caught here rather than at the whole-snapshot range check,
+        # which sees a bare list of numbers; this knows whose rate it
+        # is and what claims to reduce it.
+        if total < 0:
+            raise SnapshotError(
+                f"{code} on {day}: {override.authority} reduces the rate "
+                f"by ${-override.usd_per_gal:.4f}, more than the "
+                f"${base:.4f} the published table carries; one of the two "
+                f"is wrong"
+            )
         parts.append(
             TaxPart(
                 "Suspension or reduction",
@@ -1996,7 +2037,7 @@ def compose_state_tax(
                 extra.label,
                 extra.usd_per_gal,
                 GROSS_RECEIPTS_SOURCE_URLS[code],
-                extra.basis,
+                extra.basis if extra.exact else f"Estimated. {extra.basis}",
             )
         )
     return StateTax(
@@ -2100,7 +2141,7 @@ def build_snapshot_object(
     notes = (
         "Auto-generated weekly snapshot. Retail (col 2) from live AAA "
         f"state-averages page on {target.isoformat()}. "
-        + state_tax_notes(sources.period, sources.in_gut)
+        + state_tax_notes(sources.period, sources.in_gut, target)
         + passthrough_notes(sources.lcfs, sources.cca, sources.wa, sources.orm)
     )
     return (
@@ -2150,9 +2191,10 @@ def sanity_check_snapshot(snapshot: str, target: date) -> None:
             "sanity: built block still carries an ad-valorem field, "
             "which the row shape no longer has"
         )
-    # The sign is matched so a negative total fails as what it is -- an
-    # override larger than the rate it reduces -- rather than dropping
-    # out of the count and reading as a missing state.
+    # An override larger than the rate it reduces is caught where both
+    # are known, so what reaches here is a negative the published table
+    # itself carried. The sign is matched so that fails as a bad rate
+    # rather than dropping out of the count and reading as a lost row.
     totals = [
         float(v) for v in re.findall(r"fixed:\{ total:(-?[0-9.]+),", snapshot)
     ]

@@ -1404,13 +1404,128 @@ def test_indiana_suspension_windows_are_ordered_and_disjoint() -> None:
             assert end < start
 
 
-def test_every_shipped_override_is_inside_the_swept_range() -> None:
-    """A window reaching past the sweep would be trusted unverified."""
+def test_no_override_starts_before_the_sweep_began() -> None:
+    """An entry the sweep never covered would be trusted unverified.
+
+    Only the start is bounded. An end may legitimately run past the
+    sweep -- Illinois and Utah are fixed by statute through 2026-12-31
+    -- because the sweep's range limits which dates get priced, not how
+    far a known window may reach.
+    """
     for entry in gpb.STATE_TAX_ADJUSTMENTS:
         assert entry.start >= gpb.TAX_ADJUSTMENTS_CHECKED_FROM
-        assert entry.end <= gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH or (
-            entry.end.year >= gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH.year
+
+
+def test_delaware_rate_tracks_the_year_it_was_reset_for() -> None:
+    """The rate changes every January 1, so the year decides it."""
+    assert gpb.select_de_hsca_rate(date(2025, 6, 1)) == 0.01120
+    assert gpb.select_de_hsca_rate(date(2026, 6, 1)) == 0.011902
+
+
+def test_delaware_rate_picks_the_newest_regardless_of_table_order() -> None:
+    """The rate returned and the rate age-checked must be one entry."""
+    reversed_table = list(reversed(gpb.DE_HSCA_RATES))
+    with patch.object(gpb, "DE_HSCA_RATES", reversed_table):
+        assert gpb.select_de_hsca_rate(date(2026, 6, 1)) == 0.011902
+
+
+def test_delaware_rate_before_the_table_starts_is_reported() -> None:
+    """A backfill past the recorded years must not guess."""
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.select_de_hsca_rate(date(2019, 1, 1))
+    assert "table starts at" in str(caught.value)
+
+
+def test_delaware_rate_gone_stale_fails_the_run() -> None:
+    """A missed January would otherwise price a year at the old rate."""
+    newest = max(start for start, _ in gpb.DE_HSCA_RATES)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.select_de_hsca_rate(
+            newest + timedelta(days=gpb.DE_HSCA_STALE_DAYS + 1)
         )
+    assert "missing a year" in str(caught.value)
+
+
+def test_delaware_rate_at_the_freshness_limit_still_answers() -> None:
+    """Pins the constant itself, not merely some value inside it."""
+    newest = max(start for start, _ in gpb.DE_HSCA_RATES)
+    assert gpb.select_de_hsca_rate(
+        newest + timedelta(days=gpb.DE_HSCA_STALE_DAYS)
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("plain", "plain"),
+        ('a "quoted" word', 'a \\"quoted\\" word'),
+        ("back\\slash", "back\\\\slash"),
+        ('both \\ and "', 'both \\\\ and \\"'),
+    ],
+    ids=["plain", "quote", "backslash", "both"],
+)
+def test_page_strings_are_escaped_for_javascript(
+    raw: str, expected: str
+) -> None:
+    """The page is JS source; one stray quote breaks the whole array."""
+    assert gpb._js_string(raw) == expected
+
+
+def test_a_quote_in_an_authority_label_does_not_break_the_page() -> None:
+    """An authority string is hand-entered, so it can carry anything."""
+    tax = gpb.StateTax(
+        total=0.30,
+        parts=(gpb.TaxPart('He said "no"', 0.30, "https://x.invalid", ""),),
+        as_of="2026-07-01",
+    )
+    rendered = gpb.build_fixed(tax)
+    assert '\\"no\\"' in rendered
+    # The field must still close where the renderer expects it to.
+    assert rendered.count('n:"') == 1
+
+
+def test_a_blank_excise_cell_is_reported_not_a_key_error() -> None:
+    """A blank column must exit 1, not raise from an unattended job."""
+    period = _tax_period()
+    stripped = dict(period.excise)
+    del stripped["IN"]
+    holed = gpb.TaxPeriod(
+        period=period.period,
+        per_state=period.per_state,
+        excise=stripped,
+        federal=period.federal,
+        source_url=period.source_url,
+        missing=(),
+    )
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.compose_state_tax(
+            "IN",
+            DAY,
+            holed,
+            3.92,
+            gpb.InGutRate(date(2026, 9, 1), 0.239, "https://x.invalid"),
+            {},
+        )
+    assert "leaves IN's excise blank" in str(caught.value)
+
+
+def test_notes_name_the_states_whose_rate_is_overridden() -> None:
+    """The summary must not claim only Indiana when five are adjusted."""
+    period = _tax_period()
+    gut = gpb.InGutRate(date(2026, 5, 1), 0.233, "https://x.invalid")
+    during = gpb.state_tax_notes(period, gut, date(2026, 5, 21))
+    assert "GA" in during and "KY" in during
+    after = gpb.state_tax_notes(period, gut, date(2026, 9, 17))
+    assert "GA" not in after
+
+
+def test_indiana_is_not_in_the_flat_override_table() -> None:
+    """Its composition path returns before the table is consulted.
+
+    An Indiana entry would be silently ignored, so the invariant the
+    TaxAdjustment docstring states is checked rather than trusted.
+    """
+    assert all(e.state != "IN" for e in gpb.STATE_TAX_ADJUSTMENTS)
 
 
 def test_overrides_do_not_overlap_within_a_state() -> None:
@@ -1866,6 +1981,27 @@ def _add_snapshot_sources(
         yield
 
 
+def test_a_benchmark_derived_figure_says_so_on_the_page(
+    tmp_path: Path,
+) -> None:
+    """A reader must be able to tell an estimate from the statute.
+
+    Connecticut above its cap and Delaware against a spot benchmark are
+    the two shapes, and only one of them is exact.
+    """
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
+    with _backups_under(tmp_path), _add_snapshot_sources():
+        assert (
+            gpb.main(["add-snapshot", str(html), "--target", "2026-09-17"])
+            == 0
+        )
+    built = gpb.parse_snapshots(html.read_text()).blocks[0]
+    blocks = dict(gpb.split_state_blocks(built))
+    assert "Estimated." in blocks["DE"]
+    assert "Estimated." not in blocks["CT"]
+
+
 def test_add_snapshot_round_trip_splices_a_built_block_in(
     tmp_path: Path,
 ) -> None:
@@ -1994,10 +2130,14 @@ def test_add_snapshot_applies_a_rate_override(tmp_path: Path) -> None:
     assert "HB 1199" in georgia
 
 
-def test_an_override_larger_than_the_rate_fails_the_sanity_check(
-    tmp_path: Path,
+def test_an_override_larger_than_the_rate_is_reported_by_state(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A negative total is a bad table, and must not read as a lost row."""
+    """The failure must name whose rate it is, not just a bare number.
+
+    Exit 1 alone proves nothing here: every SnapshotError exits 1, and
+    a bad figure used to surface as a miscount of states instead.
+    """
     html = tmp_path / "page.html"
     html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
     with (
@@ -2008,27 +2148,37 @@ def test_an_override_larger_than_the_rate_fails_the_sanity_check(
             period=_tax_period(period=date(2026, 1, 1), rate=0.10),
             gut_month=date(2026, 5, 1),
         ),
+        caplog.at_level("ERROR"),
     ):
         assert (
             gpb.main(["add-snapshot", str(html), "--target", "2026-05-21"])
             == 1
         )
+    assert "GA on 2026-05-21" in caplog.text
+    assert "HB 1199" in caplog.text
+    assert "more than the" in caplog.text
 
 
 def test_add_snapshot_outside_the_swept_range_is_refused(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Past the sweep, no override table can say a rate was collected."""
     html = tmp_path / "page.html"
     html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
     beyond = gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH + timedelta(days=1)
-    with _backups_under(tmp_path), _add_snapshot_sources():
+    with (
+        _backups_under(tmp_path),
+        _add_snapshot_sources(),
+        caplog.at_level("ERROR"),
+    ):
         assert (
             gpb.main(
                 ["add-snapshot", str(html), "--target", beyond.isoformat()]
             )
             == 1
         )
+    # Named, so this cannot pass on some other source failing first.
+    assert "swept only for" in caplog.text
 
 
 def test_add_snapshot_dry_run_leaves_the_page_alone(tmp_path: Path) -> None:
