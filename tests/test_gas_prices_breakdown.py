@@ -1644,9 +1644,19 @@ def _state_block(code: str, retail: str = "3.500") -> str:
 
 def _snapshot_block(day: str, codes: list[str]) -> str:
     body = ",\n".join(_state_block(c) for c in codes) + ",\n"
+    # Shaped like a published snapshot: retail provenance, then a
+    # state-tax sentence, then the pass-through section.
+    notes = (
+        "Fixture snapshot. Retail (col 2) from somewhere. "
+        "State taxes (cols 3-4) inherited from a baseline. "
+        f"{gpb.PASSTHROUGH_NOTES_MARKER}CA LCFS 2026-09-16 ($84.75/MT)."
+    )
     return (
         f'{{\n  date: "{day}",\n'
-        '  notes: "Fixture snapshot.",\n'
+        "  federalExcise: 0.184,\n"
+        '  federalSource: "https://example.invalid/p510",\n'
+        '  federalVintage: "Unchanged since 1993.",\n'
+        f'  notes: "{notes}",\n'
         f"  data: [\n{body}  ]\n}}"
     )
 
@@ -1860,6 +1870,152 @@ def test_add_snapshot_adds_back_a_gross_receipts_tax(
     expected = round(0.30 + gpb.CT_PGET_RATE * gpb.CT_PGET_CAP_USD, 4)
     assert f"fixed:{{ total:{expected:.4f}," in conn
     assert "gross earnings" in conn
+
+
+@contextlib.contextmanager
+def _migrate_sources(period: gpb.TaxPeriod | None = None) -> Iterator[None]:
+    """Stub the three series the migration downloads once per run."""
+    chosen = period or _tax_period()
+    with (
+        patch.object(
+            gpb, "load_tax_periods", autospec=True, return_value=[chosen]
+        ),
+        patch.object(
+            gpb,
+            "load_in_gut_rates",
+            autospec=True,
+            return_value={date(2026, 9, 1): 0.239},
+        ),
+        patch.object(
+            gpb, "load_eia_api_key", autospec=True, return_value="key"
+        ),
+        patch.object(
+            gpb,
+            "load_spot_series",
+            autospec=True,
+            return_value={"2026-08": 3.213},
+        ),
+    ):
+        yield
+
+
+def _migrated(tmp_path: Path, *blocks: str) -> str:
+    html = tmp_path / "page.html"
+    html.write_text(_page(*blocks))
+    with _backups_under(tmp_path), _migrate_sources():
+        assert gpb.main(["migrate-state-tax", str(html)]) == 0
+    return html.read_text()
+
+
+def test_migrate_leaves_retail_and_nontax_exactly_as_captured(
+    tmp_path: Path,
+) -> None:
+    """Neither column can be re-derived, so neither may be disturbed."""
+    block = _snapshot_block("2026-09-17", CODES)
+    before = gpb._captured_columns(block)
+    built = gpb.parse_snapshots(_migrated(tmp_path, block)).blocks[0]
+    assert gpb._captured_columns(built) == before
+
+
+def test_migrate_drops_the_ad_valorem_field(tmp_path: Path) -> None:
+    """The published rows carry a field the page no longer reads."""
+    built = _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
+    assert "adval:" not in built
+
+
+def test_migrate_restates_the_federal_fields(tmp_path: Path) -> None:
+    """The federal rate rides the same table as the state ones."""
+    built = _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
+    assert "federalExcise: 0.1840," in built
+    assert "fueltaxes.xlsx" in built
+
+
+def test_migrate_restates_only_the_state_tax_sentence(
+    tmp_path: Path,
+) -> None:
+    """Retail provenance and the pass-through section are not its to edit."""
+    built = gpb.parse_snapshots(
+        _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
+    ).blocks[0]
+    notes = re.search(r'notes:\s*"((?:[^"\\]|\\.)*)"', built)
+    assert notes is not None
+    text = notes.group(1)
+    assert text.startswith("Fixture snapshot.")
+    assert gpb.STATE_TAX_NOTES_MARKER in text
+    assert gpb.PASSTHROUGH_NOTES_MARKER in text
+    assert text.index(gpb.STATE_TAX_NOTES_MARKER) < text.index(
+        gpb.PASSTHROUGH_NOTES_MARKER
+    )
+
+
+def test_migrate_is_idempotent(tmp_path: Path) -> None:
+    """Re-running against settled data must not churn the file."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block("2026-09-17", CODES)))
+    with _backups_under(tmp_path), _migrate_sources():
+        gpb.main(["migrate-state-tax", str(html)])
+        once = html.read_text()
+        assert gpb.main(["migrate-state-tax", str(html)]) == 0
+    assert html.read_text() == once
+
+
+def test_migrate_dry_run_leaves_the_file_alone(tmp_path: Path) -> None:
+    """A dry run is what the rewrite gets approved from."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block("2026-09-17", CODES)))
+    before = html.read_text()
+    with _backups_under(tmp_path), _migrate_sources():
+        assert gpb.main(["migrate-state-tax", "--dry-run", str(html)]) == 0
+    assert html.read_text() == before
+
+
+def test_migrate_reports_every_unreachable_snapshot(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One snapshot off the front of the sources must not hide the rest."""
+    html = tmp_path / "page.html"
+    html.write_text(
+        _page(
+            _snapshot_block("2026-09-17", CODES),
+            _snapshot_block("2019-01-03", CODES),
+        )
+    )
+    before = html.read_text()
+    with (
+        _backups_under(tmp_path),
+        _migrate_sources(),
+        caplog.at_level("ERROR"),
+    ):
+        assert gpb.main(["migrate-state-tax", str(html)]) == 1
+    assert html.read_text() == before
+    assert "2019-01-03" in caplog.text
+
+
+def test_migrate_refuses_to_disturb_a_captured_column(
+    tmp_path: Path,
+) -> None:
+    """The guard between a bad splice and irreplaceable data.
+
+    A splice that damaged retail is exactly what cannot be recovered, so
+    the guard is driven by making the rewrite misbehave rather than by
+    feeding it bad input.
+    """
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block("2026-09-17", CODES)))
+    before = html.read_text()
+
+    def _corrupting_drop(chunk: str) -> str:
+        return chunk.replace("retail:3.500", "retail:9.999")
+
+    with (
+        _backups_under(tmp_path),
+        _migrate_sources(),
+        patch.object(
+            gpb, "drop_adval", autospec=True, side_effect=_corrupting_drop
+        ),
+    ):
+        assert gpb.main(["migrate-state-tax", str(html)]) == 1
+    assert html.read_text() == before
 
 
 def test_add_snapshot_dry_run_leaves_the_page_alone(tmp_path: Path) -> None:
