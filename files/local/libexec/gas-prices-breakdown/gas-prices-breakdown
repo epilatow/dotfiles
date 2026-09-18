@@ -252,6 +252,36 @@ IN_GUT_NOTICE_URL = "https://www.in.gov/dor/files/reference/dn02.pdf"
 # allows one missed edition before the run stops.
 IN_GUT_STALE_DAYS = 70
 
+# Indiana's flat per-gallon oil inspection fee under IC 16-44-2-18. It
+# is what remains collectable while the excise and use tax are
+# suspended, and it is the residual that makes EIA's Indiana columns
+# reconcile: their "other" is the previous month's use tax plus this.
+IN_OIL_INSPECTION_FEE = 0.01
+
+# Governors suspend fuel taxes by executive order, and no rate table
+# reflects it -- EIA published Indiana at 64.5 cents for a July 2026 on
+# which both of these were suspended, because it publishes statutory
+# rates rather than what is being collected. So the windows are tracked
+# here, from the department's own notices.
+#
+# Each entry is (start, end inclusive, authority). Indiana ran its use
+# tax suspension continuously across five orders; the earlier
+# 2026-05-06 order reached the excise only for gasoline delivered to
+# marina facilities, which is not a pump-level suspension and is
+# therefore not one of these windows.
+IN_EXCISE_SUSPENSIONS: list[tuple[date, date, str]] = [
+    (date(2026, 6, 7), date(2026, 10, 5), "EO 26-13, 26-16, 26-25-1"),
+]
+IN_GUT_SUSPENSIONS: list[tuple[date, date, str]] = [
+    (date(2026, 4, 8), date(2026, 10, 5), "EO 26-09 through 26-25-1"),
+]
+# A suspension that has lapsed and one that was quietly extended look
+# identical from here, so the tables carry how far a human has actually
+# checked rather than being trusted past their last known window. Move
+# this forward only after re-reading the department's notices.
+IN_SUSPENSION_CHECKED_THROUGH = date(2026, 10, 5)
+IN_SUSPENSION_NOTICE_URL = "https://www.in.gov/dor/files/reference/dn45.pdf"
+
 STATE_CODE: dict[str, str] = {
     "Alabama": "AL",
     "Alaska": "AK",
@@ -603,6 +633,11 @@ class TaxPeriod:
     restores them is applied by the caller, not baked in, so this stays
     a faithful reading of the published table.
 
+    `excise` carries the narrower State tax column, the excise alone
+    without the charges grouped beside it. It exists for Indiana, whose
+    total has to be rebuilt from its parts because the use tax inside it
+    is reset monthly and both halves have been suspended by order.
+
     `missing` names the states whose rate cell the sheet left blank.
     EIA blanks a rate during a tax holiday, but it reads the same as a
     figure nobody filled in, so the two are not distinguished here and
@@ -611,6 +646,7 @@ class TaxPeriod:
 
     period: date
     per_state: dict[str, float]
+    excise: dict[str, float]
     federal: float
     source_url: str
     missing: tuple[str, ...]
@@ -699,6 +735,7 @@ def _read_tax_sheet(
     between editions.
     """
     per_state: dict[str, float] = {}
+    excise: dict[str, float] = {}
     federal: float | None = None
     seen: set[str] = set()
     for row in wb[sheet_name].iter_rows(values_only=True):
@@ -715,6 +752,9 @@ def _read_tax_sheet(
         rate = _tax_cell(row, 3)
         if rate is not None:
             per_state[code] = rate
+        state_only = _tax_cell(row, 1)
+        if state_only is not None:
+            excise[code] = state_only
     if federal is None:
         raise SnapshotError(
             f"EIA tax {period}: no Federal row, or its total is blank"
@@ -727,6 +767,7 @@ def _read_tax_sheet(
     return TaxPeriod(
         period=period,
         per_state=per_state,
+        excise=excise,
         federal=federal,
         source_url=EIA_FUELTAXES_URL,
         missing=tuple(sorted(seen - set(per_state))),
@@ -829,6 +870,72 @@ def _read_in_gut_rates(path: Path) -> dict[date, float]:
     if not out:
         raise SnapshotError("IN GUT: notice has no rate rows")
     return out
+
+
+@dataclass(frozen=True)
+class IndianaTax:
+    """Indiana's per-gallon state tax, resolved for one date.
+
+    `total` is what the state actually collects on the date, which is
+    what the page reports. The components are kept so the snapshot can
+    say which of them a suspension switched off rather than just
+    showing a number that dropped.
+    """
+
+    total: float
+    excise: float
+    inspection_fee: float
+    gut: float
+    suspended: tuple[str, ...]
+
+
+def _suspended_on(
+    windows: list[tuple[date, date, str]], day: date
+) -> str | None:
+    """Return the authority suspending a tax on `day`, if any."""
+    for start, end, authority in windows:
+        if start <= day <= end:
+            return authority
+    return None
+
+
+def resolve_indiana_tax(
+    day: date, eia_excise: float, gut: InGutRate
+) -> IndianaTax:
+    """Compose Indiana's state tax for `day` from its three components.
+
+    Indiana is the one state the published tables cannot describe on
+    their own: its use tax is reset monthly rather than twice a year,
+    and its excise and use tax have both been suspended by executive
+    order for stretches no rate table reflects.
+
+    Raises `SnapshotError` for a date past where the suspension windows
+    have been checked, since a lapsed suspension and an extended one are
+    indistinguishable from here.
+    """
+    if day > IN_SUSPENSION_CHECKED_THROUGH:
+        raise SnapshotError(
+            f"IN suspensions: windows are only verified through "
+            f"{IN_SUSPENSION_CHECKED_THROUGH}, so whether a tax is "
+            f"collected on {day} is unknown; re-read the department's "
+            f"notices at {IN_SUSPENSION_NOTICE_URL}"
+        )
+    excise_by = _suspended_on(IN_EXCISE_SUSPENSIONS, day)
+    gut_by = _suspended_on(IN_GUT_SUSPENSIONS, day)
+    excise = 0.0 if excise_by else eia_excise
+    gut_amount = 0.0 if gut_by else gut.usd_per_gal
+    suspended: list[str] = []
+    if excise_by:
+        suspended.append(f"gasoline excise ({excise_by})")
+    if gut_by:
+        suspended.append(f"gasoline use tax ({gut_by})")
+    return IndianaTax(
+        total=round(excise + IN_OIL_INSPECTION_FEE + gut_amount, 4),
+        excise=excise,
+        inspection_fee=IN_OIL_INSPECTION_FEE,
+        gut=gut_amount,
+        suspended=tuple(suspended),
+    )
 
 
 def _tax_label(raw: str) -> str:

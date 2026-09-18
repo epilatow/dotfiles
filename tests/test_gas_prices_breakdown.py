@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import gzip
 import http.client
+import itertools
 import re
 import subprocess
 import sys
@@ -902,7 +903,11 @@ def _tax_sheet(
     ws.append([])
     ws.append(["State tax", "Other", "Total State", "State & Federal"])
     for name, code in sorted(gpb.STATE_CODE.items()):
-        ws.append([name, None, None, rates.get(code)])
+        total = rates.get(code)
+        # The excise column is the total less the charges grouped
+        # beside it; a blank total leaves the whole row blank.
+        excise = None if total is None else round(total - 0.01, 4)
+        ws.append([name, excise, None, total])
 
 
 def _tax_workbook(
@@ -1310,6 +1315,111 @@ def test_in_gut_at_the_freshness_limit_still_answers(tmp_path: Path) -> None:
     with _in_gut_rates({month: 0.239}):
         got = gpb.fetch_in_gut_for_target_date(target, tmp_path)
     assert got.month_start == month
+
+
+# ---------------------------------------------------------------------------
+# Indiana tax suspensions
+# ---------------------------------------------------------------------------
+#
+# A published rate table says what a tax is, not whether it is being
+# collected: EIA carried Indiana at 64.5 cents for a July 2026 on which
+# both its excise and its use tax were suspended by executive order.
+
+
+def _gut(rate: float) -> gpb.InGutRate:
+    return gpb.InGutRate(date(2026, 9, 1), rate, "https://example.invalid")
+
+
+def test_indiana_sums_its_three_components_when_nothing_is_suspended() -> None:
+    """Excise plus the flat inspection fee plus that month's use tax."""
+    got = gpb.resolve_indiana_tax(date(2026, 2, 19), 0.36, _gut(0.149))
+    assert got.total == 0.519
+    assert got.excise == 0.36
+    assert got.inspection_fee == gpb.IN_OIL_INSPECTION_FEE
+    assert got.gut == 0.149
+    assert got.suspended == ()
+
+
+def test_indiana_use_tax_suspension_leaves_the_excise_collected() -> None:
+    """The first orders reached the use tax only."""
+    got = gpb.resolve_indiana_tax(date(2026, 4, 30), 0.36, _gut(0.172))
+    assert got.total == 0.37
+    assert got.gut == 0.0
+    assert got.excise == 0.36
+    assert got.suspended == ("gasoline use tax (EO 26-09 through 26-25-1)",)
+
+
+def test_indiana_with_both_suspended_keeps_only_the_inspection_fee() -> None:
+    """The notice excludes the inspection fee from every suspension."""
+    got = gpb.resolve_indiana_tax(date(2026, 9, 17), 0.37, _gut(0.239))
+    assert got.total == gpb.IN_OIL_INSPECTION_FEE
+    assert got.excise == 0.0
+    assert got.gut == 0.0
+    assert len(got.suspended) == 2
+
+
+@pytest.mark.parametrize(
+    ("day", "excise_off", "gut_off"),
+    [
+        (date(2026, 4, 7), False, False),
+        (date(2026, 4, 8), False, True),
+        (date(2026, 6, 6), False, True),
+        (date(2026, 6, 7), True, True),
+        (date(2026, 10, 5), True, True),
+    ],
+    ids=["day_before", "gut_starts", "gut_only", "excise_starts", "last_day"],
+)
+def test_indiana_suspension_windows_are_inclusive_at_both_ends(
+    day: date, excise_off: bool, gut_off: bool
+) -> None:
+    """A window that is off by a day mis-prices a whole snapshot."""
+    got = gpb.resolve_indiana_tax(day, 0.36, _gut(0.20))
+    assert (got.excise == 0.0) is excise_off
+    assert (got.gut == 0.0) is gut_off
+
+
+def test_indiana_past_the_checked_window_is_refused() -> None:
+    """A lapsed suspension and an extended one look identical here."""
+    day = gpb.IN_SUSPENSION_CHECKED_THROUGH + timedelta(days=1)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.resolve_indiana_tax(day, 0.37, _gut(0.239))
+    assert "only verified through" in str(caught.value)
+    assert gpb.IN_SUSPENSION_NOTICE_URL in str(caught.value)
+
+
+def test_indiana_on_the_last_checked_day_still_answers() -> None:
+    """Pins the constant itself, not merely some value inside it."""
+    got = gpb.resolve_indiana_tax(
+        gpb.IN_SUSPENSION_CHECKED_THROUGH, 0.37, _gut(0.239)
+    )
+    assert got.total == gpb.IN_OIL_INSPECTION_FEE
+
+
+def test_indiana_suspension_windows_are_ordered_and_disjoint() -> None:
+    """Overlapping windows would make the authority reported arbitrary."""
+    for windows in (gpb.IN_EXCISE_SUSPENSIONS, gpb.IN_GUT_SUSPENSIONS):
+        assert windows == sorted(windows)
+        for (_, end, _), (start, _, _) in itertools.pairwise(windows):
+            assert end < start
+
+
+def test_indiana_checked_through_covers_every_shipped_window() -> None:
+    """A window reaching past the check would be trusted unverified."""
+    ends = [
+        end
+        for windows in (gpb.IN_EXCISE_SUSPENSIONS, gpb.IN_GUT_SUSPENSIONS)
+        for _, end, _ in windows
+    ]
+    assert max(ends) <= gpb.IN_SUSPENSION_CHECKED_THROUGH
+
+
+def test_tax_sheet_carries_the_excise_column_for_indiana(
+    tmp_path: Path,
+) -> None:
+    """Indiana's total is rebuilt from parts, so the narrow column counts."""
+    periods = _periods(tmp_path, {"July 2026": _flat_rates(0.645)})
+    assert periods[0].excise["IN"] == 0.635
+    assert periods[0].per_state["IN"] == 0.645
 
 
 # ---------------------------------------------------------------------------
