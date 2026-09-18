@@ -10,6 +10,7 @@ dependencies = [
     # what the script imports at module scope. Each script itself resolves
     # these from its own PEP 723 block when run.
     "openpyxl",
+    "pdfplumber",
     "xlrd",
     "curl_cffi",
     "beautifulsoup4",

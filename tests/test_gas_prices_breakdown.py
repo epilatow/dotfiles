@@ -13,10 +13,11 @@ import urllib.error
 import zipfile
 from datetime import date, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 from unittest.mock import patch
 
 import openpyxl  # type: ignore[import-untyped]
+import pdfplumber
 import pytest
 import xlrd  # type: ignore[import-untyped]
 
@@ -1118,6 +1119,197 @@ def test_tax_fetch_downloads_then_selects(tmp_path: Path) -> None:
     assert got.per_state["CA"] == 0.645
     assert got.federal == 0.184
     assert got.source_url == gpb.EIA_FUELTAXES_URL
+
+
+# ---------------------------------------------------------------------------
+# Indiana gasoline use tax
+# ---------------------------------------------------------------------------
+
+
+class _FakePage:
+    def __init__(self, tables: list[list[list[str | None]]]) -> None:
+        self._tables = tables
+
+    def extract_tables(self) -> list[list[list[str | None]]]:
+        return self._tables
+
+
+class _FakePdf:
+    """The context-manager-with-pages shape pdfplumber exposes."""
+
+    def __init__(self, tables: list[list[list[str | None]]]) -> None:
+        self.pages = [_FakePage(tables)]
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+
+@contextlib.contextmanager
+def _in_gut_notice(tables: list[list[list[str | None]]]) -> Iterator[None]:
+    """Stand in for pdfplumber reading the downloaded notice."""
+    with patch.object(
+        pdfplumber, "open", autospec=True, return_value=_FakePdf(tables)
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def _in_gut_rates(rates: dict[date, float]) -> Iterator[None]:
+    """Stand in for the notice download and its parsed history."""
+    with (
+        patch.object(gpb, "_http_bytes", autospec=True, return_value=b"pdf"),
+        patch.object(
+            gpb, "_read_in_gut_rates", autospec=True, return_value=rates
+        ),
+    ):
+        yield
+
+
+def test_in_gut_reads_the_monthly_history(tmp_path: Path) -> None:
+    """The notice carries every month's rate, not only the current one."""
+    with _in_gut_notice(
+        [
+            [
+                ["September 1, 2026", "September 30, 2026", "23.9 cents"],
+                ["October 1, 2026", "October 31, 2026", "23.8 cents"],
+            ]
+        ]
+    ):
+        rates = gpb._read_in_gut_rates(tmp_path / "notice.pdf")
+    assert rates == {date(2026, 9, 1): 0.239, date(2026, 10, 1): 0.238}
+
+
+def test_in_gut_reads_the_legacy_semiannual_table_too(
+    tmp_path: Path,
+) -> None:
+    """Rows before July 2014 run six months and share the layout."""
+    with _in_gut_notice(
+        [
+            [["July 1, 2013", "December 31, 2013", "19.4 cents"]],
+            [["October 1, 2026", "October 31, 2026", "23.8 cents"]],
+        ]
+    ):
+        rates = gpb._read_in_gut_rates(tmp_path / "notice.pdf")
+    assert rates[date(2013, 7, 1)] == 0.194
+    assert rates[date(2026, 10, 1)] == 0.238
+
+
+def test_in_gut_ignores_rows_that_are_not_rates(tmp_path: Path) -> None:
+    """The notice runs prose and headers through the same extractor."""
+    with _in_gut_notice(
+        [
+            [
+                ["Period from", "Period to", "Rate Per Gallon"],
+                [None, None, None],
+                ["Disclaimer: this document is not a statement", "", ""],
+                ["October 1, 2026", "October 31, 2026", "23.8 cents"],
+            ]
+        ]
+    ):
+        rates = gpb._read_in_gut_rates(tmp_path / "notice.pdf")
+    assert rates == {date(2026, 10, 1): 0.238}
+
+
+def test_in_gut_notice_without_rate_rows_is_reported(
+    tmp_path: Path,
+) -> None:
+    """A reshaped notice must not read as an empty history."""
+    with (
+        _in_gut_notice([[["Period from", "Period to", "Rate Per Gallon"]]]),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb._read_in_gut_rates(tmp_path / "notice.pdf")
+    assert "no rate rows" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("name", "body"),
+    [
+        ("error_page", b"<html>503 Service Unavailable</html>"),
+        ("empty", b""),
+        ("header_only", b"%PDF-1.4\n"),
+    ],
+)
+def test_in_gut_damaged_notice_is_reported_not_raised(
+    tmp_path: Path, name: str, body: bytes
+) -> None:
+    """Every way the download goes wrong exits 1, never a traceback."""
+    notice = tmp_path / f"{name}.pdf"
+    notice.write_bytes(body)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._read_in_gut_rates(notice)
+    assert "IN GUT" in str(caught.value)
+
+
+def test_in_gut_missing_notice_is_reported_not_raised(
+    tmp_path: Path,
+) -> None:
+    """A file that never landed is the same class of failure."""
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._read_in_gut_rates(tmp_path / "absent.pdf")
+    assert "IN GUT" in str(caught.value)
+
+
+def test_in_gut_uses_the_month_the_snapshot_falls_in(
+    tmp_path: Path,
+) -> None:
+    """The rate steps on the first of the month and holds all month."""
+    with _in_gut_rates(
+        {
+            date(2026, 8, 1): 0.219,
+            date(2026, 9, 1): 0.239,
+            date(2026, 10, 1): 0.238,
+        }
+    ):
+        got = gpb.fetch_in_gut_for_target_date(date(2026, 9, 17), tmp_path)
+    assert got.month_start == date(2026, 9, 1)
+    assert got.usd_per_gal == 0.239
+    assert got.source_url == gpb.IN_GUT_NOTICE_URL
+
+
+def test_in_gut_does_not_use_a_month_that_has_not_started(
+    tmp_path: Path,
+) -> None:
+    """October's rate is published in September but is not in force."""
+    with _in_gut_rates({date(2026, 9, 1): 0.239, date(2026, 10, 1): 0.238}):
+        got = gpb.fetch_in_gut_for_target_date(date(2026, 9, 30), tmp_path)
+    assert got.month_start == date(2026, 9, 1)
+
+
+def test_in_gut_target_before_the_notice_starts_is_reported(
+    tmp_path: Path,
+) -> None:
+    """A backfill reaching past the published history must not guess."""
+    with (
+        _in_gut_rates({date(2026, 9, 1): 0.239}),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb.fetch_in_gut_for_target_date(date(1990, 1, 1), tmp_path)
+    assert "starts at" in str(caught.value)
+
+
+def test_in_gut_notice_gone_quiet_fails_the_run(tmp_path: Path) -> None:
+    """A notice nobody replaces keeps answering with its last month."""
+    month = date(2026, 9, 1)
+    target = month + timedelta(days=gpb.IN_GUT_STALE_DAYS + 1)
+    with (
+        _in_gut_rates({month: 0.239}),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb.fetch_in_gut_for_target_date(target, tmp_path)
+    assert "stopped replacing" in str(caught.value)
+
+
+def test_in_gut_at_the_freshness_limit_still_answers(tmp_path: Path) -> None:
+    """Pins the constant itself, not merely some value far inside it."""
+    month = date(2026, 9, 1)
+    target = month + timedelta(days=gpb.IN_GUT_STALE_DAYS)
+    with _in_gut_rates({month: 0.239}):
+        got = gpb.fetch_in_gut_for_target_date(target, tmp_path)
+    assert got.month_start == month
 
 
 # ---------------------------------------------------------------------------

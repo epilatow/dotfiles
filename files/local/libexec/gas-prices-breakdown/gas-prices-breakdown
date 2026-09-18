@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["openpyxl", "xlrd"]
+# dependencies = ["openpyxl", "pdfplumber", "xlrd"]
 # ///
 """Manage SNAPSHOTS and embedded markdown in gas-price-breakdown.html.
 
@@ -65,7 +65,9 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import openpyxl  # type: ignore[import-untyped]
+import pdfplumber
 import xlrd  # type: ignore[import-untyped]
+from pdfplumber.utils.exceptions import PdfminerException
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -234,6 +236,21 @@ EIA_FUELTAXES_URL = (
 # sits a quarter past that, far enough to tell a late edition from a
 # table EIA has stopped publishing.
 EIA_TAX_STALE_DAYS = 275
+
+# Indiana recalculates its gasoline use tax every month, which is faster
+# than the EIA table is published, so the rate comes from the department
+# that sets it. The notice carries the whole monthly history alongside
+# the current rate.
+#
+# The same notice shows the statewide average pump price the rate is
+# derived from, and that figure is OPIS-licensed and restricted to
+# computing and remitting the tax. Only the statutory rate -- a figure
+# the state publishes in its own right -- is read here.
+IN_GUT_NOTICE_URL = "https://www.in.gov/dor/files/reference/dn02.pdf"
+# A month's rate is published at the start of the month it covers, so
+# the rate in force runs at most a month behind the snapshot. The limit
+# allows one missed edition before the run stops.
+IN_GUT_STALE_DAYS = 70
 
 STATE_CODE: dict[str, str] = {
     "Alabama": "AL",
@@ -714,6 +731,104 @@ def _read_tax_sheet(
         source_url=EIA_FUELTAXES_URL,
         missing=tuple(sorted(seen - set(per_state))),
     )
+
+
+@dataclass(frozen=True)
+class InGutRate:
+    """Indiana's gasoline use tax for the month it was set."""
+
+    month_start: date
+    usd_per_gal: float
+    source_url: str
+
+
+def load_in_gut_rates(cache_dir: Path) -> dict[date, float]:
+    """Download Indiana's notice and read its monthly rate history."""
+    pdf_path = cache_dir / "indiana-gut.pdf"
+    pdf_path.write_bytes(_http_bytes(IN_GUT_NOTICE_URL))
+    return _read_in_gut_rates(pdf_path)
+
+
+def select_in_gut(rates: dict[date, float], target: date) -> InGutRate:
+    """Return the Indiana gasoline use tax in force on `target`.
+
+    Raises `SnapshotError` when the notice does not reach back to
+    `target`, and when the newest rate it does carry is too far behind
+    to describe it -- a notice the department has stopped replacing
+    keeps answering with its last month.
+    """
+    usable = [m for m in rates if m <= target]
+    if not usable:
+        raise SnapshotError(
+            f"IN GUT: no rate in force on {target}; the notice starts at "
+            f"{min(rates)}"
+        )
+    month_start = max(usable)
+    age = (target - month_start).days
+    if age > IN_GUT_STALE_DAYS:
+        raise SnapshotError(
+            f"IN GUT: newest rate in force ({month_start}) is {age} days "
+            f"before {target}, over the {IN_GUT_STALE_DAYS}-day limit; "
+            f"the department has stopped replacing the notice"
+        )
+    return InGutRate(
+        month_start=month_start,
+        usd_per_gal=rates[month_start],
+        source_url=IN_GUT_NOTICE_URL,
+    )
+
+
+def fetch_in_gut_for_target_date(target: date, cache_dir: Path) -> InGutRate:
+    """Download Indiana's notice and pick the month for `target`."""
+    return select_in_gut(load_in_gut_rates(cache_dir), target)
+
+
+_IN_GUT_PERIOD_RE = re.compile(r"^([A-Z][a-z]+) (\d{1,2}), (\d{4})$")
+_IN_GUT_RATE_RE = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*cents$")
+
+
+def _read_in_gut_rates(path: Path) -> dict[date, float]:
+    """Read the notice's rate history as month-start to dollars a gallon.
+
+    The history is a three-column table -- period start, period end,
+    rate -- and only the first and last are read; see
+    `IN_GUT_NOTICE_URL` for why the rest of the notice is left alone.
+    Rows are recognised by their own shape rather than by position,
+    because the notice runs the current monthly table and an older
+    semi-annual one under the same layout.
+    """
+    out: dict[date, float] = {}
+    # pdfplumber funnels every parser failure into one wrapper, so a
+    # body that is not a PDF and one truncated mid-transfer both arrive
+    # as PdfminerException; a file that never landed is the OSError.
+    try:
+        with pdfplumber.open(path) as pdf:
+            tables = [t for page in pdf.pages for t in page.extract_tables()]
+    except (PdfminerException, OSError) as exc:
+        raise SnapshotError(
+            f"IN GUT: notice is not a readable PDF ({_describe(exc)})"
+        ) from exc
+    for table in tables:
+        for row in table:
+            cells = [(c or "").strip().replace("\n", " ") for c in row]
+            if len(cells) < 3:
+                continue
+            start = _IN_GUT_PERIOD_RE.match(cells[0])
+            rate = _IN_GUT_RATE_RE.match(cells[2])
+            if not start or start.group(1) not in MONTHS or not rate:
+                continue
+            month = date(
+                int(start.group(3)),
+                MONTHS[start.group(1)],
+                int(start.group(2)),
+            )
+            # The statute rounds the rate to a tenth of a cent, so the
+            # dollar figure is exact to three places; rounding keeps the
+            # cents-to-dollars division from inventing a fourth.
+            out[month] = round(float(rate.group(1)) / 100, 4)
+    if not out:
+        raise SnapshotError("IN GUT: notice has no rate rows")
+    return out
 
 
 def _tax_label(raw: str) -> str:
