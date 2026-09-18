@@ -51,12 +51,14 @@ from __future__ import annotations
 import argparse
 import gzip
 import http.client
+import json
 import logging
 import re
 import shutil
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from collections.abc import Callable
@@ -281,6 +283,52 @@ IN_GUT_SUSPENSIONS: list[tuple[date, date, str]] = [
 # this forward only after re-reading the department's notices.
 IN_SUSPENSION_CHECKED_THROUGH = date(2026, 10, 5)
 IN_SUSPENSION_NOTICE_URL = "https://www.in.gov/dor/files/reference/dn45.pdf"
+
+# EIA's table is explicit that its rates exclude "any state taxes based
+# on gross or net receipts", which drops four real per-gallon costs:
+# Connecticut's PGET, Delaware's HSCA, Ohio's PAT and Hawaii's GET. New
+# Jersey's gross receipts tax is not among them, because the state sets
+# it as a per-gallon figure that EIA carries.
+#
+# Hawaii's is levied on the seller's gross income, and the pump price is
+# that income, so the rate applies to retail directly. The other three
+# are levied on the first sale into the state, which is a wholesale
+# price nobody publishes per state any more -- EIA's own refiner series
+# ended in March 2022 -- so they are taken against a spot benchmark.
+CT_PGET_RATE = 0.081
+# Gross earnings from the first sale of gasoline are capped at $3.00 a
+# gallon by CGS 12-587(a)(4), so above that the tax is a constant 24.3
+# cents regardless of the benchmark. Rack sits above spot, so a spot
+# quote at or over the cap proves the cap binds; below it the benchmark
+# is doing real work and understates, since it omits the rack margin.
+CT_PGET_CAP_USD = 3.00
+DE_HSCA_RATE = 0.011902
+OH_PAT_RATE = 0.0065
+HI_GET_RATE = 0.04
+
+# Spot benchmarks standing in for the rack price each tax is levied on:
+# New York Harbor for the two Atlantic states, Gulf Coast for Ohio.
+EIA_SPOT_API = "https://api.eia.gov/v2/petroleum/pri/spt/data/"
+EIA_SPOT_SERIES = {
+    "CT": "EER_EPMRU_PF4_Y35NY_DPG",
+    "DE": "EER_EPMRU_PF4_Y35NY_DPG",
+    "OH": "EER_EPMRU_PF4_RGC_DPG",
+}
+# The series is monthly and lands a few weeks after the month closes, so
+# the quote in force is legitimately up to ~60 days behind the snapshot.
+EIA_SPOT_STALE_DAYS = 100
+# EIA requires a key for its API but not for the tax workbook. It is
+# read from disk at run time so it stays out of the repo and out of the
+# page; a run without it fails rather than quietly skipping the states
+# that depend on it.
+EIA_API_KEY_PATH = (
+    Path.home()
+    / ".local"
+    / "state"
+    / "gas-prices-breakdown"
+    / "secrets"
+    / "eia-api-key"
+)
 
 STATE_CODE: dict[str, str] = {
     "Alabama": "AL",
@@ -935,6 +983,164 @@ def resolve_indiana_tax(
         inspection_fee=IN_OIL_INSPECTION_FEE,
         gut=gut_amount,
         suspended=tuple(suspended),
+    )
+
+
+@dataclass(frozen=True)
+class SpotQuote:
+    """A monthly spot benchmark standing in for a rack price."""
+
+    year_month: str
+    usd_per_gal: float
+    series: str
+
+
+@dataclass(frozen=True)
+class GrossReceiptsTax:
+    """A per-gallon tax the published rate table leaves out."""
+
+    state: str
+    usd_per_gal: float
+    label: str
+    basis: str
+    exact: bool
+
+
+def load_eia_api_key() -> str:
+    """Read the EIA API key, naming the file when it is not there."""
+    try:
+        key = EIA_API_KEY_PATH.read_text().strip()
+    except OSError as exc:
+        raise SnapshotError(
+            f"EIA API key: cannot read {EIA_API_KEY_PATH} "
+            f"({_describe(exc)}); register one at "
+            f"https://www.eia.gov/opendata/register.php"
+        ) from exc
+    if not key:
+        raise SnapshotError(f"EIA API key: {EIA_API_KEY_PATH} is empty")
+    return key
+
+
+def load_spot_series(series: str, key: str) -> dict[str, float]:
+    """Fetch one monthly spot benchmark as year-month to dollars."""
+    query = urllib.parse.urlencode(
+        {
+            "frequency": "monthly",
+            "data[0]": "value",
+            "facets[series][]": series,
+            "sort[0][column]": "period",
+            "sort[0][direction]": "desc",
+            "length": "600",
+            "api_key": key,
+        }
+    )
+    raw = _http_bytes(f"{EIA_SPOT_API}?{query}")
+    try:
+        payload = json.loads(raw)
+        rows = payload["response"]["data"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise SnapshotError(
+            f"EIA spot {series}: response is not the expected shape "
+            f"({_describe(exc)})"
+        ) from exc
+    out: dict[str, float] = {}
+    for row in rows:
+        period, value = row.get("period"), row.get("value")
+        if not isinstance(period, str):
+            continue
+        # The API quotes its numbers and sends null for a month it has
+        # no price for, so a usable row is a string or a number that
+        # parses; anything else is a gap rather than a parse failure.
+        if not isinstance(value, (str, int, float)):
+            continue
+        try:
+            out[period] = float(value)
+        except ValueError:
+            continue
+    if not out:
+        raise SnapshotError(f"EIA spot {series}: no priced months returned")
+    return out
+
+
+def select_spot(
+    months: dict[str, float], target: date, series: str
+) -> SpotQuote:
+    """Return the newest spot month that had closed by `target`.
+
+    Raises `SnapshotError` when the series does not reach back to
+    `target`, and when its newest closed month is too far behind to
+    describe it.
+    """
+    cutoff = f"{target.year:04d}-{target.month:02d}"
+    usable = [m for m in months if m < cutoff]
+    if not usable:
+        raise SnapshotError(
+            f"EIA spot {series}: no month closed before {target}; the "
+            f"series starts at {min(months)}"
+        )
+    year_month = max(usable)
+    year, month = (int(part) for part in year_month.split("-"))
+    age = (target - date(year, month, 1)).days
+    if age > EIA_SPOT_STALE_DAYS:
+        raise SnapshotError(
+            f"EIA spot {series}: newest closed month is {year_month}, "
+            f"{age} days before {target}, over the "
+            f"{EIA_SPOT_STALE_DAYS}-day limit; the series has stopped"
+        )
+    return SpotQuote(
+        year_month=year_month, usd_per_gal=months[year_month], series=series
+    )
+
+
+def resolve_gross_receipts(
+    state: str, retail: float, spot: SpotQuote | None
+) -> GrossReceiptsTax:
+    """Return the gross-receipts tax the rate table omits for `state`.
+
+    Hawaii's is a share of the pump price and needs no benchmark. The
+    other three are a share of the first sale into the state, which is
+    what `spot` stands in for.
+    """
+    if state == "HI":
+        amount = round(HI_GET_RATE * retail, 4)
+        return GrossReceiptsTax(
+            state=state,
+            usd_per_gal=amount,
+            label=f"General excise tax ({HI_GET_RATE:.1%} of retail)",
+            basis=f"{HI_GET_RATE:.1%} x ${retail:.3f} retail",
+            exact=True,
+        )
+    if spot is None:
+        raise SnapshotError(f"{state}: needs a spot benchmark to be priced")
+    if state == "CT":
+        base = min(spot.usd_per_gal, CT_PGET_CAP_USD)
+        capped = spot.usd_per_gal >= CT_PGET_CAP_USD
+        return GrossReceiptsTax(
+            state=state,
+            usd_per_gal=round(CT_PGET_RATE * base, 4),
+            label=f"Petroleum products gross earnings tax "
+            f"({CT_PGET_RATE:.1%})",
+            basis=(
+                f"{CT_PGET_RATE:.1%} x ${CT_PGET_CAP_USD:.2f} statutory cap"
+                if capped
+                else f"{CT_PGET_RATE:.1%} x ${base:.3f} "
+                f"({spot.year_month} spot, below the "
+                f"${CT_PGET_CAP_USD:.2f} cap)"
+            ),
+            # Above the cap the benchmark drops out of the arithmetic, so
+            # the figure is the statute's rather than an estimate.
+            exact=capped,
+        )
+    rate, label = {
+        "DE": (DE_HSCA_RATE, "Hazardous substance cleanup act tax"),
+        "OH": (OH_PAT_RATE, "Petroleum activity tax"),
+    }[state]
+    return GrossReceiptsTax(
+        state=state,
+        usd_per_gal=round(rate * spot.usd_per_gal, 4),
+        label=f"{label} ({rate:.4%})",
+        basis=f"{rate:.4%} x ${spot.usd_per_gal:.3f} ({spot.year_month} spot)",
+        exact=False,
     )
 
 

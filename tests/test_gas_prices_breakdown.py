@@ -6,6 +6,7 @@ import contextlib
 import gzip
 import http.client
 import itertools
+import json
 import re
 import subprocess
 import sys
@@ -1420,6 +1421,205 @@ def test_tax_sheet_carries_the_excise_column_for_indiana(
     periods = _periods(tmp_path, {"July 2026": _flat_rates(0.645)})
     assert periods[0].excise["IN"] == 0.635
     assert periods[0].per_state["IN"] == 0.645
+
+
+# ---------------------------------------------------------------------------
+# Gross-receipts taxes the rate table omits
+# ---------------------------------------------------------------------------
+
+
+def _spot(usd: float, year_month: str = "2026-08") -> gpb.SpotQuote:
+    return gpb.SpotQuote(year_month, usd, "EER_TEST")
+
+
+def _spot_payload(months: dict[str, object]) -> bytes:
+    rows = [{"period": p, "value": v} for p, v in months.items()]
+    return json.dumps({"response": {"data": rows}}).encode()
+
+
+def test_hawaii_is_a_share_of_the_pump_price(tmp_path: Path) -> None:
+    """The tax lands on gross income, and the pump price is that income."""
+    del tmp_path
+    got = gpb.resolve_gross_receipts("HI", 5.484, None)
+    assert got.usd_per_gal == round(gpb.HI_GET_RATE * 5.484, 4)
+    assert got.exact is True
+
+
+def test_connecticut_above_the_cap_is_the_statutory_constant() -> None:
+    """Rack sits above spot, so a spot at the cap proves the cap binds."""
+    got = gpb.resolve_gross_receipts("CT", 4.492, _spot(3.213))
+    assert got.usd_per_gal == round(gpb.CT_PGET_RATE * gpb.CT_PGET_CAP_USD, 4)
+    assert got.exact is True
+    assert "cap" in got.basis
+
+
+def test_connecticut_below_the_cap_is_an_estimate(tmp_path: Path) -> None:
+    """Under the cap the benchmark does real work, so it is not exact."""
+    del tmp_path
+    got = gpb.resolve_gross_receipts("CT", 4.492, _spot(2.063, "2026-01"))
+    assert got.usd_per_gal == round(gpb.CT_PGET_RATE * 2.063, 4)
+    assert got.exact is False
+    assert "2026-01" in got.basis
+
+
+def test_connecticut_exactly_at_the_cap_counts_as_capped() -> None:
+    """The boundary belongs to the side where the statute decides."""
+    got = gpb.resolve_gross_receipts("CT", 4.492, _spot(gpb.CT_PGET_CAP_USD))
+    assert got.exact is True
+
+
+@pytest.mark.parametrize(
+    ("state", "rate"),
+    [("DE", gpb.DE_HSCA_RATE), ("OH", gpb.OH_PAT_RATE)],
+)
+def test_wholesale_states_scale_with_the_benchmark(
+    state: str, rate: float
+) -> None:
+    """Neither has a cap, so the benchmark carries the whole figure."""
+    got = gpb.resolve_gross_receipts(state, 4.4, _spot(3.2))
+    assert got.usd_per_gal == round(rate * 3.2, 4)
+    assert got.exact is False
+
+
+@pytest.mark.parametrize("state", ["CT", "DE", "OH"])
+def test_wholesale_states_without_a_benchmark_are_refused(
+    state: str,
+) -> None:
+    """A missing benchmark must fail, not silently price the tax at zero."""
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.resolve_gross_receipts(state, 4.4, None)
+    assert state in str(caught.value)
+
+
+def test_spot_uses_the_newest_month_that_has_closed() -> None:
+    """A month still running has no settled average to quote."""
+    months = {"2026-07": 3.222, "2026-08": 3.213, "2026-09": 3.4}
+    got = gpb.select_spot(months, date(2026, 9, 17), "EER_TEST")
+    assert got.year_month == "2026-08"
+
+
+def test_spot_series_gone_quiet_fails_the_run() -> None:
+    """A series nobody updates keeps answering with its last month."""
+    months = {"2026-01": 2.063}
+    target = date(2026, 1, 1) + timedelta(days=gpb.EIA_SPOT_STALE_DAYS + 1)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.select_spot(months, target, "EER_TEST")
+    assert "has stopped" in str(caught.value)
+
+
+def test_spot_at_the_freshness_limit_still_answers() -> None:
+    """Pins the constant itself, not merely some value far inside it."""
+    months = {"2026-01": 2.063}
+    target = date(2026, 1, 1) + timedelta(days=gpb.EIA_SPOT_STALE_DAYS)
+    assert gpb.select_spot(months, target, "EER_TEST").year_month == "2026-01"
+
+
+def test_spot_target_before_the_series_starts_is_reported() -> None:
+    """A backfill reaching past the published history must not guess."""
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.select_spot({"2026-08": 3.2}, date(2020, 1, 1), "EER_TEST")
+    assert "starts at" in str(caught.value)
+
+
+def test_spot_values_arrive_quoted_and_are_still_numbers() -> None:
+    """The API quotes its numbers; a string must not read as no data."""
+    with patch.object(
+        gpb,
+        "_http_bytes",
+        autospec=True,
+        return_value=_spot_payload({"2026-08": "3.213"}),
+    ):
+        got = gpb.load_spot_series("EER_TEST", "key")
+    assert got == {"2026-08": 3.213}
+
+
+def test_spot_months_without_a_price_are_skipped() -> None:
+    """The API sends null for a month it has no price for."""
+    with patch.object(
+        gpb,
+        "_http_bytes",
+        autospec=True,
+        return_value=_spot_payload({"2026-07": None, "2026-08": "3.213"}),
+    ):
+        got = gpb.load_spot_series("EER_TEST", "key")
+    assert got == {"2026-08": 3.213}
+
+
+def test_spot_response_that_is_not_the_expected_shape_is_reported() -> None:
+    """An error body answering 200 must not read as an empty series."""
+    with (
+        patch.object(
+            gpb, "_http_bytes", autospec=True, return_value=b"<html>502</html>"
+        ),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb.load_spot_series("EER_TEST", "key")
+    assert "expected shape" in str(caught.value)
+
+
+def test_spot_response_with_no_priced_months_is_reported() -> None:
+    """A series that returns rows but no prices is still unusable."""
+    with (
+        patch.object(
+            gpb,
+            "_http_bytes",
+            autospec=True,
+            return_value=_spot_payload({"2026-08": None}),
+        ),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb.load_spot_series("EER_TEST", "key")
+    assert "no priced months" in str(caught.value)
+
+
+def test_missing_api_key_names_the_file_and_the_registration(
+    tmp_path: Path,
+) -> None:
+    """A run without the key fails rather than skipping four states."""
+    with (
+        patch.object(gpb, "EIA_API_KEY_PATH", tmp_path / "absent"),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb.load_eia_api_key()
+    assert "absent" in str(caught.value)
+    assert "opendata/register" in str(caught.value)
+
+
+def test_empty_api_key_is_reported(tmp_path: Path) -> None:
+    """An empty file is as unusable as a missing one, and quieter."""
+    key = tmp_path / "eia-api-key"
+    key.write_text("\n")
+    with (
+        patch.object(gpb, "EIA_API_KEY_PATH", key),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb.load_eia_api_key()
+    assert "is empty" in str(caught.value)
+
+
+def test_api_key_is_stripped_of_surrounding_whitespace(
+    tmp_path: Path,
+) -> None:
+    """A key file written by an editor carries a trailing newline."""
+    key = tmp_path / "eia-api-key"
+    key.write_text("  abc123  \n")
+    with patch.object(gpb, "EIA_API_KEY_PATH", key):
+        assert gpb.load_eia_api_key() == "abc123"
+
+
+def test_api_key_never_reaches_the_error_text(tmp_path: Path) -> None:
+    """A failure must not put the secret into a log or a traceback."""
+    key = tmp_path / "eia-api-key"
+    key.write_text("SECRETKEYVALUE")
+    with (
+        patch.object(gpb, "EIA_API_KEY_PATH", key),
+        patch.object(
+            gpb, "_http_bytes", autospec=True, return_value=b"<html>502</html>"
+        ),
+        pytest.raises(gpb.SnapshotError) as caught,
+    ):
+        gpb.load_spot_series("EER_TEST", gpb.load_eia_api_key())
+    assert "SECRETKEYVALUE" not in str(caught.value)
 
 
 # ---------------------------------------------------------------------------
