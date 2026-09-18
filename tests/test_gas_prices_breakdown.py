@@ -971,7 +971,7 @@ def test_tax_state_names_survive_footnotes_and_change_markers(
     ws = wb.create_sheet("July 2026")
     ws.append(["Federal", 0.183, 0.001, None, 0.184])
     for name, code in sorted(gpb.STATE_CODE.items()):
-        decorated = {"CA": f"{name}[4]  ", "OH": f"* {name} "}.get(name, name)
+        decorated = {"CA": f"{name}[4]  ", "OH": f"* {name} "}.get(code, name)
         ws.append([decorated, None, None, 0.30 if code != "CA" else 0.7364])
     wb.save(book)
     period = gpb._read_tax_periods(book)[0]
@@ -1364,8 +1364,8 @@ def test_indiana_with_both_suspended_keeps_only_the_inspection_fee() -> None:
     [
         (date(2026, 4, 7), False, False),
         (date(2026, 4, 8), False, True),
-        (date(2026, 6, 6), False, True),
-        (date(2026, 6, 7), True, True),
+        (date(2026, 5, 5), False, True),
+        (date(2026, 5, 6), True, True),
         (date(2026, 10, 5), True, True),
     ],
     ids=["day_before", "gut_starts", "gut_only", "excise_starts", "last_day"],
@@ -1381,17 +1381,17 @@ def test_indiana_suspension_windows_are_inclusive_at_both_ends(
 
 def test_indiana_past_the_checked_window_is_refused() -> None:
     """A lapsed suspension and an extended one look identical here."""
-    day = gpb.IN_SUSPENSION_CHECKED_THROUGH + timedelta(days=1)
+    day = gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH + timedelta(days=1)
     with pytest.raises(gpb.SnapshotError) as caught:
-        gpb.resolve_indiana_tax(day, 0.37, _gut(0.239))
-    assert "only verified through" in str(caught.value)
-    assert gpb.IN_SUSPENSION_NOTICE_URL in str(caught.value)
+        gpb.assert_adjustments_cover(day)
+    assert "swept only for" in str(caught.value)
 
 
 def test_indiana_on_the_last_checked_day_still_answers() -> None:
     """Pins the constant itself, not merely some value inside it."""
+    gpb.assert_adjustments_cover(gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH)
     got = gpb.resolve_indiana_tax(
-        gpb.IN_SUSPENSION_CHECKED_THROUGH, 0.37, _gut(0.239)
+        gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH, 0.37, _gut(0.239)
     )
     assert got.total == gpb.IN_OIL_INSPECTION_FEE
 
@@ -1404,6 +1404,69 @@ def test_indiana_suspension_windows_are_ordered_and_disjoint() -> None:
             assert end < start
 
 
+def test_every_shipped_override_is_inside_the_swept_range() -> None:
+    """A window reaching past the sweep would be trusted unverified."""
+    for entry in gpb.STATE_TAX_ADJUSTMENTS:
+        assert entry.start >= gpb.TAX_ADJUSTMENTS_CHECKED_FROM
+        assert entry.end <= gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH or (
+            entry.end.year >= gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH.year
+        )
+
+
+def test_overrides_do_not_overlap_within_a_state() -> None:
+    """Two windows on one state would make the one reported arbitrary."""
+    by_state: dict[str, list[gpb.TaxAdjustment]] = {}
+    for entry in gpb.STATE_TAX_ADJUSTMENTS:
+        by_state.setdefault(entry.state, []).append(entry)
+    for entries in by_state.values():
+        entries.sort(key=lambda e: e.start)
+        for earlier, later in itertools.pairwise(entries):
+            assert earlier.end < later.start
+
+
+def test_every_override_is_a_reduction_with_an_authority() -> None:
+    """A positive figure would be a rate rise, which the table carries."""
+    for entry in gpb.STATE_TAX_ADJUSTMENTS:
+        assert entry.usd_per_gal < 0
+        assert entry.authority
+        assert entry.source_url.startswith("https://")
+        assert entry.state in gpb.STATE_CODE.values()
+
+
+@pytest.mark.parametrize(
+    ("state", "day", "expected"),
+    [
+        ("GA", date(2026, 3, 19), None),
+        ("GA", date(2026, 3, 20), -0.333),
+        ("GA", date(2026, 6, 2), -0.333),
+        ("GA", date(2026, 6, 3), None),
+        ("KY", date(2026, 5, 11), -0.10),
+        ("KY", date(2026, 7, 1), None),
+        ("UT", date(2026, 7, 1), -0.06),
+        ("IL", date(2026, 7, 1), -0.013),
+        ("TX", date(2026, 7, 1), None),
+    ],
+    ids=lambda v: str(v),
+)
+def test_override_windows_are_inclusive_at_both_ends(
+    state: str, day: date, expected: float | None
+) -> None:
+    """A window off by a day mis-prices a whole snapshot."""
+    got = gpb.adjustment_on(state, day)
+    assert (got.usd_per_gal if got else None) == expected
+
+
+def test_a_date_outside_the_sweep_is_refused_in_both_directions() -> None:
+    """A date nobody swept and a date with no override look the same."""
+    for day in (
+        gpb.TAX_ADJUSTMENTS_CHECKED_FROM - timedelta(days=1),
+        gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH + timedelta(days=1),
+    ):
+        with pytest.raises(gpb.SnapshotError) as caught:
+            gpb.assert_adjustments_cover(day)
+        assert "swept only for" in str(caught.value)
+
+
 def test_indiana_checked_through_covers_every_shipped_window() -> None:
     """A window reaching past the check would be trusted unverified."""
     ends = [
@@ -1411,7 +1474,7 @@ def test_indiana_checked_through_covers_every_shipped_window() -> None:
         for windows in (gpb.IN_EXCISE_SUSPENSIONS, gpb.IN_GUT_SUSPENSIONS)
         for _, end, _ in windows
     ]
-    assert max(ends) <= gpb.IN_SUSPENSION_CHECKED_THROUGH
+    assert max(ends) <= gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH
 
 
 def test_tax_sheet_carries_the_excise_column_for_indiana(
@@ -1428,6 +1491,9 @@ def test_tax_sheet_carries_the_excise_column_for_indiana(
 # ---------------------------------------------------------------------------
 
 
+DAY = date(2026, 9, 17)
+
+
 def _spot(usd: float, year_month: str = "2026-08") -> gpb.SpotQuote:
     return gpb.SpotQuote(year_month, usd, "EER_TEST")
 
@@ -1437,26 +1503,24 @@ def _spot_payload(months: dict[str, object]) -> bytes:
     return json.dumps({"response": {"data": rows}}).encode()
 
 
-def test_hawaii_is_a_share_of_the_pump_price(tmp_path: Path) -> None:
+def test_hawaii_is_a_share_of_the_pump_price() -> None:
     """The tax lands on gross income, and the pump price is that income."""
-    del tmp_path
-    got = gpb.resolve_gross_receipts("HI", 5.484, None)
+    got = gpb.resolve_gross_receipts("HI", DAY, 5.484, None)
     assert got.usd_per_gal == round(gpb.HI_GET_RATE * 5.484, 4)
     assert got.exact is True
 
 
 def test_connecticut_above_the_cap_is_the_statutory_constant() -> None:
     """Rack sits above spot, so a spot at the cap proves the cap binds."""
-    got = gpb.resolve_gross_receipts("CT", 4.492, _spot(3.213))
+    got = gpb.resolve_gross_receipts("CT", DAY, 4.492, _spot(3.213))
     assert got.usd_per_gal == round(gpb.CT_PGET_RATE * gpb.CT_PGET_CAP_USD, 4)
     assert got.exact is True
     assert "cap" in got.basis
 
 
-def test_connecticut_below_the_cap_is_an_estimate(tmp_path: Path) -> None:
+def test_connecticut_below_the_cap_is_an_estimate() -> None:
     """Under the cap the benchmark does real work, so it is not exact."""
-    del tmp_path
-    got = gpb.resolve_gross_receipts("CT", 4.492, _spot(2.063, "2026-01"))
+    got = gpb.resolve_gross_receipts("CT", DAY, 4.492, _spot(2.063, "2026-01"))
     assert got.usd_per_gal == round(gpb.CT_PGET_RATE * 2.063, 4)
     assert got.exact is False
     assert "2026-01" in got.basis
@@ -1464,19 +1528,21 @@ def test_connecticut_below_the_cap_is_an_estimate(tmp_path: Path) -> None:
 
 def test_connecticut_exactly_at_the_cap_counts_as_capped() -> None:
     """The boundary belongs to the side where the statute decides."""
-    got = gpb.resolve_gross_receipts("CT", 4.492, _spot(gpb.CT_PGET_CAP_USD))
+    got = gpb.resolve_gross_receipts(
+        "CT", DAY, 4.492, _spot(gpb.CT_PGET_CAP_USD)
+    )
     assert got.exact is True
 
 
 @pytest.mark.parametrize(
     ("state", "rate"),
-    [("DE", gpb.DE_HSCA_RATE), ("OH", gpb.OH_PAT_RATE)],
+    [("DE", gpb.select_de_hsca_rate(DAY)), ("OH", gpb.OH_PAT_RATE)],
 )
 def test_wholesale_states_scale_with_the_benchmark(
     state: str, rate: float
 ) -> None:
     """Neither has a cap, so the benchmark carries the whole figure."""
-    got = gpb.resolve_gross_receipts(state, 4.4, _spot(3.2))
+    got = gpb.resolve_gross_receipts(state, DAY, 4.4, _spot(3.2))
     assert got.usd_per_gal == round(rate * 3.2, 4)
     assert got.exact is False
 
@@ -1487,15 +1553,15 @@ def test_wholesale_states_without_a_benchmark_are_refused(
 ) -> None:
     """A missing benchmark must fail, not silently price the tax at zero."""
     with pytest.raises(gpb.SnapshotError) as caught:
-        gpb.resolve_gross_receipts(state, 4.4, None)
+        gpb.resolve_gross_receipts(state, DAY, 4.4, None)
     assert state in str(caught.value)
 
 
-def test_spot_uses_the_newest_month_that_has_closed() -> None:
-    """A month still running has no settled average to quote."""
-    months = {"2026-07": 3.222, "2026-08": 3.213, "2026-09": 3.4}
+def test_spot_uses_the_newest_month_already_published() -> None:
+    """A month closes, then lands weeks later; only then is it usable."""
+    months = {"2026-06": 3.037, "2026-07": 3.222, "2026-08": 3.213}
     got = gpb.select_spot(months, date(2026, 9, 17), "EER_TEST")
-    assert got.year_month == "2026-08"
+    assert got.year_month == "2026-07"
 
 
 def test_spot_series_gone_quiet_fails_the_run() -> None:
@@ -1607,19 +1673,36 @@ def test_api_key_is_stripped_of_surrounding_whitespace(
         assert gpb.load_eia_api_key() == "abc123"
 
 
-def test_api_key_never_reaches_the_error_text(tmp_path: Path) -> None:
-    """A failure must not put the secret into a log or a traceback."""
-    key = tmp_path / "eia-api-key"
-    key.write_text("SECRETKEYVALUE")
+def test_api_key_never_reaches_the_url(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The URL reaches the retry log and the error text; the key must not.
+
+    This drives the real transport helper rather than the layer above
+    it, because that layer is exactly where a query-string key would
+    leak -- mocking it would make this test green against code that
+    leaks.
+    """
+    seen: list[tuple[str, dict[str, str] | None]] = []
+
+    def _fail(url: str, headers: dict[str, str] | None = None) -> bytes:
+        seen.append((url, headers))
+        raise TimeoutError("timed out")
+
     with (
-        patch.object(gpb, "EIA_API_KEY_PATH", key),
         patch.object(
-            gpb, "_http_bytes", autospec=True, return_value=b"<html>502</html>"
+            gpb, "_http_bytes_once", autospec=True, side_effect=_fail
         ),
-        pytest.raises(gpb.SnapshotError) as caught,
+        caplog.at_level("WARNING"),
+        pytest.raises(gpb.FetchError) as caught,
     ):
-        gpb.load_spot_series("EER_TEST", gpb.load_eia_api_key())
+        gpb.load_spot_series("EER_TEST", "SECRETKEYVALUE")
+    assert seen, "the transport helper was never reached"
+    for url, headers in seen:
+        assert "SECRETKEYVALUE" not in url
+        assert (headers or {})["X-Api-Key"] == "SECRETKEYVALUE"
     assert "SECRETKEYVALUE" not in str(caught.value)
+    assert "SECRETKEYVALUE" not in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -1770,7 +1853,7 @@ def _add_snapshot_sources(
             gpb,
             "load_spot_series",
             autospec=True,
-            return_value={"2026-08": 3.213},
+            return_value={"2026-06": 3.037, "2026-07": 3.222},
         ),
     ):
         yield
@@ -1794,6 +1877,7 @@ def test_add_snapshot_round_trip_splices_a_built_block_in(
     assert 'date: "2026-09-17"' in blocks[0]
     assert blocks[1] == baseline
     assert gpb.PASSTHROUGH_NOTES_MARKER in blocks[0]
+    assert gpb.STATE_TAX_NOTES_MARKER in blocks[0]
     assert "Argus via Neste monitor" in blocks[0]
 
 
@@ -1839,6 +1923,8 @@ def test_add_snapshot_takes_the_federal_rate_from_the_table(
         gpb.main(["add-snapshot", str(html), "--target", "2026-09-17"])
     built = gpb.parse_snapshots(html.read_text()).blocks[0]
     assert "federalExcise: 0.1840," in built
+    assert 'federalSource: "https://example.invalid/fueltaxes.xlsx"' in built
+    assert 'federalVintage: "Federal excise and LUST fee' in built
 
 
 def test_add_snapshot_composes_indiana_rather_than_taking_the_total(
@@ -1876,15 +1962,23 @@ def test_add_snapshot_adds_back_a_gross_receipts_tax(
 def _migrate_sources(period: gpb.TaxPeriod | None = None) -> Iterator[None]:
     """Stub the three series the migration downloads once per run."""
     chosen = period or _tax_period()
+    # Two editions, so a snapshot from either half-year resolves.
+    earlier = _tax_period(period=date(2026, 1, 1), rate=0.30)
     with (
         patch.object(
-            gpb, "load_tax_periods", autospec=True, return_value=[chosen]
+            gpb,
+            "load_tax_periods",
+            autospec=True,
+            return_value=[earlier, chosen],
         ),
         patch.object(
             gpb,
             "load_in_gut_rates",
             autospec=True,
-            return_value={date(2026, 9, 1): 0.239},
+            return_value={
+                date(2026, 5, 1): 0.233,
+                date(2026, 9, 1): 0.239,
+            },
         ),
         patch.object(
             gpb, "load_eia_api_key", autospec=True, return_value="key"
@@ -1893,7 +1987,12 @@ def _migrate_sources(period: gpb.TaxPeriod | None = None) -> Iterator[None]:
             gpb,
             "load_spot_series",
             autospec=True,
-            return_value={"2026-08": 3.213},
+            return_value={
+                "2026-02": 2.081,
+                "2026-03": 2.952,
+                "2026-06": 3.037,
+                "2026-07": 3.222,
+            },
         ),
     ):
         yield
@@ -1912,9 +2011,18 @@ def test_migrate_leaves_retail_and_nontax_exactly_as_captured(
 ) -> None:
     """Neither column can be re-derived, so neither may be disturbed."""
     block = _snapshot_block("2026-09-17", CODES)
-    before = gpb._captured_columns(block)
+    before = gpb._captured_columns(gpb.extract_data_block(block), len(CODES))
     built = gpb.parse_snapshots(_migrated(tmp_path, block)).blocks[0]
-    assert gpb._captured_columns(built) == before
+    after = gpb._captured_columns(gpb.extract_data_block(built), len(CODES))
+    assert after == before
+
+
+def test_captured_columns_refuses_a_block_it_cannot_fully_read() -> None:
+    """A guard built from a pattern must not fail open on a lost row."""
+    body = gpb.extract_data_block(_snapshot_block("2026-09-17", CODES))
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._captured_columns(body, len(CODES) + 1)
+    assert "would not see a lost row" in str(caught.value)
 
 
 def test_migrate_drops_the_ad_valorem_field(tmp_path: Path) -> None:
@@ -1946,6 +2054,91 @@ def test_migrate_restates_only_the_state_tax_sentence(
     assert text.index(gpb.STATE_TAX_NOTES_MARKER) < text.index(
         gpb.PASSTHROUGH_NOTES_MARKER
     )
+
+
+def test_migrate_restates_the_state_tax_total(tmp_path: Path) -> None:
+    """The thing the command exists for; without this the rest is vacuous."""
+    built = _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
+    block = gpb.parse_snapshots(built).blocks[0]
+    texas = next(
+        c for code, c in gpb.split_state_blocks(block) if code == "TX"
+    )
+    assert "fixed:{ total:0.3000," in texas
+    assert "total:0.1000" not in block
+
+
+def test_migrate_composes_indiana_and_applies_its_suspension(
+    tmp_path: Path,
+) -> None:
+    """Indiana is the headline case and needs its own migration test."""
+    built = _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
+    block = gpb.parse_snapshots(built).blocks[0]
+    indiana = next(
+        c for code, c in gpb.split_state_blocks(block) if code == "IN"
+    )
+    assert f"fixed:{{ total:{gpb.IN_OIL_INSPECTION_FEE:.4f}," in indiana
+    assert "Suspended" in indiana
+
+
+def test_migrate_applies_a_rate_override(tmp_path: Path) -> None:
+    """Georgia's excise holiday is larger than any pass-through here."""
+    built = _migrated(tmp_path, _snapshot_block("2026-05-21", CODES))
+    block = gpb.parse_snapshots(built).blocks[0]
+    georgia = next(
+        c for code, c in gpb.split_state_blocks(block) if code == "GA"
+    )
+    expected = round(0.30 - 0.333, 4)
+    assert f"fixed:{{ total:{expected:.4f}," in georgia
+    assert "HB 1199" in georgia
+
+
+def test_migrate_adds_back_a_gross_receipts_tax(tmp_path: Path) -> None:
+    """Connecticut's is a sixth of its corrected total."""
+    built = _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
+    block = gpb.parse_snapshots(built).blocks[0]
+    conn = next(c for code, c in gpb.split_state_blocks(block) if code == "CT")
+    expected = round(0.30 + gpb.CT_PGET_RATE * gpb.CT_PGET_CAP_USD, 4)
+    assert f"fixed:{{ total:{expected:.4f}," in conn
+
+
+def test_migrate_removes_the_stale_state_tax_sentence(
+    tmp_path: Path,
+) -> None:
+    """Leaving the old claim beside the new one is the falsehood at issue."""
+    built = _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
+    assert "inherited from a baseline" not in built
+
+
+def test_migrate_refuses_notes_that_keep_a_second_claim(
+    tmp_path: Path,
+) -> None:
+    """A sentence after the pass-through section must not survive."""
+    block = _snapshot_block("2026-09-17", CODES).replace(
+        "State taxes (cols 3-4) inherited from a baseline. ", ""
+    )
+    block = block.replace(
+        "($84.75/MT).",
+        "($84.75/MT). State taxes inherited from a baseline.",
+    )
+    html = tmp_path / "page.html"
+    html.write_text(_page(block))
+    with _backups_under(tmp_path), _migrate_sources():
+        assert gpb.main(["migrate-state-tax", str(html)]) == 1
+
+
+def test_migrate_refuses_a_half_restated_federal_row(
+    tmp_path: Path,
+) -> None:
+    """A silently skipped field would bake the wrong figure in for good."""
+    block = _snapshot_block("2026-09-17", CODES).replace(
+        '  federalVintage: "Unchanged since 1993.",\n', ""
+    )
+    html = tmp_path / "page.html"
+    html.write_text(_page(block))
+    before = html.read_text()
+    with _backups_under(tmp_path), _migrate_sources():
+        assert gpb.main(["migrate-state-tax", str(html)]) == 1
+    assert html.read_text() == before
 
 
 def test_migrate_is_idempotent(tmp_path: Path) -> None:

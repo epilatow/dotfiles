@@ -30,7 +30,7 @@ Subcommands:
 Data sources:
   Fetched live: AAA state-averages (retail), EIA's federal and state
   motor fuel tax table, Indiana's gasoline use tax notice, EIA spot
-  benchmarks (see GROSS_RECEIPTS_STATES for what they price), the daily
+  benchmarks (see EIA_SPOT_SERIES for what they price), the daily
   California LCFS credit assessment (see LCFS_MONITOR_URL for why it is
   not CARB's own series), Oregon DEQ CFP credit-transfer xlsx. Each
   carries a freshness bound; a run fails rather than publish a figure
@@ -41,11 +41,15 @@ Data sources:
   settlements (WA_CCA_AUCTIONS). A run fails rather than publish from a
   table whose newest entry is older than CCA_STALE_DAYS.
 
-  Hand-maintained and checked by date rather than by age: the Indiana
-  tax suspension windows. A published rate table says what a tax is,
-  not whether it is being collected, so the windows come from the
-  department's notices and a run past IN_SUSPENSION_CHECKED_THROUGH
-  fails rather than assume a suspension has lapsed.
+  Hand-maintained and checked by date rather than by age: the tax
+  suspensions, holidays and reductions (STATE_TAX_ADJUSTMENTS, plus
+  IN_EXCISE_SUSPENSIONS and IN_GUT_SUSPENSIONS for the one state whose
+  two taxes were suspended separately), and Delaware's annually reset
+  gross-receipts rate (DE_HSCA_RATES). A published rate table says what
+  a tax is, not whether anyone is collecting it, and its notes are not
+  a reliable index of the difference, so these are swept for directly.
+  A run outside TAX_ADJUSTMENTS_CHECKED_FROM..THROUGH fails rather than
+  assert that no override was in force.
 
   The EIA spot benchmarks need an API key, read at run time from
   EIA_API_KEY_PATH. The tax table itself does not.
@@ -239,11 +243,20 @@ OR_CFP_URL = (
 # series -- measured across the shipped history, 22 states changed twice
 # or fewer since 2015 and 11 never changed.
 #
-# The exceptions are states that adjust faster than the sheets appear.
-# Kentucky and New Jersey read as quarterly in the table's own notes but
-# move only in July and only on January 1 respectively, so the sheets
-# still land them exactly. Indiana genuinely recalculates monthly, which
-# is why it is sourced from the state instead.
+# The sheets are exact only where a statutory date lands on one of
+# them, which is the common case but not the rule. Three ways it breaks,
+# all of them present in the shipped history:
+#
+#   - A state adjusts on a date between editions. New Jersey moved on
+#     October 1 under its pre-2024 law, and the table restates it only
+#     at the January edition, so the July sheet is wrong for that
+#     quarter in those years.
+#   - A state recalculates faster than the table is published. Indiana
+#     resets its use tax monthly, which is why it is sourced from the
+#     state instead.
+#   - A legislature or governor overrides the rate mid-period. See
+#     STATE_TAX_ADJUSTMENTS; the table publishes what a rate is, not
+#     whether it is being collected.
 EIA_FUELTAXES_URL = (
     "https://www.eia.gov/petroleum/marketing/monthly/xls/fueltaxes.xlsx"
 )
@@ -273,30 +286,108 @@ IN_GUT_STALE_DAYS = 70
 # suspended, and it is the residual that makes EIA's Indiana columns
 # reconcile: their "other" is the previous month's use tax plus this.
 IN_OIL_INSPECTION_FEE = 0.01
+IN_OIL_INSPECTION_SOURCE_URL = (
+    "https://law.justia.com/codes/indiana/title-16/article-44/chapter-2/"
+)
+IN_EXCISE_SOURCE_URL = (
+    "https://www.in.gov/dor/business-tax/fuel-tax/gasoline-tax/"
+)
 
-# Governors suspend fuel taxes by executive order, and no rate table
-# reflects it -- EIA published Indiana at 64.5 cents for a July 2026 on
-# which both of these were suspended, because it publishes statutory
-# rates rather than what is being collected. So the windows are tracked
-# here, from the department's own notices.
+# Legislatures and governors override published rates, and no rate table
+# reflects it: EIA published Indiana at 64.5 cents for a July 2026 on
+# which both its taxes were suspended, and Georgia at its full 34.05
+# cents through an eleven-week excise holiday. EIA publishes what a tax
+# is, not whether anyone is collecting it.
 #
-# Each entry is (start, end inclusive, authority). Indiana ran its use
-# tax suspension continuously across five orders; the earlier
-# 2026-05-06 order reached the excise only for gasoline delivered to
-# marina facilities, which is not a pump-level suspension and is
-# therefore not one of these windows.
+# Its notes are not a reliable index of these either -- they carried
+# Kentucky's executive order and said nothing about Indiana's, Georgia's,
+# Utah's or Illinois's. So the windows are swept for directly, from the
+# enacting instrument or the taxing agency, and recorded here.
+#
+# Indiana's are per-component rather than a flat figure, because its use
+# tax is reset monthly and the two halves were suspended on different
+# dates. Each entry is (start, end inclusive, authority).
 IN_EXCISE_SUSPENSIONS: list[tuple[date, date, str]] = [
-    (date(2026, 6, 7), date(2026, 10, 5), "EO 26-13, 26-16, 26-25-1"),
+    (date(2026, 5, 6), date(2026, 10, 5), "EO 26-11 through 26-25-1"),
 ]
 IN_GUT_SUSPENSIONS: list[tuple[date, date, str]] = [
     (date(2026, 4, 8), date(2026, 10, 5), "EO 26-09 through 26-25-1"),
 ]
-# A suspension that has lapsed and one that was quietly extended look
-# identical from here, so the tables carry how far a human has actually
-# checked rather than being trusted past their last known window. Move
-# this forward only after re-reading the department's notices.
-IN_SUSPENSION_CHECKED_THROUGH = date(2026, 10, 5)
-IN_SUSPENSION_NOTICE_URL = "https://www.in.gov/dor/files/reference/dn45.pdf"
+IN_SUSPENSION_NOTICE_URL = (
+    "https://www.in.gov/dor/i-am-a/business-corp/gasoline-use-tax/"
+)
+
+
+@dataclass(frozen=True)
+class TaxAdjustment:
+    """A legislative override of a published rate, for one window.
+
+    `usd_per_gal` is signed and added to the figure the tax table
+    publishes, so a suspension or holiday is negative. Every state but
+    Indiana resolves to one such figure; Indiana's two taxes were
+    suspended on different dates and its use tax moves monthly, so it is
+    composed from its parts instead.
+    """
+
+    state: str
+    start: date
+    end: date
+    usd_per_gal: float
+    authority: str
+    source_url: str
+
+
+STATE_TAX_ADJUSTMENTS: list[TaxAdjustment] = [
+    # Georgia suspended the excise under O.C.G.A. 48-9-3 outright. The
+    # underground storage tank fee is levied elsewhere and is not an
+    # excise, so it kept being collected.
+    TaxAdjustment(
+        state="GA",
+        start=date(2026, 3, 20),
+        end=date(2026, 6, 2),
+        usd_per_gal=-0.333,
+        authority="HB 1199, extended by EO 05.15.26.02",
+        source_url="https://dor.georgia.gov/"
+        "2026-suspension-georgia-motor-fuel-taxes-faqs",
+    ),
+    # Illinois froze the indexed increase that would have taken the
+    # excise to 49.6 cents, which is the figure the table publishes.
+    TaxAdjustment(
+        state="IL",
+        start=date(2026, 7, 1),
+        end=date(2026, 12, 31),
+        usd_per_gal=-0.013,
+        authority="PA 104-0468",
+        source_url="https://tax.illinois.gov/research/publications/"
+        "bulletins/fy-2026-23.html",
+    ),
+    TaxAdjustment(
+        state="KY",
+        start=date(2026, 5, 11),
+        end=date(2026, 6, 30),
+        usd_per_gal=-0.10,
+        authority="EO 2026-235",
+        source_url="https://revenue.ky.gov/Business/Motor-Fuels-Tax/"
+        "Pages/default.aspx",
+    ),
+    TaxAdjustment(
+        state="UT",
+        start=date(2026, 7, 1),
+        end=date(2026, 12, 31),
+        usd_per_gal=-0.06,
+        authority="HB 575",
+        source_url="https://le.utah.gov/~2026/bills/static/HB0575.html",
+    ),
+]
+
+# A window that lapsed and one that was quietly extended look identical
+# from here, and Indiana's was extended five times. So the tables carry
+# how far a human has actually swept rather than being trusted past
+# their last known window, in either direction: a snapshot outside the
+# checked range fails rather than assert that no override was in force.
+# Move these only after re-sweeping.
+TAX_ADJUSTMENTS_CHECKED_FROM = date(2026, 1, 1)
+TAX_ADJUSTMENTS_CHECKED_THROUGH = date(2026, 10, 5)
 
 # EIA's table is explicit that its rates exclude "any state taxes based
 # on gross or net receipts", which drops four real per-gallon costs:
@@ -309,6 +400,14 @@ IN_SUSPENSION_NOTICE_URL = "https://www.in.gov/dor/files/reference/dn45.pdf"
 # are levied on the first sale into the state, which is a wholesale
 # price nobody publishes per state any more -- EIA's own refiner series
 # ended in March 2022 -- so they are taken against a spot benchmark.
+# Delaware recalculates its rate every January 1 from a lookback
+# formula, so unlike the other three these are dated and the run fails
+# rather than price a year nobody entered. Each entry is
+# (effective from, rate).
+DE_HSCA_RATES: list[tuple[date, float]] = [
+    (date(2025, 1, 1), 0.01120),
+    (date(2026, 1, 1), 0.011902),
+]
 CT_PGET_RATE = 0.081
 # Gross earnings from the first sale of gasoline are capped at $3.00 a
 # gallon by CGS 12-587(a)(4), so above that the tax is a constant 24.3
@@ -316,8 +415,10 @@ CT_PGET_RATE = 0.081
 # quote at or over the cap proves the cap binds; below it the benchmark
 # is doing real work and understates, since it omits the rack margin.
 CT_PGET_CAP_USD = 3.00
-DE_HSCA_RATE = 0.011902
 OH_PAT_RATE = 0.0065
+# Hawaii's state rate. All four counties add a 0.5% surcharge on top,
+# which this page excludes along with every other county and local levy,
+# so the figure is the state's alone and is labelled as such.
 HI_GET_RATE = 0.04
 
 # Spot benchmarks standing in for the rack price each tax is levied on:
@@ -341,9 +442,15 @@ GROSS_RECEIPTS_SOURCE_URLS = {
     "petroleum-activity-tax/",
 }
 GROSS_RECEIPTS_STATES = tuple(sorted(GROSS_RECEIPTS_SOURCE_URLS))
-# The series is monthly and lands a few weeks after the month closes, so
-# the quote in force is legitimately up to ~60 days behind the snapshot.
-EIA_SPOT_STALE_DAYS = 100
+# The series is monthly and lands a few weeks after the month closes,
+# so month M is treated as knowable from the first day of M+2 -- the
+# same shape as the Oregon CFP lag, and what keeps a backfill from
+# reaching for a figure nobody had published on the date it describes.
+EIA_SPOT_PUBLICATION_LAG_MONTHS = 2
+# Age is measured from the selected month's first day, so with that lag
+# the quote in force legitimately runs ~90 days behind. The limit sits
+# well past it, far enough to tell a late month from a stopped series.
+EIA_SPOT_STALE_DAYS = 150
 # EIA requires a key for its API but not for the tax workbook. It is
 # read from disk at run time so it stays out of the repo and out of the
 # page; a run without it fails rather than quietly skipping the states
@@ -499,8 +606,13 @@ def _retryable(exc: Exception) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _http_bytes_once(url: str) -> bytes:
-    """GET `url` and return the decompressed response body."""
+def _http_bytes_once(url: str, headers: dict[str, str] | None = None) -> bytes:
+    """GET `url` and return the decompressed response body.
+
+    `headers` carries anything the caller must send but must not put in
+    the URL -- credentials above all, since the URL reaches the logs and
+    the error text and the header never does.
+    """
     req = urllib.request.Request(
         url,
         headers={
@@ -511,6 +623,7 @@ def _http_bytes_once(url: str) -> bytes:
             ),
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip",
+            **(headers or {}),
         },
     )
     with urllib.request.urlopen(req, timeout=60) as resp:
@@ -520,17 +633,19 @@ def _http_bytes_once(url: str) -> bytes:
     return body
 
 
-def _http_bytes(url: str) -> bytes:
+def _http_bytes(url: str, headers: dict[str, str] | None = None) -> bytes:
     """GET `url`, retrying transient failures, and return the body.
 
     Raises `FetchError` once the attempts are spent, or immediately for
     a failure that describes the request rather than the connection.
+    Both the log line and the error text carry `url`, so a credential
+    belongs in `headers` and never in the query string.
     """
     attempt = 0
     while True:
         attempt += 1
         try:
-            return _http_bytes_once(url)
+            return _http_bytes_once(url, headers)
         except TRANSIENT_ERRORS as exc:
             if not _retryable(exc):
                 raise FetchError(f"GET {url}: {_describe(exc)}") from exc
@@ -974,27 +1089,49 @@ def _suspended_on(
     return None
 
 
+def assert_adjustments_cover(day: date) -> None:
+    """Refuse a date the override sweep has not reached.
+
+    An override that lapsed and one that was quietly extended look the
+    same from here, and so do a date nobody swept and a date with no
+    override. Both directions fail rather than assert an absence the
+    tables cannot support.
+    """
+    if (
+        not TAX_ADJUSTMENTS_CHECKED_FROM
+        <= day
+        <= TAX_ADJUSTMENTS_CHECKED_THROUGH
+    ):
+        raise SnapshotError(
+            f"tax overrides: swept only for "
+            f"{TAX_ADJUSTMENTS_CHECKED_FROM} to "
+            f"{TAX_ADJUSTMENTS_CHECKED_THROUGH}, so whether a rate was "
+            f"suspended or reduced on {day} is unknown; re-sweep before "
+            f"moving the bound"
+        )
+
+
+def adjustment_on(state: str, day: date) -> TaxAdjustment | None:
+    """Return the override in force for `state` on `day`, if any."""
+    for entry in STATE_TAX_ADJUSTMENTS:
+        if entry.state == state and entry.start <= day <= entry.end:
+            return entry
+    return None
+
+
 def resolve_indiana_tax(
     day: date, eia_excise: float, gut: InGutRate
 ) -> IndianaTax:
     """Compose Indiana's state tax for `day` from its three components.
 
-    Indiana is the one state the published tables cannot describe on
-    their own: its use tax is reset monthly rather than twice a year,
-    and its excise and use tax have both been suspended by executive
-    order for stretches no rate table reflects.
+    Indiana is the one state the published tables cannot describe as a
+    single figure: its use tax is reset monthly rather than twice a
+    year, and its two taxes were suspended from different dates, so an
+    override on the total could not express it.
 
-    Raises `SnapshotError` for a date past where the suspension windows
-    have been checked, since a lapsed suspension and an extended one are
-    indistinguishable from here.
+    The caller is responsible for `assert_adjustments_cover`; this
+    function trusts that the date is inside the swept range.
     """
-    if day > IN_SUSPENSION_CHECKED_THROUGH:
-        raise SnapshotError(
-            f"IN suspensions: windows are only verified through "
-            f"{IN_SUSPENSION_CHECKED_THROUGH}, so whether a tax is "
-            f"collected on {day} is unknown; re-read the department's "
-            f"notices at {IN_SUSPENSION_NOTICE_URL}"
-        )
     excise_by = _suspended_on(IN_EXCISE_SUSPENSIONS, day)
     gut_by = _suspended_on(IN_GUT_SUSPENSIONS, day)
     excise = 0.0 if excise_by else eia_excise
@@ -1058,10 +1195,12 @@ def load_spot_series(series: str, key: str) -> dict[str, float]:
             "sort[0][column]": "period",
             "sort[0][direction]": "desc",
             "length": "600",
-            "api_key": key,
         }
     )
-    raw = _http_bytes(f"{EIA_SPOT_API}?{query}")
+    # The key travels as a header, never in the query string: the URL
+    # reaches the retry log and the FetchError text, and this runs
+    # unattended with its stderr going to a log file.
+    raw = _http_bytes(f"{EIA_SPOT_API}?{query}", {"X-Api-Key": key})
     try:
         payload = json.loads(raw)
         rows = payload["response"]["data"]
@@ -1092,17 +1231,23 @@ def load_spot_series(series: str, key: str) -> dict[str, float]:
 def select_spot(
     months: dict[str, float], target: date, series: str
 ) -> SpotQuote:
-    """Return the newest spot month that had closed by `target`.
+    """Return the newest spot month that was published by `target`.
+
+    A month closes and is then published a few weeks later, so the
+    newest usable month is two behind the target rather than one; see
+    `EIA_SPOT_PUBLICATION_LAG_MONTHS`.
 
     Raises `SnapshotError` when the series does not reach back to
-    `target`, and when its newest closed month is too far behind to
+    `target`, and when its newest published month is too far behind to
     describe it.
     """
-    cutoff = f"{target.year:04d}-{target.month:02d}"
-    usable = [m for m in months if m < cutoff]
+    available = target.year * 12 + (target.month - 1)
+    available -= EIA_SPOT_PUBLICATION_LAG_MONTHS
+    cutoff = f"{available // 12:04d}-{available % 12 + 1:02d}"
+    usable = [m for m in months if m <= cutoff]
     if not usable:
         raise SnapshotError(
-            f"EIA spot {series}: no month closed before {target}; the "
+            f"EIA spot {series}: no month published by {target}; the "
             f"series starts at {min(months)}"
         )
     year_month = max(usable)
@@ -1119,8 +1264,31 @@ def select_spot(
     )
 
 
+def select_de_hsca_rate(day: date) -> float:
+    """Return Delaware's HSCA rate in force on `day`.
+
+    The rate is recalculated each January 1, so a year nobody entered
+    fails rather than silently reusing the last one -- the same reason
+    every other hand-maintained figure here carries a bound.
+    """
+    usable = [rate for start, rate in DE_HSCA_RATES if start <= day]
+    if not usable:
+        raise SnapshotError(
+            f"DE HSCA: no rate recorded for {day}; the table starts at "
+            f"{DE_HSCA_RATES[0][0]}"
+        )
+    newest = max(start for start, _ in DE_HSCA_RATES if start <= day)
+    if (day - newest).days > 400:
+        raise SnapshotError(
+            f"DE HSCA: newest recorded rate takes effect {newest}, over a "
+            f"year before {day}; Delaware resets it each January 1, so "
+            f"the table needs the intervening years"
+        )
+    return usable[-1]
+
+
 def resolve_gross_receipts(
-    state: str, retail: float, spot: SpotQuote | None
+    state: str, day: date, retail: float, spot: SpotQuote | None
 ) -> GrossReceiptsTax:
     """Return the gross-receipts tax the rate table omits for `state`.
 
@@ -1133,8 +1301,10 @@ def resolve_gross_receipts(
         return GrossReceiptsTax(
             state=state,
             usd_per_gal=amount,
-            label=f"General excise tax ({HI_GET_RATE:.1%} of retail)",
-            basis=f"{HI_GET_RATE:.1%} x ${retail:.3f} retail",
+            label=f"State general excise tax ({HI_GET_RATE:.1%} of retail)",
+            basis=f"{HI_GET_RATE:.1%} {TIMES} ${retail:.3f} retail; the "
+            f"0.5% county surcharge is excluded, as every county and "
+            f"local levy is",
             exact=True,
         )
     if spot is None:
@@ -1148,25 +1318,33 @@ def resolve_gross_receipts(
             label=f"Petroleum products gross earnings tax "
             f"({CT_PGET_RATE:.1%})",
             basis=(
-                f"{CT_PGET_RATE:.1%} x ${CT_PGET_CAP_USD:.2f} statutory cap"
+                f"{CT_PGET_RATE:.1%} {TIMES} ${CT_PGET_CAP_USD:.2f} "
+                f"statutory cap"
                 if capped
-                else f"{CT_PGET_RATE:.1%} x ${base:.3f} "
-                f"({spot.year_month} spot, below the "
-                f"${CT_PGET_CAP_USD:.2f} cap)"
+                else f"{CT_PGET_RATE:.1%} {TIMES} ${base:.3f}, the "
+                f"{spot.year_month} spot benchmark standing in for an "
+                f"unpublished rack price; below the "
+                f"${CT_PGET_CAP_USD:.2f} cap, so the benchmark carries "
+                f"the figure and it runs low"
             ),
             # Above the cap the benchmark drops out of the arithmetic, so
             # the figure is the statute's rather than an estimate.
             exact=capped,
         )
     rate, label = {
-        "DE": (DE_HSCA_RATE, "Hazardous substance cleanup act tax"),
+        "DE": (
+            select_de_hsca_rate(day),
+            "Hazardous substance cleanup act tax",
+        ),
         "OH": (OH_PAT_RATE, "Petroleum activity tax"),
     }[state]
     return GrossReceiptsTax(
         state=state,
         usd_per_gal=round(rate * spot.usd_per_gal, 4),
         label=f"{label} ({rate:.4%})",
-        basis=f"{rate:.4%} x ${spot.usd_per_gal:.3f} ({spot.year_month} spot)",
+        basis=f"{rate:.4%} {TIMES} ${spot.usd_per_gal:.3f}, the "
+        f"{spot.year_month} spot benchmark standing in for an "
+        f"unpublished rack price; spot runs below rack, so this is low",
         exact=False,
     )
 
@@ -1644,7 +1822,8 @@ def state_tax_notes(period: TaxPeriod, in_gut: InGutRate) -> str:
         f"{STATE_TAX_NOTES_MARKER}EIA federal and state motor fuel tax "
         f"table, {period.period} edition; IN composed from its excise, "
         f"oil inspection fee and {in_gut.month_start:%b %Y} gasoline use "
-        f"tax, with suspensions applied; CT, DE, HI and OH add the "
+        f"tax, with suspensions applied; "
+        f"{', '.join(GROSS_RECEIPTS_STATES)} add the "
         f"gross-receipts taxes that table excludes. "
     )
 
@@ -1725,12 +1904,21 @@ def build_wa_nontax(wa: AuctionSettlement) -> str:
 
 
 @dataclass(frozen=True)
+class TaxPart:
+    """One named component of a state's tax, as the page shows it."""
+
+    name: str
+    usd_per_gal: float
+    src: str
+    note: str
+
+
+@dataclass(frozen=True)
 class StateTax:
     """One state's per-gallon tax for a snapshot, with its provenance."""
 
-    code: str
     total: float
-    parts: tuple[tuple[str, float, str, str], ...]
+    parts: tuple[TaxPart, ...]
     as_of: str
 
 
@@ -1744,22 +1932,26 @@ def compose_state_tax(
 ) -> StateTax:
     """Resolve what one state charges per gallon on `day`.
 
-    Most states are the published table's own figure. Indiana is built
-    from its parts, because its use tax is reset monthly and both it and
-    the excise have been suspended by order. The four states whose
-    gross-receipts taxes the table excludes get them added back.
+    Most states are the published table's own figure, adjusted for any
+    override in force. Indiana is built from its parts instead, because
+    its use tax is reset monthly and its two taxes were suspended from
+    different dates. The four states whose gross-receipts taxes the
+    table excludes get them added back.
     """
+    assert_adjustments_cover(day)
     if code == "IN":
-        indiana = resolve_indiana_tax(day, period.excise["IN"], in_gut)
+        indiana = resolve_indiana_tax(day, _excise_of(period, "IN"), in_gut)
         parts = [
-            ("Gasoline excise", indiana.excise, period.source_url, ""),
-            (
+            TaxPart(
+                "Gasoline excise", indiana.excise, IN_EXCISE_SOURCE_URL, ""
+            ),
+            TaxPart(
                 "Oil inspection fee",
                 indiana.inspection_fee,
-                IN_SUSPENSION_NOTICE_URL,
+                IN_OIL_INSPECTION_SOURCE_URL,
                 "",
             ),
-            (
+            TaxPart(
                 f"Gasoline use tax ({in_gut.month_start:%b %Y})",
                 indiana.gut,
                 in_gut.source_url,
@@ -1768,16 +1960,17 @@ def compose_state_tax(
         ]
         note = "; ".join(indiana.suspended)
         if note:
-            parts.append(("Suspended", 0.0, IN_SUSPENSION_NOTICE_URL, note))
+            parts.append(
+                TaxPart("Suspended", 0.0, IN_SUSPENSION_NOTICE_URL, note)
+            )
         return StateTax(
-            code=code,
             total=indiana.total,
             parts=tuple(parts),
             as_of=in_gut.month_start.isoformat(),
         )
     base = period.per_state[code]
     parts = [
-        (
+        TaxPart(
             "State taxes and fees",
             base,
             period.source_url,
@@ -1788,37 +1981,66 @@ def compose_state_tax(
         )
     ]
     total = base
+    override = adjustment_on(code, day)
+    if override is not None:
+        total = round(total + override.usd_per_gal, 4)
+        parts.append(
+            TaxPart(
+                "Suspension or reduction",
+                override.usd_per_gal,
+                override.source_url,
+                f"{override.authority}, in force {override.start} to "
+                f"{override.end}; the published table carries the rate "
+                f"this overrides",
+            )
+        )
     if code in GROSS_RECEIPTS_STATES:
-        extra = resolve_gross_receipts(code, retail, spot.get(code))
+        extra = resolve_gross_receipts(code, day, retail, spot.get(code))
         total = round(total + extra.usd_per_gal, 4)
         parts.append(
-            (
+            TaxPart(
                 extra.label,
                 extra.usd_per_gal,
                 GROSS_RECEIPTS_SOURCE_URLS[code],
-                extra.basis
-                + (
-                    ""
-                    if extra.exact
-                    else "; estimated, the published table excludes it"
-                ),
+                extra.basis,
             )
         )
     return StateTax(
-        code=code,
         total=total,
         parts=tuple(parts),
         as_of=period.period.isoformat(),
     )
 
 
+def _excise_of(period: TaxPeriod, code: str) -> float:
+    """Read one state's excise, naming the gap when the sheet left it."""
+    try:
+        return period.excise[code]
+    except KeyError:
+        raise SnapshotError(
+            f"EIA tax: the {period.period} sheet leaves {code}'s excise "
+            f"blank, so its tax cannot be composed from parts"
+        ) from None
+
+
+def _js_string(text: str) -> str:
+    """Escape text for a double-quoted JavaScript string literal.
+
+    The page is JavaScript source, so a stray quote or backslash in an
+    authority label or a source URL would break parsing for the whole
+    array rather than just its own row.
+    """
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def build_fixed(tax: StateTax) -> str:
     """Render one state's tax as the page's `fixed` field."""
     rendered = ",\n".join(
-        f'      {{n:"{name}", v:{value:.4f}, src:"{src}"'
-        + (f', note:"{note}"' if note else "")
+        f'      {{n:"{_js_string(part.name)}", '
+        f'v:{part.usd_per_gal:.4f}, src:"{_js_string(part.src)}"'
+        + (f', note:"{_js_string(part.note)}"' if part.note else "")
         + "}"
-        for name, value, src, note in tax.parts
+        for part in tax.parts
     )
     return (
         f"fixed:{{ total:{tax.total:.4f}, parts:[\n"
@@ -1931,8 +2153,8 @@ def sanity_check_snapshot(snapshot: str, target: date) -> None:
         )
     if "adval:" in snapshot:
         raise SnapshotError(
-            "sanity: built block still carries an ad-valorem field, which "
-            "the page no longer reads"
+            "sanity: built block still carries an ad-valorem field, "
+            "which the row shape no longer has"
         )
     totals = [
         float(v) for v in re.findall(r"fixed:\{ total:([0-9.]+),", snapshot)
@@ -2040,13 +2262,15 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
         log.error("baseline snapshot %s not found", args.baseline)
         return 2
 
-    # The auction tables are local and their staleness is deterministic,
-    # so settle them before spending any fetches on a run that cannot
-    # produce a snapshot anyway.
+    # Everything local settles first -- the auction tables, the override
+    # sweep's range, and the API key on disk -- so a run that cannot
+    # produce a snapshot fails before spending a single fetch.
     cca = latest_auction(
         CARB_CCA_AUCTIONS, target, program="CARB_CCA_AUCTIONS"
     )
     wa = latest_auction(WA_CCA_AUCTIONS, target, program="WA_CCA_AUCTIONS")
+    assert_adjustments_cover(target)
+    key = load_eia_api_key()
 
     log.info("fetching AAA retail (live)...")
     retail = fetch_aaa_retail(target)
@@ -2090,10 +2314,15 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
     log.info("IN GUT: %s $%.4f/gal", in_gut.month_start, in_gut.usd_per_gal)
 
     log.info("fetching wholesale benchmarks...")
-    key = load_eia_api_key()
+    # Two states share the New York Harbor series, so the fetch is keyed
+    # by series rather than by state.
+    series_months = {
+        name: load_spot_series(name, key)
+        for name in sorted(set(EIA_SPOT_SERIES.values()))
+    }
     spot = {
-        code: select_spot(load_spot_series(series, key), target, series)
-        for code, series in EIA_SPOT_SERIES.items()
+        code: select_spot(series_months[name], target, name)
+        for code, name in EIA_SPOT_SERIES.items()
     }
     for code, quote in sorted(spot.items()):
         log.info(
@@ -2155,18 +2384,34 @@ def _snapshot_day(block: str) -> date:
     return date.fromisoformat(match.group(1))
 
 
-def _captured_columns(block: str) -> list[tuple[str, str]]:
-    """Every state's code and retail string, plus its non-tax total.
+def _captured_columns(block: str, expected: int) -> list[tuple[str, str]]:
+    """Every state's code, retail string and non-tax total.
 
     These are the columns a state-tax migration has no business
     touching: retail cannot be fetched again for a past date, and the
     non-tax pass-throughs were settled against their own sources.
+
+    `expected` is how many states the block holds. A guard built from a
+    pattern fails open -- an unrecognised row layout yields nothing, and
+    comparing two empty lists passes while the rewrite proceeds -- so
+    the count is checked rather than assumed.
     """
-    retail = re.findall(
-        r'code:"([A-Z]{2})", state:"[^"]+", retail:([0-9.]+)', block
-    )
-    nontax = re.findall(r"nontax:\{ total:([0-9.]+)", block)
-    return retail + [("nontax", v) for v in nontax]
+    rows: list[tuple[str, str]] = []
+    for code, chunk in split_state_blocks(block):
+        retail = re.search(r"retail:\s*([0-9.]+)", chunk)
+        nontax = re.search(r"nontax:\{ total:([0-9.]+)", chunk)
+        if not retail or not nontax:
+            raise SnapshotError(
+                f"{code}: cannot read the retail or non-tax figure the "
+                f"migration must preserve"
+            )
+        rows.append((code, f"{retail.group(1)}/{nontax.group(1)}"))
+    if len(rows) != expected:
+        raise SnapshotError(
+            f"read {len(rows)} states where the snapshot holds "
+            f"{expected}; the guard would not see a lost row"
+        )
+    return rows
 
 
 def migrate_snapshot_tax(
@@ -2182,12 +2427,13 @@ def migrate_snapshot_tax(
     total.
     """
     day = _snapshot_day(block)
-    before = _captured_columns(block)
-    moved: dict[str, tuple[float, float]] = {}
-    rebuilt: list[str] = []
     found = _DATA_ARRAY_RE.search(block)
     if not found:
         raise SnapshotError(f"snapshot {day}: could not locate its data array")
+    states = len(split_state_blocks(found.group("body")))
+    before = _captured_columns(found.group("body"), states)
+    moved: dict[str, tuple[float, float]] = {}
+    rebuilt: list[str] = []
     for code, chunk in split_state_blocks(found.group("body")):
         retail_match = re.search(r"retail:([0-9.]+)", chunk)
         old_match = re.search(r"fixed:\{ total:([0-9.]+)", chunk)
@@ -2211,8 +2457,10 @@ def migrate_snapshot_tax(
     )
     spliced = _migrate_federal(spliced, period)
     spliced = _migrate_notes(spliced, period, in_gut)
-    after = _captured_columns(spliced)
-    if before != after:
+    check = _DATA_ARRAY_RE.search(spliced)
+    if not check:
+        raise SnapshotError(f"snapshot {day}: the rewrite lost its data array")
+    if _captured_columns(check.group("body"), states) != before:
         raise SnapshotError(
             f"snapshot {day}: migrating changed a captured column, which "
             f"it must never do"
@@ -2221,26 +2469,40 @@ def migrate_snapshot_tax(
 
 
 def _migrate_federal(block: str, period: TaxPeriod) -> str:
-    """Point the federal fields at the table the state column now uses."""
-    block = re.sub(
-        r"federalExcise: [0-9.]+,",
-        f"federalExcise: {period.federal:.4f},",
-        block,
-        count=1,
+    """Point the federal fields at the table the state column now uses.
+
+    Each substitution asserts it matched. A field spelled differently or
+    absent would otherwise leave a half-restated federal row beside a
+    fully restated state column, reported as success -- and this runs
+    once against the published page, so the wrong figure would stay.
+    """
+    replacements = (
+        (
+            r"federalExcise: [0-9.]+,",
+            f"federalExcise: {period.federal:.4f},",
+        ),
+        (
+            r'federalSource: "[^"]*",',
+            f'federalSource: "{period.source_url}",',
+        ),
+        (
+            r'federalVintage: "(?:[^"\\]|\\.)*",',
+            (
+                f'federalVintage: "Federal excise and LUST fee as '
+                f"published for the {period.period} edition of the EIA "
+                f'table.",'
+            ),
+        ),
     )
-    block = re.sub(
-        r'federalSource: "[^"]*",',
-        f'federalSource: "{period.source_url}",',
-        block,
-        count=1,
-    )
-    return re.sub(
-        r'federalVintage: "(?:[^"\\]|\\.)*",',
-        f'federalVintage: "Federal excise and LUST fee as published for '
-        f'the {period.period} edition of the EIA table.",',
-        block,
-        count=1,
-    )
+    for pattern, replacement in replacements:
+        block, count = re.subn(pattern, replacement, block, count=1)
+        if count != 1:
+            field = pattern.split(":")[0].lstrip("^")
+            raise SnapshotError(
+                f"snapshot {_snapshot_day(block)}: no {field} field to "
+                f"restate, so the federal row would be left half-migrated"
+            )
+    return block
 
 
 def _migrate_notes(block: str, period: TaxPeriod, in_gut: InGutRate) -> str:
@@ -2269,7 +2531,16 @@ def _migrate_notes(block: str, period: TaxPeriod, in_gut: InGutRate) -> str:
     state_at = head.find("State tax")
     if state_at >= 0:
         head = head[:state_at]
-    restated = head.rstrip() + " " + state_tax_notes(period, in_gut) + tail
+    restated = (head.rstrip() + " ").lstrip()
+    restated += state_tax_notes(period, in_gut) + tail
+    # A snapshot whose sentence sat after the pass-through section would
+    # otherwise keep its stale claim beside the new one, which is the
+    # falsehood this exists to remove.
+    if restated.count("State tax") != 1:
+        raise SnapshotError(
+            f"snapshot {_snapshot_day(block)}: the notes carry a second "
+            f"state-tax sentence the restatement did not replace"
+        )
     return block[: match.start(1)] + restated + block[match.end(1) :]
 
 
@@ -2286,9 +2557,11 @@ def cmd_migrate_state_tax(args: argparse.Namespace) -> int:
     in_rates = load_in_gut_rates(cache_dir)
     log.info("fetching wholesale benchmarks...")
     key = load_eia_api_key()
+    # Two states share the New York Harbor series, so the fetch is keyed
+    # by series rather than by state.
     series = {
-        code: load_spot_series(name, key)
-        for code, name in EIA_SPOT_SERIES.items()
+        name: load_spot_series(name, key)
+        for name in sorted(set(EIA_SPOT_SERIES.values()))
     }
 
     rebuilt: list[str] = []
@@ -2304,8 +2577,8 @@ def cmd_migrate_state_tax(args: argparse.Namespace) -> int:
                 select_tax_period(periods, day),
                 select_in_gut(in_rates, day),
                 {
-                    code: select_spot(months, day, EIA_SPOT_SERIES[code])
-                    for code, months in series.items()
+                    code: select_spot(series[name], day, name)
+                    for code, name in EIA_SPOT_SERIES.items()
                 },
             )
         except SnapshotError as exc:
