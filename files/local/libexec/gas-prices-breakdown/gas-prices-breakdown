@@ -17,13 +17,6 @@ Subcommands:
   remove-snapshot HTML SNAPSHOT_DATE [--dry-run]
       Remove the snapshot whose `date` field is SNAPSHOT_DATE.
 
-  rebase-passthroughs HTML [--dry-run]
-      Recompute the CA, OR, and WA non-tax pass-throughs of every
-      snapshot, each from the price its own date should have used,
-      leaving retail and the tax columns as captured. For restating
-      the series after a source or a correction changes what those
-      pass-throughs should have been.
-
   extract-markdown HTML [--output PATH]
       Write the embedded SPEC_MD spec text to PATH (or stdout).
 
@@ -39,15 +32,12 @@ Data sources:
   settlements (WA_CCA_AUCTIONS). A run fails rather than publish from a
   table whose newest entry is older than CCA_STALE_DAYS.
 
-  rebase-passthroughs draws on the same sources and tables except AAA,
-  since it never touches the retail column.
-
 Exit status:
   0  Success, including a run whose snapshot was already present.
   1  A source was unreachable, its content no longer parses, or what it
-     offers does not reach the date being worked on -- too old to
-     describe it, or for a restatement, not far enough back to cover
-     it. Each fetch is retried (see HTTP_ATTEMPTS) before the run gives
+     offers does not reach the date being snapshotted -- too old to
+     describe it, or, for a --target backfill, not reaching back that
+     far. Each fetch is retried (see HTTP_ATTEMPTS) before the run gives
      up, and the failure is reported as error lines rather than a
      traceback.
   2  Bad invocation, or a snapshot the arguments name that the file
@@ -159,10 +149,10 @@ CCA_STALE_DAYS = 130
 
 # Per-gallon conversion factors, each back-derived once from a
 # credit-price-and-pass-through pair the page carried at the date named
-# beside it. The ratio is what is load-bearing, not the pair: restating
-# a snapshot rewrites its pass-through, so the anchoring pair is a
-# record of where the ratio came from rather than something still
-# findable in the array.
+# beside it. The ratio is what is load-bearing, not the pair: the
+# anchoring date records which snapshot the ratio was read off, and the
+# snapshot it names may since have been rewritten against a different
+# source, so do not expect to find the pair by looking there.
 LCFS_FACTOR = 0.18 / 62.93  # CA: $/gal per $/MT (Apr 2026 anchor)
 CCA_FACTOR_MT_PER_GAL = 0.00878  # CA: MT/gal CO2 (CARB-documented)
 WA_FACTOR = 0.52 / 65.26  # WA: $/gal per $/allowance (Mar 2026 anchor)
@@ -570,8 +560,9 @@ class LcfsQuote:
 def load_lcfs_series(cache_dir: Path) -> list[tuple[date, float]]:
     """Download the monitor's export and return it as ascending pairs.
 
-    Split from the per-date selection so a caller restating many dates
-    pays for one download rather than one per date.
+    Kept separate from the per-date selection so the transport failures
+    live here and the "which quote describes this date" decision lives
+    in `select_lcfs`, where it can be reasoned about without a network.
     """
     xls_path = cache_dir / "lcfs.xls"
     xls_path.write_bytes(_http_bytes(LCFS_MONITOR_XLS))
@@ -723,8 +714,9 @@ class OrCfpMonth:
 def load_or_cfp_series(cache_dir: Path) -> dict[tuple[int, int], float]:
     """Download the DEQ workbook and return its monthly VWAPs.
 
-    Split from the per-date selection for the same reason as the LCFS
-    series: one download serves any number of dates.
+    Kept separate from the per-date selection for the same reason as the
+    LCFS series: fetching and choosing fail for unrelated reasons and
+    read better apart.
     """
     xlsx_path = cache_dir / "oregon-cfp.xlsx"
     xlsx_path.write_bytes(_http_bytes(OR_CFP_URL))
@@ -982,9 +974,9 @@ def passthrough_notes(
 ) -> str:
     """Summarise which priced programs a snapshot's pass-throughs came from.
 
-    Shared by the writer and the restater so a restated snapshot cannot
-    end up describing one vintage in its notes and another in its state
-    blocks.
+    Takes the same four values the CA, OR and WA state blocks are built
+    from, so a snapshot cannot end up describing one vintage in its
+    notes and another in its numbers.
     """
     return (
         f"{PASSTHROUGH_NOTES_MARKER}"
@@ -1331,236 +1323,6 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Subcommand: rebase-passthroughs
-# ---------------------------------------------------------------------------
-
-
-def _snapshot_date(block: str) -> date:
-    match = SNAPSHOT_DATE_RE.search(block)
-    if not match:
-        raise SnapshotError(f"snapshot has no date field: {block[:60]!r}")
-    return date.fromisoformat(match.group(1))
-
-
-def _nontax_total(chunk: str) -> float:
-    """Read the non-tax total a state block currently carries."""
-    match = re.search(r"nontax:\{ total:([0-9.]+),", chunk)
-    if not match:
-        raise SnapshotError(f"no nontax total in block: {chunk[:60]!r}")
-    return float(match.group(1))
-
-
-# The snapshots this script writes close their data array on its own
-# line; the hand-built ones that predate it close on the same line as the
-# last state. Both are valid input here, so the array is located by span
-# and spliced rather than reformatted.
-_DATA_ARRAY_RE = re.compile(r"  data: \[\n(?P<body>[\s\S]*?)\s*\]\s*\}\s*\Z")
-
-
-def _state_retail(block: str) -> list[tuple[str, str]]:
-    """Every state's code and retail string, in file order."""
-    return re.findall(
-        r'code:"([A-Z]{2})", state:"[^"]+", retail:([0-9.]+)', block
-    )
-
-
-def _assert_only_nontax_changed(before: str, after: str, day: date) -> None:
-    """Guard the one promise a restatement makes about captured data.
-
-    Retail cannot be fetched again for a past date, so a restatement
-    that disturbed it would destroy the only copy. Comparing the codes
-    and their retail strings catches a splice that dropped a state,
-    reordered them, or edited a price, none of which the pass-through
-    rebuild has any business doing.
-    """
-    if _state_retail(before) != _state_retail(after):
-        raise SnapshotError(
-            f"snapshot {day}: restating changed the state or retail "
-            f"columns, which it must never do"
-        )
-
-
-def _rebase_notes(
-    block: str,
-    lcfs: LcfsQuote,
-    cca: AuctionSettlement,
-    wa: AuctionSettlement,
-    orm: OrCfpMonth,
-) -> str:
-    """Restate the pass-through sentence of a snapshot's notes.
-
-    Everything before the marker is per-snapshot provenance -- where its
-    retail came from, which baseline its taxes carry -- and stays as
-    captured. Everything from the marker onward is replaced, not just
-    the first sentence of it: in every snapshot written so far the
-    marker runs to the end of the notes, and a partial rewrite would
-    leave half a description of one vintage beside half of another.
-    Anything a human adds after it would be lost, so caveats belong
-    before the marker.
-    """
-    match = re.search(r'notes:\s*"((?:[^"\\]|\\.)*)"', block)
-    if not match:
-        raise SnapshotError(
-            f"snapshot {_snapshot_date(block)}: no notes field to restate"
-        )
-    existing = match.group(1)
-    head, sep, _tail = existing.partition(PASSTHROUGH_NOTES_MARKER)
-    if not sep:
-        # The original baseline never described its pass-throughs, so
-        # there is nothing to replace -- it gains the description the
-        # restated blocks now warrant instead.
-        head = f"{existing.rstrip()} " if existing.strip() else ""
-    restated = head + passthrough_notes(lcfs, cca, wa, orm)
-    return block[: match.start(1)] + restated + block[match.end(1) :]
-
-
-def rebase_snapshot_passthroughs(
-    block: str,
-    lcfs: LcfsQuote,
-    cca: AuctionSettlement,
-    wa: AuctionSettlement,
-    orm: OrCfpMonth,
-) -> tuple[str, dict[str, tuple[float, float]]]:
-    """Recompute a snapshot's non-tax pass-throughs in place.
-
-    Only the three states whose pass-throughs are derived from a priced
-    program are touched. Retail, the tax columns, and every other state
-    are left exactly as captured, because the retail prices in
-    particular cannot be fetched again for a past date.
-
-    Returns the rewritten block and, per state changed, its old and new
-    non-tax total.
-    """
-    day = _snapshot_date(block)
-    found = _DATA_ARRAY_RE.search(block)
-    if not found:
-        raise SnapshotError(f"snapshot {day}: could not locate its data array")
-    data = found.group("body")
-    builders: dict[str, Callable[[], str]] = {
-        "CA": lambda: build_ca_nontax(day, lcfs, cca),
-        "OR": lambda: build_or_nontax(orm),
-        "WA": lambda: build_wa_nontax(wa),
-    }
-    moved: dict[str, tuple[float, float]] = {}
-    rebuilt: list[str] = []
-    seen: set[str] = set()
-    for code, chunk in split_state_blocks(data):
-        build = builders.get(code)
-        if build is None:
-            rebuilt.append(chunk)
-            continue
-        seen.add(code)
-        before = _nontax_total(chunk)
-        chunk = swap_nontax(chunk, build())
-        after = _nontax_total(chunk)
-        if before != after:
-            moved[code] = (before, after)
-        rebuilt.append(chunk)
-    missing = sorted(set(builders) - seen)
-    if missing:
-        # A snapshot that has lost one of these silently reports as
-        # "already correct", which is the one outcome that must not be
-        # indistinguishable from success.
-        raise SnapshotError(
-            f"snapshot {day}: no block for {', '.join(missing)}; the "
-            f"snapshot is not the shape this restates"
-        )
-    spliced = (
-        block[: found.start("body")]
-        + "".join(rebuilt)
-        + block[found.end("body") :]
-    )
-    spliced = _rebase_notes(spliced, lcfs, cca, wa, orm)
-    return spliced, moved
-
-
-def cmd_rebase_passthroughs(args: argparse.Namespace) -> int:
-    html_text = read_html(args.html)
-    snapshots = parse_snapshots(html_text)
-    log.info("loaded %d snapshots from %s", len(snapshots.blocks), args.html)
-
-    cache_dir = Path.home() / ".cache" / "gas-prices-breakdown"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    log.info("fetching CA LCFS assessment series...")
-    lcfs_series = load_lcfs_series(cache_dir)
-    log.info("fetching Oregon CFP series...")
-    or_series = load_or_cfp_series(cache_dir)
-
-    rebuilt: list[str] = []
-    # A restatement counts because the block's text changed, not because
-    # a total moved: switching a source rewrites the src link, the note
-    # and the asOf while the rounded total can land on the same four
-    # decimals, and dropping those would leave a retired source cited on
-    # the page.
-    restated = 0
-    # One snapshot the sources cannot reach must not hide the rest.
-    # The assessment export is a rolling window and the auction tables
-    # start where they start, so the oldest snapshots are the ones that
-    # fall off; collecting every failure says how far the problem goes
-    # in one run instead of one snapshot per attempt.
-    unreachable: list[str] = []
-    for block in snapshots.blocks:
-        day = _snapshot_date(block)
-        try:
-            new_block, moved = rebase_snapshot_passthroughs(
-                block,
-                select_lcfs(lcfs_series, day),
-                latest_auction(
-                    CARB_CCA_AUCTIONS, day, program="CARB_CCA_AUCTIONS"
-                ),
-                latest_auction(
-                    WA_CCA_AUCTIONS, day, program="WA_CCA_AUCTIONS"
-                ),
-                select_or_cfp(or_series, day),
-            )
-        except SnapshotError as exc:
-            unreachable.append(f"{day}: {exc}")
-            rebuilt.append(block)
-            continue
-        _assert_only_nontax_changed(block, new_block, day)
-        rebuilt.append(new_block)
-        if new_block == block:
-            continue
-        restated += 1
-        detail = (
-            "  ".join(
-                f"{code} {before:.4f} -> {after:.4f}"
-                for code, (before, after) in sorted(moved.items())
-            )
-            or "attribution only"
-        )
-        log.info("%s  %s", day, detail)
-    snapshots.blocks = rebuilt
-    new_html = render_snapshots(snapshots)
-
-    log.info("%d of %d snapshots restated", restated, len(snapshots.blocks))
-    if unreachable:
-        for line in unreachable:
-            log.error("%s", line)
-        log.error(
-            "%d snapshot(s) could not be restated; nothing written",
-            len(unreachable),
-        )
-        return 1
-    if not restated:
-        log.info("nothing to rewrite")
-        return 0
-    if args.dry_run:
-        log.info(
-            "dry-run: would write %d bytes (was %d); not modifying file",
-            len(new_html),
-            len(html_text),
-        )
-        return 0
-
-    backup = backup_html(args.html)
-    log.info("backed up to %s", backup)
-    write_with_canonical_mode(args.html, new_html)
-    log.info("wrote %d bytes", len(new_html))
-    return 0
-
-
-# ---------------------------------------------------------------------------
 # Subcommand: remove-snapshot
 # ---------------------------------------------------------------------------
 
@@ -1699,20 +1461,6 @@ def main(argv: list[str] | None = None) -> int:
         help="report what would be removed without modifying the HTML",
     )
     p_rm.set_defaults(func=cmd_remove_snapshot)
-
-    p_rebase = sub.add_parser(
-        "rebase-passthroughs",
-        help="recompute every snapshot's non-tax pass-throughs",
-    )
-    p_rebase.add_argument(
-        "html", type=Path, help="path to gas-price-breakdown.html"
-    )
-    p_rebase.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="report what would change without modifying the HTML",
-    )
-    p_rebase.set_defaults(func=cmd_rebase_passthroughs)
 
     p_md = sub.add_parser(
         "extract-markdown",
