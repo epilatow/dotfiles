@@ -1701,22 +1701,34 @@ def test_write_path_backs_the_page_up_first(tmp_path: Path) -> None:
     assert backups[0].read_text() == original
 
 
-def test_add_snapshot_round_trip_splices_a_built_block_in(
-    tmp_path: Path,
-) -> None:
-    """The scheduled job's whole path, with only the fetches stubbed."""
-    codes = sorted(set(gpb.STATE_CODE.values()))
-    baseline = _snapshot_block(gpb.BASELINE_DATE, codes)
-    html = tmp_path / "page.html"
-    html.write_text(_page(baseline))
+CODES = sorted(set(gpb.STATE_CODE.values()))
+
+
+def _tax_period(
+    period: date = date(2026, 7, 1), rate: float = 0.30
+) -> gpb.TaxPeriod:
+    return gpb.TaxPeriod(
+        period=period,
+        per_state=dict.fromkeys(CODES, rate),
+        excise=dict.fromkeys(CODES, round(rate - 0.01, 4)),
+        federal=0.184,
+        source_url="https://example.invalid/fueltaxes.xlsx",
+        missing=(),
+    )
+
+
+@contextlib.contextmanager
+def _add_snapshot_sources(
+    retail: float = 3.5, period: gpb.TaxPeriod | None = None
+) -> Iterator[None]:
+    """Stub every fetch add-snapshot makes, so no test touches a network."""
     lcfs, _cca, _wa, orm = _sample_sources()
     with (
-        _backups_under(tmp_path),
         patch.object(
             gpb,
             "fetch_aaa_retail",
             autospec=True,
-            return_value=dict.fromkeys(codes, 3.5),
+            return_value=dict.fromkeys(CODES, retail),
         ),
         patch.object(
             gpb, "fetch_lcfs_for_target_date", autospec=True, return_value=lcfs
@@ -1727,7 +1739,41 @@ def test_add_snapshot_round_trip_splices_a_built_block_in(
             autospec=True,
             return_value=orm,
         ),
+        patch.object(
+            gpb,
+            "fetch_tax_period_for_target_date",
+            autospec=True,
+            return_value=period or _tax_period(),
+        ),
+        patch.object(
+            gpb,
+            "fetch_in_gut_for_target_date",
+            autospec=True,
+            return_value=gpb.InGutRate(
+                date(2026, 9, 1), 0.239, "https://example.invalid/dn02.pdf"
+            ),
+        ),
+        patch.object(
+            gpb, "load_eia_api_key", autospec=True, return_value="key"
+        ),
+        patch.object(
+            gpb,
+            "load_spot_series",
+            autospec=True,
+            return_value={"2026-08": 3.213},
+        ),
     ):
+        yield
+
+
+def test_add_snapshot_round_trip_splices_a_built_block_in(
+    tmp_path: Path,
+) -> None:
+    """The scheduled job's whole path, with only the fetches stubbed."""
+    baseline = _snapshot_block(gpb.BASELINE_DATE, CODES)
+    html = tmp_path / "page.html"
+    html.write_text(_page(baseline))
+    with _backups_under(tmp_path), _add_snapshot_sources():
         assert (
             gpb.main(["add-snapshot", str(html), "--target", "2026-09-17"])
             == 0
@@ -1741,31 +1787,87 @@ def test_add_snapshot_round_trip_splices_a_built_block_in(
     assert "Argus via Neste monitor" in blocks[0]
 
 
-def test_add_snapshot_dry_run_leaves_the_page_alone(tmp_path: Path) -> None:
-    """A dry run builds and sanity-checks but must not touch the file."""
-    codes = sorted(set(gpb.STATE_CODE.values()))
+def test_add_snapshot_drops_the_ad_valorem_field(tmp_path: Path) -> None:
+    """State tax reaches the page as one figure, so the percentage goes."""
     html = tmp_path / "page.html"
-    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, codes)))
-    before = html.read_text()
-    lcfs, _cca, _wa, orm = _sample_sources()
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
+    with _backups_under(tmp_path), _add_snapshot_sources():
+        gpb.main(["add-snapshot", str(html), "--target", "2026-09-17"])
+    built = gpb.parse_snapshots(html.read_text()).blocks[0]
+    assert "adval:" not in built
+    assert built.count("fixed:{") == 51
+    assert built.count("nontax:{") == 51
+
+
+def test_add_snapshot_takes_the_state_tax_from_the_table(
+    tmp_path: Path,
+) -> None:
+    """The figure is the published one, not inherited from a baseline."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
     with (
         _backups_under(tmp_path),
-        patch.object(
-            gpb,
-            "fetch_aaa_retail",
-            autospec=True,
-            return_value=dict.fromkeys(codes, 3.5),
-        ),
-        patch.object(
-            gpb, "fetch_lcfs_for_target_date", autospec=True, return_value=lcfs
-        ),
-        patch.object(
-            gpb,
-            "fetch_or_cfp_for_target_date",
-            autospec=True,
-            return_value=orm,
-        ),
+        _add_snapshot_sources(period=_tax_period(rate=0.4235)),
     ):
+        gpb.main(["add-snapshot", str(html), "--target", "2026-09-17"])
+    built = gpb.parse_snapshots(html.read_text()).blocks[0]
+    texas = next(
+        c for code, c in gpb.split_state_blocks(built) if code == "TX"
+    )
+    assert "fixed:{ total:0.4235," in texas
+    # The baseline's own 0.100 must not survive anywhere.
+    assert "total:0.1000" not in built
+
+
+def test_add_snapshot_takes_the_federal_rate_from_the_table(
+    tmp_path: Path,
+) -> None:
+    """The federal figure rides the same sheet as the state ones."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
+    with _backups_under(tmp_path), _add_snapshot_sources():
+        gpb.main(["add-snapshot", str(html), "--target", "2026-09-17"])
+    built = gpb.parse_snapshots(html.read_text()).blocks[0]
+    assert "federalExcise: 0.1840," in built
+
+
+def test_add_snapshot_composes_indiana_rather_than_taking_the_total(
+    tmp_path: Path,
+) -> None:
+    """Indiana is suspended on this date, so its total is the fee alone."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
+    with _backups_under(tmp_path), _add_snapshot_sources():
+        gpb.main(["add-snapshot", str(html), "--target", "2026-09-17"])
+    built = gpb.parse_snapshots(html.read_text()).blocks[0]
+    indiana = next(
+        c for code, c in gpb.split_state_blocks(built) if code == "IN"
+    )
+    assert f"fixed:{{ total:{gpb.IN_OIL_INSPECTION_FEE:.4f}," in indiana
+    assert "Suspended" in indiana
+
+
+def test_add_snapshot_adds_back_a_gross_receipts_tax(
+    tmp_path: Path,
+) -> None:
+    """Connecticut's is a sixth of what it charges; omitting it is wrong."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
+    with _backups_under(tmp_path), _add_snapshot_sources():
+        gpb.main(["add-snapshot", str(html), "--target", "2026-09-17"])
+    built = gpb.parse_snapshots(html.read_text()).blocks[0]
+    conn = next(c for code, c in gpb.split_state_blocks(built) if code == "CT")
+    expected = round(0.30 + gpb.CT_PGET_RATE * gpb.CT_PGET_CAP_USD, 4)
+    assert f"fixed:{{ total:{expected:.4f}," in conn
+    assert "gross earnings" in conn
+
+
+def test_add_snapshot_dry_run_leaves_the_page_alone(tmp_path: Path) -> None:
+    """A dry run builds and sanity-checks but must not touch the file."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
+    before = html.read_text()
+    with _backups_under(tmp_path), _add_snapshot_sources():
         assert (
             gpb.main(
                 [

@@ -11,8 +11,9 @@ Subcommands:
 
   add-snapshot HTML [--target DATE] [--baseline DATE] [--dry-run]
       Fetch live data and append a snapshot for DATE (default: most recent
-      Thursday). Inherits state-tax structure (cols 3-4) from the BASELINE
-      snapshot; does not refresh state tax rates -- those need human review.
+      Thursday). Every priced column is fetched for DATE; the BASELINE
+      snapshot supplies only the row scaffolding -- state names, ordering,
+      and the non-tax entries of states with no priced program.
 
   remove-snapshot HTML SNAPSHOT_DATE [--dry-run]
       Remove the snapshot whose `date` field is SNAPSHOT_DATE.
@@ -21,16 +22,27 @@ Subcommands:
       Write the embedded SPEC_MD spec text to PATH (or stdout).
 
 Data sources:
-  Fetched live: AAA state-averages (retail), the daily California LCFS
-  credit assessment (see LCFS_MONITOR_URL for why it is not CARB's own
-  series), Oregon DEQ CFP credit-transfer xlsx. The LCFS assessment
-  carries a freshness bound; a run fails rather than publish a price too
-  old to describe the date being snapshotted.
+  Fetched live: AAA state-averages (retail), EIA's federal and state
+  motor fuel tax table, Indiana's gasoline use tax notice, EIA spot
+  benchmarks (see GROSS_RECEIPTS_STATES for what they price), the daily
+  California LCFS credit assessment (see LCFS_MONITOR_URL for why it is
+  not CARB's own series), Oregon DEQ CFP credit-transfer xlsx. Each
+  carries a freshness bound; a run fails rather than publish a figure
+  too old to describe the date being snapshotted.
 
   Hand-maintained tables (need quarterly human update): CARB cap-and-invest
   auction settlements (CARB_CCA_AUCTIONS), Washington CCA auction
   settlements (WA_CCA_AUCTIONS). A run fails rather than publish from a
   table whose newest entry is older than CCA_STALE_DAYS.
+
+  Hand-maintained and checked by date rather than by age: the Indiana
+  tax suspension windows. A published rate table says what a tax is,
+  not whether it is being collected, so the windows come from the
+  department's notices and a run past IN_SUSPENSION_CHECKED_THROUGH
+  fails rather than assume a suspension has lapsed.
+
+  The EIA spot benchmarks need an API key, read at run time from
+  EIA_API_KEY_PATH. The tax table itself does not.
 
 Exit status:
   0  Success, including a run whose snapshot was already present.
@@ -161,10 +173,6 @@ LCFS_FACTOR = 0.18 / 62.93  # CA: $/gal per $/MT (Apr 2026 anchor)
 CCA_FACTOR_MT_PER_GAL = 0.00878  # CA: MT/gal CO2 (CARB-documented)
 WA_FACTOR = 0.52 / 65.26  # WA: $/gal per $/allowance (Mar 2026 anchor)
 OR_FACTOR = 0.10 / 43.73  # OR: $/gal per $/credit (Jan 2025 anchor)
-
-# Indiana gasoline use tax suspension window (statutory).
-IN_SUSPENSION_START = date(2026, 4, 8)
-IN_SUSPENSION_END = date(2026, 5, 8)
 
 # California LCFS credit price.
 #
@@ -314,6 +322,19 @@ EIA_SPOT_SERIES = {
     "DE": "EER_EPMRU_PF4_Y35NY_DPG",
     "OH": "EER_EPMRU_PF4_RGC_DPG",
 }
+# Hawaii needs no benchmark, so it is not in the series map above. Each
+# state cites its own taxing authority rather than the table these taxes
+# are being added back to, which is the source that leaves them out.
+GROSS_RECEIPTS_SOURCE_URLS = {
+    "CT": "https://portal.ct.gov/DRS/Taxes/Petroleum-Products-Tax/"
+    "Tax-Information",
+    "DE": "https://revenue.delaware.gov/business-tax-forms/"
+    "hazardous-substance-cleanup-act/",
+    "HI": "https://tax.hawaii.gov/geninfo/get/",
+    "OH": "https://tax.ohio.gov/business/ohio-business-taxes/"
+    "petroleum-activity-tax/",
+}
+GROSS_RECEIPTS_STATES = tuple(sorted(GROSS_RECEIPTS_SOURCE_URLS))
 # The series is monthly and lands a few weeks after the month closes, so
 # the quote in force is legitimately up to ~60 days behind the snapshot.
 EIA_SPOT_STALE_DAYS = 100
@@ -1563,8 +1584,9 @@ def replace_retail(chunk: str, retail: float) -> str:
     )
 
 
-def swap_nontax(chunk: str, replacement: str) -> str:
-    i = chunk.index("nontax:{")
+def _span_of(chunk: str, field: str) -> tuple[int, int]:
+    """Locate one brace-delimited field inside a state block."""
+    i = chunk.index(f"{field}:{{")
     depth = 0
     j = i
     while j < len(chunk):
@@ -1577,7 +1599,33 @@ def swap_nontax(chunk: str, replacement: str) -> str:
                 j += 1
                 break
         j += 1
+    return i, j
+
+
+def swap_nontax(chunk: str, replacement: str) -> str:
+    i, j = _span_of(chunk, "nontax")
     return chunk[:i] + replacement + chunk[j:]
+
+
+def swap_fixed(chunk: str, replacement: str) -> str:
+    i, j = _span_of(chunk, "fixed")
+    return chunk[:i] + replacement + chunk[j:]
+
+
+def drop_adval(chunk: str) -> str:
+    """Remove the ad-valorem field, which the row no longer carries.
+
+    State tax reaches the page as one per-gallon figure, so the
+    percentage that used to sit beside it has nothing left to describe.
+    The trailing comma and the blank line it leaves go with it.
+    """
+    if "adval:{" not in chunk:
+        return chunk
+    i, j = _span_of(chunk, "adval")
+    # The field occupied its own line, so the comma that ended it, the
+    # newline after it and the indentation that led into it all go too.
+    tail = chunk[j:].removeprefix(",").removeprefix("\n")
+    return chunk[:i].rstrip(" ") + tail
 
 
 PASSTHROUGH_NOTES_MARKER = "Non-tax pass-throughs: "
@@ -1658,52 +1706,126 @@ def build_wa_nontax(wa: AuctionSettlement) -> str:
     )
 
 
-def replace_in_adval(chunk: str, d: date, retail: float) -> str:
-    in_suspension = IN_SUSPENSION_START <= d <= IN_SUSPENSION_END
-    if in_suspension:
-        new_adval = (
-            "adval:{ pct:0, parts:[\n"
-            '      {n:"Gasoline use tax (7%): SUSPENDED Apr 8 - May 8, 2026", '
-            f'rate:"7% {TIMES} retail (suspended)", effCents:0, '
-            'src:"https://www.in.gov/dor/i-am-a/business-corp/'
-            'gasoline-use-tax/", '
-            'note:"In suspension window"'
-            f'}}], asOf:"{d.isoformat()}"}}'
+@dataclass(frozen=True)
+class StateTax:
+    """One state's per-gallon tax for a snapshot, with its provenance."""
+
+    code: str
+    total: float
+    parts: tuple[tuple[str, float, str, str], ...]
+    as_of: str
+
+
+def compose_state_tax(
+    code: str,
+    day: date,
+    period: TaxPeriod,
+    retail: float,
+    in_gut: InGutRate,
+    spot: dict[str, SpotQuote],
+) -> StateTax:
+    """Resolve what one state charges per gallon on `day`.
+
+    Most states are the published table's own figure. Indiana is built
+    from its parts, because its use tax is reset monthly and both it and
+    the excise have been suspended by order. The four states whose
+    gross-receipts taxes the table excludes get them added back.
+    """
+    if code == "IN":
+        indiana = resolve_indiana_tax(day, period.excise["IN"], in_gut)
+        parts = [
+            ("Gasoline excise", indiana.excise, period.source_url, ""),
+            (
+                "Oil inspection fee",
+                indiana.inspection_fee,
+                IN_SUSPENSION_NOTICE_URL,
+                "",
+            ),
+            (
+                f"Gasoline use tax ({in_gut.month_start:%b %Y})",
+                indiana.gut,
+                in_gut.source_url,
+                "",
+            ),
+        ]
+        note = "; ".join(indiana.suspended)
+        if note:
+            parts.append(("Suspended", 0.0, IN_SUSPENSION_NOTICE_URL, note))
+        return StateTax(
+            code=code,
+            total=indiana.total,
+            parts=tuple(parts),
+            as_of=in_gut.month_start.isoformat(),
         )
-    else:
-        eff_cents = round(0.07 * retail, 4)
-        new_adval = (
-            "adval:{ pct:7.0, parts:[\n"
-            '      {n:"Gasoline use tax (7% of retail)", '
-            f'rate:"7% {TIMES} retail", effCents:{eff_cents:.4f}, '
-            'src:"https://www.in.gov/dor/i-am-a/business-corp/gasoline-use-tax/"'
-            f'}}], asOf:"{d.isoformat()}"}}'
+    base = period.per_state[code]
+    parts = [
+        (
+            "State taxes and fees",
+            base,
+            period.source_url,
+            (
+                "Excise plus the sales, inspection and environmental "
+                "charges the published table groups with it"
+            ),
         )
-    new_chunk = re.sub(
-        r"adval:\{.*?\},(?=\s*\n\s*nontax)",
-        new_adval + ",",
-        chunk,
-        count=1,
-        flags=re.DOTALL,
+    ]
+    total = base
+    if code in GROSS_RECEIPTS_STATES:
+        extra = resolve_gross_receipts(code, retail, spot.get(code))
+        total = round(total + extra.usd_per_gal, 4)
+        parts.append(
+            (
+                extra.label,
+                extra.usd_per_gal,
+                GROSS_RECEIPTS_SOURCE_URLS[code],
+                extra.basis
+                + (
+                    ""
+                    if extra.exact
+                    else "; estimated, the published table excludes it"
+                ),
+            )
+        )
+    return StateTax(
+        code=code,
+        total=total,
+        parts=tuple(parts),
+        as_of=period.period.isoformat(),
     )
-    if not in_suspension:
-        new_chunk = re.sub(
-            r',\s*flag:"GUT suspended through 2026-05-08"',
-            "",
-            new_chunk,
-            count=1,
-        )
-    return new_chunk
+
+
+def build_fixed(tax: StateTax) -> str:
+    """Render one state's tax as the page's `fixed` field."""
+    rendered = ",\n".join(
+        f'      {{n:"{name}", v:{value:.4f}, src:"{src}"'
+        + (f', note:"{note}"' if note else "")
+        + "}"
+        for name, value, src, note in tax.parts
+    )
+    return (
+        f"fixed:{{ total:{tax.total:.4f}, parts:[\n"
+        f'{rendered}], asOf:"{tax.as_of}"}}'
+    )
+
+
+@dataclass(frozen=True)
+class SnapshotSources:
+    """Everything one snapshot is built from, already dated to it."""
+
+    period: TaxPeriod
+    in_gut: InGutRate
+    spot: dict[str, SpotQuote]
+    lcfs: LcfsQuote
+    cca: AuctionSettlement
+    wa: AuctionSettlement
+    orm: OrCfpMonth
 
 
 def build_data_block(
     baseline_data: str,
     target: date,
     retail: dict[str, float],
-    lcfs: LcfsQuote,
-    cca: AuctionSettlement,
-    wa: AuctionSettlement,
-    orm: OrCfpMonth,
+    sources: SnapshotSources,
 ) -> str:
     blocks = split_state_blocks(baseline_data)
     out: list[str] = []
@@ -1711,14 +1833,24 @@ def build_data_block(
         if code not in retail:
             raise SnapshotError(f"missing retail price for {code}")
         chunk = replace_retail(chunk, retail[code])
+        tax = compose_state_tax(
+            code,
+            target,
+            sources.period,
+            retail[code],
+            sources.in_gut,
+            sources.spot,
+        )
+        chunk = swap_fixed(chunk, build_fixed(tax))
+        chunk = drop_adval(chunk)
         if code == "CA":
-            chunk = swap_nontax(chunk, build_ca_nontax(target, lcfs, cca))
+            chunk = swap_nontax(
+                chunk, build_ca_nontax(target, sources.lcfs, sources.cca)
+            )
         elif code == "OR":
-            chunk = swap_nontax(chunk, build_or_nontax(orm))
+            chunk = swap_nontax(chunk, build_or_nontax(sources.orm))
         elif code == "WA":
-            chunk = swap_nontax(chunk, build_wa_nontax(wa))
-        elif code == "IN":
-            chunk = replace_in_adval(chunk, target, retail["IN"])
+            chunk = swap_nontax(chunk, build_wa_nontax(sources.wa))
         out.append(chunk)
     return "".join(out)
 
@@ -1727,26 +1859,24 @@ def build_snapshot_object(
     target: date,
     baseline_block: str,
     retail: dict[str, float],
-    lcfs: LcfsQuote,
-    cca: AuctionSettlement,
-    wa: AuctionSettlement,
-    orm: OrCfpMonth,
+    sources: SnapshotSources,
 ) -> str:
     baseline_data = extract_data_block(baseline_block)
-    body = build_data_block(baseline_data, target, retail, lcfs, cca, wa, orm)
+    body = build_data_block(baseline_data, target, retail, sources)
     notes = (
         "Auto-generated weekly snapshot. Retail (col 2) from live AAA "
-        f"state-averages page on {target.isoformat()}. State taxes (cols 3-4) "
-        f"inherited from {BASELINE_DATE} baseline. "
-        + passthrough_notes(lcfs, cca, wa, orm)
+        f"state-averages page on {target.isoformat()}. State tax (col 3) "
+        f"from the EIA federal and state motor fuel tax table, "
+        f"{sources.period.period} edition. "
+        + passthrough_notes(sources.lcfs, sources.cca, sources.wa, sources.orm)
     )
     return (
         "{\n"
         f'  date: "{target.isoformat()}",\n'
-        "  federalExcise: 0.184,\n"
-        '  federalSource: "https://www.irs.gov/publications/p510",\n'
-        '  federalVintage: "Unchanged since 1993; current per IRS Pub 510 '
-        '(2025). 18.3 cents excise + 0.1 cent LUST = 18.4 cents.",\n'
+        f"  federalExcise: {sources.period.federal:.4f},\n"
+        f'  federalSource: "{sources.period.source_url}",\n'
+        f'  federalVintage: "Federal excise and LUST fee as published for '
+        f'the {sources.period.period} edition of the EIA table.",\n'
         f'  aaaUrl: "{AAA_URL}",\n'
         f'  notes: "{notes}",\n'
         "  data: [\n"
@@ -1781,6 +1911,25 @@ def sanity_check_snapshot(snapshot: str, target: date) -> None:
         bad = [v for v in retail_values if not (1.0 < v < 12.0)]
         raise SnapshotError(
             f"sanity: retail values outside plausible range: {bad}"
+        )
+    if "adval:" in snapshot:
+        raise SnapshotError(
+            "sanity: built block still carries an ad-valorem field, which "
+            "the page no longer reads"
+        )
+    totals = [
+        float(v) for v in re.findall(r"fixed:\{ total:([0-9.]+),", snapshot)
+    ]
+    if len(totals) != 51:
+        raise SnapshotError(
+            f"sanity: expected 51 state-tax totals, got {len(totals)}"
+        )
+    # Every state charges something per gallon, and no state is close to
+    # a dollar; either bound means a source was misread.
+    if not all(0.0 < v < 1.0 for v in totals):
+        bad = [v for v in totals if not (0.0 < v < 1.0)]
+        raise SnapshotError(
+            f"sanity: state-tax totals outside plausible range: {bad}"
         )
 
 
@@ -1910,9 +2059,40 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
         "OR CFP: %s VWAP $%.2f/credit", orm.year_month, orm.vwap_per_credit
     )
 
-    new_block = build_snapshot_object(
-        target, baseline, retail, lcfs, cca, wa, orm
+    log.info("fetching federal and state tax table...")
+    period = fetch_tax_period_for_target_date(target, cache_dir)
+    log.info(
+        "EIA tax: %s edition, %d states, federal $%.4f",
+        period.period,
+        len(period.per_state),
+        period.federal,
     )
+
+    log.info("fetching Indiana gasoline use tax...")
+    in_gut = fetch_in_gut_for_target_date(target, cache_dir)
+    log.info("IN GUT: %s $%.4f/gal", in_gut.month_start, in_gut.usd_per_gal)
+
+    log.info("fetching wholesale benchmarks...")
+    key = load_eia_api_key()
+    spot = {
+        code: select_spot(load_spot_series(series, key), target, series)
+        for code, series in EIA_SPOT_SERIES.items()
+    }
+    for code, quote in sorted(spot.items()):
+        log.info(
+            "spot %s: %s $%.3f/gal", code, quote.year_month, quote.usd_per_gal
+        )
+
+    sources = SnapshotSources(
+        period=period,
+        in_gut=in_gut,
+        spot=spot,
+        lcfs=lcfs,
+        cca=cca,
+        wa=wa,
+        orm=orm,
+    )
+    new_block = build_snapshot_object(target, baseline, retail, sources)
     sanity_check_snapshot(new_block, target)
 
     snapshots.blocks = insert_in_date_order(
