@@ -18,12 +18,6 @@ Subcommands:
   remove-snapshot HTML SNAPSHOT_DATE [--dry-run]
       Remove the snapshot whose `date` field is SNAPSHOT_DATE.
 
-  migrate-state-tax HTML [--dry-run]
-      Restate every published snapshot's state and federal tax from the
-      sources in force on its own date, leaving retail and the non-tax
-      pass-throughs as captured. For moving the series onto sourced tax
-      data; not part of the weekly cycle.
-
   extract-markdown HTML [--output PATH]
       Write the embedded SPEC_MD spec text to PATH (or stdout).
 
@@ -2156,8 +2150,11 @@ def sanity_check_snapshot(snapshot: str, target: date) -> None:
             "sanity: built block still carries an ad-valorem field, "
             "which the row shape no longer has"
         )
+    # The sign is matched so a negative total fails as what it is -- an
+    # override larger than the rate it reduces -- rather than dropping
+    # out of the count and reading as a missing state.
     totals = [
-        float(v) for v in re.findall(r"fixed:\{ total:([0-9.]+),", snapshot)
+        float(v) for v in re.findall(r"fixed:\{ total:(-?[0-9.]+),", snapshot)
     ]
     if len(totals) != 51:
         raise SnapshotError(
@@ -2366,268 +2363,6 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Subcommand: migrate-state-tax
-# ---------------------------------------------------------------------------
-
-
-# The snapshots this script writes close their data array on its own
-# line; the hand-built ones that predate it close on the same line as
-# the last state. Both are valid input here, so the array is located by
-# span and spliced rather than reformatted.
-_DATA_ARRAY_RE = re.compile(r"  data: \[\n(?P<body>[\s\S]*?)\s*\]\s*\}\s*\Z")
-
-
-def _snapshot_day(block: str) -> date:
-    match = SNAPSHOT_DATE_RE.search(block)
-    if not match:
-        raise SnapshotError(f"snapshot has no date field: {block[:60]!r}")
-    return date.fromisoformat(match.group(1))
-
-
-def _captured_columns(block: str, expected: int) -> list[tuple[str, str]]:
-    """Every state's code, retail string and non-tax total.
-
-    These are the columns a state-tax migration has no business
-    touching: retail cannot be fetched again for a past date, and the
-    non-tax pass-throughs were settled against their own sources.
-
-    `expected` is how many states the block holds. A guard built from a
-    pattern fails open -- an unrecognised row layout yields nothing, and
-    comparing two empty lists passes while the rewrite proceeds -- so
-    the count is checked rather than assumed.
-    """
-    rows: list[tuple[str, str]] = []
-    for code, chunk in split_state_blocks(block):
-        retail = re.search(r"retail:\s*([0-9.]+)", chunk)
-        nontax = re.search(r"nontax:\{ total:([0-9.]+)", chunk)
-        if not retail or not nontax:
-            raise SnapshotError(
-                f"{code}: cannot read the retail or non-tax figure the "
-                f"migration must preserve"
-            )
-        rows.append((code, f"{retail.group(1)}/{nontax.group(1)}"))
-    if len(rows) != expected:
-        raise SnapshotError(
-            f"read {len(rows)} states where the snapshot holds "
-            f"{expected}; the guard would not see a lost row"
-        )
-    return rows
-
-
-def migrate_snapshot_tax(
-    block: str,
-    period: TaxPeriod,
-    in_gut: InGutRate,
-    spot: dict[str, SpotQuote],
-) -> tuple[str, dict[str, tuple[float, float]]]:
-    """Rewrite one published snapshot's state and federal tax.
-
-    Retail and the non-tax pass-throughs are left exactly as captured.
-    Returns the rewritten block and, per state changed, its old and new
-    total.
-    """
-    day = _snapshot_day(block)
-    found = _DATA_ARRAY_RE.search(block)
-    if not found:
-        raise SnapshotError(f"snapshot {day}: could not locate its data array")
-    states = len(split_state_blocks(found.group("body")))
-    before = _captured_columns(found.group("body"), states)
-    moved: dict[str, tuple[float, float]] = {}
-    rebuilt: list[str] = []
-    for code, chunk in split_state_blocks(found.group("body")):
-        retail_match = re.search(r"retail:([0-9.]+)", chunk)
-        old_match = re.search(r"fixed:\{ total:([0-9.]+)", chunk)
-        if not retail_match or not old_match:
-            raise SnapshotError(
-                f"snapshot {day}: {code} is missing its retail price or "
-                f"its state-tax total"
-            )
-        old = float(old_match.group(1))
-        tax = compose_state_tax(
-            code, day, period, float(retail_match.group(1)), in_gut, spot
-        )
-        chunk = drop_adval(swap_fixed(chunk, build_fixed(tax)))
-        if abs(tax.total - old) >= 0.00005:
-            moved[code] = (old, tax.total)
-        rebuilt.append(chunk)
-    spliced = (
-        block[: found.start("body")]
-        + "".join(rebuilt)
-        + block[found.end("body") :]
-    )
-    spliced = _migrate_federal(spliced, period)
-    spliced = _migrate_notes(spliced, period, in_gut)
-    check = _DATA_ARRAY_RE.search(spliced)
-    if not check:
-        raise SnapshotError(f"snapshot {day}: the rewrite lost its data array")
-    if _captured_columns(check.group("body"), states) != before:
-        raise SnapshotError(
-            f"snapshot {day}: migrating changed a captured column, which "
-            f"it must never do"
-        )
-    return spliced, moved
-
-
-def _migrate_federal(block: str, period: TaxPeriod) -> str:
-    """Point the federal fields at the table the state column now uses.
-
-    Each substitution asserts it matched. A field spelled differently or
-    absent would otherwise leave a half-restated federal row beside a
-    fully restated state column, reported as success -- and this runs
-    once against the published page, so the wrong figure would stay.
-    """
-    replacements = (
-        (
-            r"federalExcise: [0-9.]+,",
-            f"federalExcise: {period.federal:.4f},",
-        ),
-        (
-            r'federalSource: "[^"]*",',
-            f'federalSource: "{period.source_url}",',
-        ),
-        (
-            r'federalVintage: "(?:[^"\\]|\\.)*",',
-            (
-                f'federalVintage: "Federal excise and LUST fee as '
-                f"published for the {period.period} edition of the EIA "
-                f'table.",'
-            ),
-        ),
-    )
-    for pattern, replacement in replacements:
-        block, count = re.subn(pattern, replacement, block, count=1)
-        if count != 1:
-            field = pattern.split(":")[0].lstrip("^")
-            raise SnapshotError(
-                f"snapshot {_snapshot_day(block)}: no {field} field to "
-                f"restate, so the federal row would be left half-migrated"
-            )
-    return block
-
-
-def _migrate_notes(block: str, period: TaxPeriod, in_gut: InGutRate) -> str:
-    """Restate the state-tax sentence of a snapshot's notes.
-
-    Everything before it is per-snapshot provenance -- where the retail
-    came from -- and everything from the pass-through marker on belongs
-    to the other columns; only the middle is this migration's to
-    rewrite.
-    """
-    match = re.search(r'notes:\s*"((?:[^"\\]|\\.)*)"', block)
-    if not match:
-        raise SnapshotError(
-            f"snapshot {_snapshot_day(block)}: no notes field to restate"
-        )
-    existing = match.group(1)
-    # The pass-through section belongs to the other columns and stays
-    # put; where a snapshot has none, the sentence goes on the end.
-    tail_at = existing.find(PASSTHROUGH_NOTES_MARKER)
-    if tail_at < 0:
-        head, tail = existing, ""
-    else:
-        head, tail = existing[:tail_at], existing[tail_at:]
-    # The sentence being replaced opens with "State tax" in every shape
-    # the page has carried; anything before that is retail provenance.
-    state_at = head.find("State tax")
-    if state_at >= 0:
-        head = head[:state_at]
-    restated = (head.rstrip() + " ").lstrip()
-    restated += state_tax_notes(period, in_gut) + tail
-    # A snapshot whose sentence sat after the pass-through section would
-    # otherwise keep its stale claim beside the new one, which is the
-    # falsehood this exists to remove.
-    if restated.count("State tax") != 1:
-        raise SnapshotError(
-            f"snapshot {_snapshot_day(block)}: the notes carry a second "
-            f"state-tax sentence the restatement did not replace"
-        )
-    return block[: match.start(1)] + restated + block[match.end(1) :]
-
-
-def cmd_migrate_state_tax(args: argparse.Namespace) -> int:
-    html_text = read_html(args.html)
-    snapshots = parse_snapshots(html_text)
-    log.info("loaded %d snapshots from %s", len(snapshots.blocks), args.html)
-
-    cache_dir = Path.home() / ".cache" / "gas-prices-breakdown"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    log.info("fetching federal and state tax table...")
-    periods = load_tax_periods(cache_dir)
-    log.info("fetching Indiana gasoline use tax...")
-    in_rates = load_in_gut_rates(cache_dir)
-    log.info("fetching wholesale benchmarks...")
-    key = load_eia_api_key()
-    # Two states share the New York Harbor series, so the fetch is keyed
-    # by series rather than by state.
-    series = {
-        name: load_spot_series(name, key)
-        for name in sorted(set(EIA_SPOT_SERIES.values()))
-    }
-
-    rebuilt: list[str] = []
-    migrated = 0
-    # One snapshot the sources cannot reach must not hide the rest, so
-    # every failure is collected before the run gives up.
-    unreachable: list[str] = []
-    for block in snapshots.blocks:
-        day = _snapshot_day(block)
-        try:
-            new_block, moved = migrate_snapshot_tax(
-                block,
-                select_tax_period(periods, day),
-                select_in_gut(in_rates, day),
-                {
-                    code: select_spot(series[name], day, name)
-                    for code, name in EIA_SPOT_SERIES.items()
-                },
-            )
-        except SnapshotError as exc:
-            unreachable.append(f"{day}: {exc}")
-            rebuilt.append(block)
-            continue
-        rebuilt.append(new_block)
-        if new_block == block:
-            continue
-        migrated += 1
-        detail = (
-            "  ".join(
-                f"{code} {old:.4f} -> {new:.4f}"
-                for code, (old, new) in sorted(moved.items())
-            )
-            or "attribution only"
-        )
-        log.info("%s  %s", day, detail)
-    snapshots.blocks = rebuilt
-    new_html = render_snapshots(snapshots)
-
-    log.info("%d of %d snapshots migrated", migrated, len(snapshots.blocks))
-    if unreachable:
-        for line in unreachable:
-            log.error("%s", line)
-        log.error(
-            "%d snapshot(s) could not be migrated; nothing written",
-            len(unreachable),
-        )
-        return 1
-    if not migrated:
-        log.info("nothing to rewrite")
-        return 0
-    if args.dry_run:
-        log.info(
-            "dry-run: would write %d bytes (was %d); not modifying file",
-            len(new_html),
-            len(html_text),
-        )
-        return 0
-
-    backup = backup_html(args.html)
-    log.info("backed up to %s", backup)
-    write_with_canonical_mode(args.html, new_html)
-    log.info("wrote %d bytes", len(new_html))
-    return 0
-
-
-# ---------------------------------------------------------------------------
 # Subcommand: remove-snapshot
 # ---------------------------------------------------------------------------
 
@@ -2766,20 +2501,6 @@ def main(argv: list[str] | None = None) -> int:
         help="report what would be removed without modifying the HTML",
     )
     p_rm.set_defaults(func=cmd_remove_snapshot)
-
-    p_migrate = sub.add_parser(
-        "migrate-state-tax",
-        help="restate every snapshot's state and federal tax columns",
-    )
-    p_migrate.add_argument(
-        "html", type=Path, help="path to gas-price-breakdown.html"
-    )
-    p_migrate.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="report what would change without modifying the HTML",
-    )
-    p_migrate.set_defaults(func=cmd_migrate_state_tax)
 
     p_md = sub.add_parser(
         "extract-markdown",

@@ -1812,7 +1812,9 @@ def _tax_period(
 
 @contextlib.contextmanager
 def _add_snapshot_sources(
-    retail: float = 3.5, period: gpb.TaxPeriod | None = None
+    retail: float = 3.5,
+    period: gpb.TaxPeriod | None = None,
+    gut_month: date = date(2026, 9, 1),
 ) -> Iterator[None]:
     """Stub every fetch add-snapshot makes, so no test touches a network."""
     lcfs, _cca, _wa, orm = _sample_sources()
@@ -1843,7 +1845,7 @@ def _add_snapshot_sources(
             "fetch_in_gut_for_target_date",
             autospec=True,
             return_value=gpb.InGutRate(
-                date(2026, 9, 1), 0.239, "https://example.invalid/dn02.pdf"
+                gut_month, 0.239, "https://example.invalid/dn02.pdf"
             ),
         ),
         patch.object(
@@ -1853,7 +1855,12 @@ def _add_snapshot_sources(
             gpb,
             "load_spot_series",
             autospec=True,
-            return_value={"2026-06": 3.037, "2026-07": 3.222},
+            return_value={
+                "2026-02": 2.081,
+                "2026-03": 2.952,
+                "2026-06": 3.037,
+                "2026-07": 3.222,
+            },
         ),
     ):
         yield
@@ -1958,257 +1965,70 @@ def test_add_snapshot_adds_back_a_gross_receipts_tax(
     assert "gross earnings" in conn
 
 
-@contextlib.contextmanager
-def _migrate_sources(period: gpb.TaxPeriod | None = None) -> Iterator[None]:
-    """Stub the three series the migration downloads once per run."""
-    chosen = period or _tax_period()
-    # Two editions, so a snapshot from either half-year resolves.
-    earlier = _tax_period(period=date(2026, 1, 1), rate=0.30)
+def test_add_snapshot_applies_a_rate_override(tmp_path: Path) -> None:
+    """A suspension the table does not carry must reach the page.
+
+    Georgia's excise holiday is larger than any pass-through this
+    script prices, so a snapshot that missed it would be wrong by more
+    than every non-tax column put together.
+    """
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
     with (
-        patch.object(
-            gpb,
-            "load_tax_periods",
-            autospec=True,
-            return_value=[earlier, chosen],
-        ),
-        patch.object(
-            gpb,
-            "load_in_gut_rates",
-            autospec=True,
-            return_value={
-                date(2026, 5, 1): 0.233,
-                date(2026, 9, 1): 0.239,
-            },
-        ),
-        patch.object(
-            gpb, "load_eia_api_key", autospec=True, return_value="key"
-        ),
-        patch.object(
-            gpb,
-            "load_spot_series",
-            autospec=True,
-            return_value={
-                "2026-02": 2.081,
-                "2026-03": 2.952,
-                "2026-06": 3.037,
-                "2026-07": 3.222,
-            },
+        _backups_under(tmp_path),
+        _add_snapshot_sources(
+            # Above the 33.3 cent holiday, as Georgia's real rate is.
+            period=_tax_period(period=date(2026, 1, 1), rate=0.3405),
+            gut_month=date(2026, 5, 1),
         ),
     ):
-        yield
-
-
-def _migrated(tmp_path: Path, *blocks: str) -> str:
-    html = tmp_path / "page.html"
-    html.write_text(_page(*blocks))
-    with _backups_under(tmp_path), _migrate_sources():
-        assert gpb.main(["migrate-state-tax", str(html)]) == 0
-    return html.read_text()
-
-
-def test_migrate_leaves_retail_and_nontax_exactly_as_captured(
-    tmp_path: Path,
-) -> None:
-    """Neither column can be re-derived, so neither may be disturbed."""
-    block = _snapshot_block("2026-09-17", CODES)
-    before = gpb._captured_columns(gpb.extract_data_block(block), len(CODES))
-    built = gpb.parse_snapshots(_migrated(tmp_path, block)).blocks[0]
-    after = gpb._captured_columns(gpb.extract_data_block(built), len(CODES))
-    assert after == before
-
-
-def test_captured_columns_refuses_a_block_it_cannot_fully_read() -> None:
-    """A guard built from a pattern must not fail open on a lost row."""
-    body = gpb.extract_data_block(_snapshot_block("2026-09-17", CODES))
-    with pytest.raises(gpb.SnapshotError) as caught:
-        gpb._captured_columns(body, len(CODES) + 1)
-    assert "would not see a lost row" in str(caught.value)
-
-
-def test_migrate_drops_the_ad_valorem_field(tmp_path: Path) -> None:
-    """The published rows carry a field the page no longer reads."""
-    built = _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
-    assert "adval:" not in built
-
-
-def test_migrate_restates_the_federal_fields(tmp_path: Path) -> None:
-    """The federal rate rides the same table as the state ones."""
-    built = _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
-    assert "federalExcise: 0.1840," in built
-    assert "fueltaxes.xlsx" in built
-
-
-def test_migrate_restates_only_the_state_tax_sentence(
-    tmp_path: Path,
-) -> None:
-    """Retail provenance and the pass-through section are not its to edit."""
-    built = gpb.parse_snapshots(
-        _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
-    ).blocks[0]
-    notes = re.search(r'notes:\s*"((?:[^"\\]|\\.)*)"', built)
-    assert notes is not None
-    text = notes.group(1)
-    assert text.startswith("Fixture snapshot.")
-    assert gpb.STATE_TAX_NOTES_MARKER in text
-    assert gpb.PASSTHROUGH_NOTES_MARKER in text
-    assert text.index(gpb.STATE_TAX_NOTES_MARKER) < text.index(
-        gpb.PASSTHROUGH_NOTES_MARKER
-    )
-
-
-def test_migrate_restates_the_state_tax_total(tmp_path: Path) -> None:
-    """The thing the command exists for; without this the rest is vacuous."""
-    built = _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
-    block = gpb.parse_snapshots(built).blocks[0]
-    texas = next(
-        c for code, c in gpb.split_state_blocks(block) if code == "TX"
-    )
-    assert "fixed:{ total:0.3000," in texas
-    assert "total:0.1000" not in block
-
-
-def test_migrate_composes_indiana_and_applies_its_suspension(
-    tmp_path: Path,
-) -> None:
-    """Indiana is the headline case and needs its own migration test."""
-    built = _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
-    block = gpb.parse_snapshots(built).blocks[0]
-    indiana = next(
-        c for code, c in gpb.split_state_blocks(block) if code == "IN"
-    )
-    assert f"fixed:{{ total:{gpb.IN_OIL_INSPECTION_FEE:.4f}," in indiana
-    assert "Suspended" in indiana
-
-
-def test_migrate_applies_a_rate_override(tmp_path: Path) -> None:
-    """Georgia's excise holiday is larger than any pass-through here."""
-    built = _migrated(tmp_path, _snapshot_block("2026-05-21", CODES))
-    block = gpb.parse_snapshots(built).blocks[0]
+        assert (
+            gpb.main(["add-snapshot", str(html), "--target", "2026-05-21"])
+            == 0
+        )
+    built = gpb.parse_snapshots(html.read_text()).blocks[0]
     georgia = next(
-        c for code, c in gpb.split_state_blocks(block) if code == "GA"
+        c for code, c in gpb.split_state_blocks(built) if code == "GA"
     )
-    expected = round(0.30 - 0.333, 4)
-    assert f"fixed:{{ total:{expected:.4f}," in georgia
+    assert f"fixed:{{ total:{round(0.3405 - 0.333, 4):.4f}," in georgia
     assert "HB 1199" in georgia
 
 
-def test_migrate_adds_back_a_gross_receipts_tax(tmp_path: Path) -> None:
-    """Connecticut's is a sixth of its corrected total."""
-    built = _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
-    block = gpb.parse_snapshots(built).blocks[0]
-    conn = next(c for code, c in gpb.split_state_blocks(block) if code == "CT")
-    expected = round(0.30 + gpb.CT_PGET_RATE * gpb.CT_PGET_CAP_USD, 4)
-    assert f"fixed:{{ total:{expected:.4f}," in conn
-
-
-def test_migrate_removes_the_stale_state_tax_sentence(
+def test_an_override_larger_than_the_rate_fails_the_sanity_check(
     tmp_path: Path,
 ) -> None:
-    """Leaving the old claim beside the new one is the falsehood at issue."""
-    built = _migrated(tmp_path, _snapshot_block("2026-09-17", CODES))
-    assert "inherited from a baseline" not in built
-
-
-def test_migrate_refuses_notes_that_keep_a_second_claim(
-    tmp_path: Path,
-) -> None:
-    """A sentence after the pass-through section must not survive."""
-    block = _snapshot_block("2026-09-17", CODES).replace(
-        "State taxes (cols 3-4) inherited from a baseline. ", ""
-    )
-    block = block.replace(
-        "($84.75/MT).",
-        "($84.75/MT). State taxes inherited from a baseline.",
-    )
+    """A negative total is a bad table, and must not read as a lost row."""
     html = tmp_path / "page.html"
-    html.write_text(_page(block))
-    with _backups_under(tmp_path), _migrate_sources():
-        assert gpb.main(["migrate-state-tax", str(html)]) == 1
-
-
-def test_migrate_refuses_a_half_restated_federal_row(
-    tmp_path: Path,
-) -> None:
-    """A silently skipped field would bake the wrong figure in for good."""
-    block = _snapshot_block("2026-09-17", CODES).replace(
-        '  federalVintage: "Unchanged since 1993.",\n', ""
-    )
-    html = tmp_path / "page.html"
-    html.write_text(_page(block))
-    before = html.read_text()
-    with _backups_under(tmp_path), _migrate_sources():
-        assert gpb.main(["migrate-state-tax", str(html)]) == 1
-    assert html.read_text() == before
-
-
-def test_migrate_is_idempotent(tmp_path: Path) -> None:
-    """Re-running against settled data must not churn the file."""
-    html = tmp_path / "page.html"
-    html.write_text(_page(_snapshot_block("2026-09-17", CODES)))
-    with _backups_under(tmp_path), _migrate_sources():
-        gpb.main(["migrate-state-tax", str(html)])
-        once = html.read_text()
-        assert gpb.main(["migrate-state-tax", str(html)]) == 0
-    assert html.read_text() == once
-
-
-def test_migrate_dry_run_leaves_the_file_alone(tmp_path: Path) -> None:
-    """A dry run is what the rewrite gets approved from."""
-    html = tmp_path / "page.html"
-    html.write_text(_page(_snapshot_block("2026-09-17", CODES)))
-    before = html.read_text()
-    with _backups_under(tmp_path), _migrate_sources():
-        assert gpb.main(["migrate-state-tax", "--dry-run", str(html)]) == 0
-    assert html.read_text() == before
-
-
-def test_migrate_reports_every_unreachable_snapshot(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """One snapshot off the front of the sources must not hide the rest."""
-    html = tmp_path / "page.html"
-    html.write_text(
-        _page(
-            _snapshot_block("2026-09-17", CODES),
-            _snapshot_block("2019-01-03", CODES),
-        )
-    )
-    before = html.read_text()
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
     with (
         _backups_under(tmp_path),
-        _migrate_sources(),
-        caplog.at_level("ERROR"),
-    ):
-        assert gpb.main(["migrate-state-tax", str(html)]) == 1
-    assert html.read_text() == before
-    assert "2019-01-03" in caplog.text
-
-
-def test_migrate_refuses_to_disturb_a_captured_column(
-    tmp_path: Path,
-) -> None:
-    """The guard between a bad splice and irreplaceable data.
-
-    A splice that damaged retail is exactly what cannot be recovered, so
-    the guard is driven by making the rewrite misbehave rather than by
-    feeding it bad input.
-    """
-    html = tmp_path / "page.html"
-    html.write_text(_page(_snapshot_block("2026-09-17", CODES)))
-    before = html.read_text()
-
-    def _corrupting_drop(chunk: str) -> str:
-        return chunk.replace("retail:3.500", "retail:9.999")
-
-    with (
-        _backups_under(tmp_path),
-        _migrate_sources(),
-        patch.object(
-            gpb, "drop_adval", autospec=True, side_effect=_corrupting_drop
+        # Well under Georgia's 33.3 cent holiday, so its total goes below
+        # zero and the check has to say so.
+        _add_snapshot_sources(
+            period=_tax_period(period=date(2026, 1, 1), rate=0.10),
+            gut_month=date(2026, 5, 1),
         ),
     ):
-        assert gpb.main(["migrate-state-tax", str(html)]) == 1
-    assert html.read_text() == before
+        assert (
+            gpb.main(["add-snapshot", str(html), "--target", "2026-05-21"])
+            == 1
+        )
+
+
+def test_add_snapshot_outside_the_swept_range_is_refused(
+    tmp_path: Path,
+) -> None:
+    """Past the sweep, no override table can say a rate was collected."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
+    beyond = gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH + timedelta(days=1)
+    with _backups_under(tmp_path), _add_snapshot_sources():
+        assert (
+            gpb.main(
+                ["add-snapshot", str(html), "--target", beyond.isoformat()]
+            )
+            == 1
+        )
 
 
 def test_add_snapshot_dry_run_leaves_the_page_alone(tmp_path: Path) -> None:
