@@ -521,17 +521,6 @@ def test_lcfs_export_without_usable_rows_is_reported(
     assert "no dated rows" in str(caught.value)
 
 
-def test_lcfs_export_that_is_not_a_workbook_is_reported(
-    tmp_path: Path,
-) -> None:
-    """A source answering 200 with an error page is still bad input."""
-    book = tmp_path / "lcfs.xls"
-    book.write_text("<html>503 Service Unavailable</html>")
-    with pytest.raises(gpb.SnapshotError) as caught:
-        gpb._read_lcfs_daily(book)
-    assert "CA LCFS" in str(caught.value)
-
-
 @contextlib.contextmanager
 def _or_cfp_sources(
     monthly: dict[tuple[int, int], float],
@@ -705,7 +694,8 @@ def test_lcfs_damaged_export_is_reported_not_raised(
     Only the innermost is an `XLRDError`; a corrupt container and a
     truncated transfer surface as other classes entirely, and any of
     them escaping would be a traceback where the tool promises one
-    reported line.
+    reported line. The error page is the case that arrives with a 200,
+    so nothing before this point has reason to treat it as a failure.
     """
     book = tmp_path / "lcfs.xls"
     book.write_bytes(blob)
