@@ -117,10 +117,15 @@ USER_AGENT = (
 # knowable on the date being snapshotted.
 
 # CARB Cap-and-Invest joint-auction current-vintage settlement prices.
-# Source: ARB "Summary of California-Quebec Joint Auction Settlement
-# Prices and Results" (results_summary.pdf at the CARB auction-information
-# page). Auctions run Feb / May / Aug / Nov; add the new settlement here
-# within the quarter, or the next run fails (see CCA_STALE_DAYS).
+# Source: the program page below, whose "Summary of California-Quebec
+# Joint Auction Settlement Prices and Results" (results_summary.pdf)
+# carries the settlement price. Auctions run Feb / May / Aug / Nov; add
+# the new settlement here within the quarter, or the next run fails
+# (see CCA_STALE_DAYS).
+CARB_CCA_PROGRAM_URL = (
+    "https://ww2.arb.ca.gov/our-work/programs/cap-and-trade-program/"
+    "auction-information"
+)
 CARB_CCA_AUCTIONS: list[tuple[date, float, str]] = [
     (date(2025, 11, 19), 28.32, "Nov 2025 Joint Auction #45"),
     (date(2026, 2, 18), 27.94, "Feb 2026 Joint Auction #46"),
@@ -129,10 +134,13 @@ CARB_CCA_AUCTIONS: list[tuple[date, float, str]] = [
 ]
 
 # Washington Climate Commitment Act allowance auction settlements.
-# Source: ecology.wa.gov/air-climate/climate-commitment-act/cap-and-invest
-# /auctions-and-market, whose per-auction Summary Report carries the
-# settlement price, the auction date, and the certification date.
-# Quarterly; same maintenance obligation as the CARB table above.
+# Source: the program page below, whose per-auction Summary Report
+# carries the settlement price, the auction date, and the certification
+# date. Quarterly; same maintenance obligation as the CARB table above.
+WA_CCA_PROGRAM_URL = (
+    "https://ecology.wa.gov/air-climate/climate-commitment-act/"
+    "cap-and-invest/auctions-and-market"
+)
 WA_CCA_AUCTIONS: list[tuple[date, float, str]] = [
     (date(2025, 12, 3), 70.86, "WA Auction #12 (Dec 3, 2025)"),
     (date(2026, 3, 4), 65.26, "WA Auction #13 (Mar 4, 2026)"),
@@ -229,6 +237,11 @@ OR_CFP_STALE_DAYS = 125
 OR_CFP_URL = (
     "https://www.oregon.gov/deq/ghgp/Documents/"
     "CFPCreditTransferActivityReport.xlsx"
+)
+# The program's own landing page, cited on the page beside the figure;
+# the xlsx above is what the run actually reads.
+OR_CFP_PROGRAM_URL = (
+    "https://www.oregon.gov/deq/ghgp/cfp/pages/monthly-data.aspx"
 )
 
 # EIA's federal and state motor fuel tax table, one sheet per January 1
@@ -1883,7 +1896,7 @@ def build_ca_nontax(d: date, lcfs: LcfsQuote, cca: AuctionSettlement) -> str:
     return (
         f"nontax:{{ total:{total:.4f}, parts:[\n"
         f'      {{n:"LCFS pass-through", v:{lcfs_pass:.4f}, '
-        f'src:"{LCFS_MONITOR_URL}", '
+        f'src:"{_js_string(LCFS_MONITOR_URL)}", '
         f'note:"Credit ${lcfs.usd_per_mt:.2f}/MT ({lcfs.as_of.isoformat()}) '
         f"{TIMES} {LCFS_FACTOR:.6f}. Daily Argus assessment, via Neste's "
         f"LCFS monitor. An assessed market price, not CARB's "
@@ -1892,9 +1905,9 @@ def build_ca_nontax(d: date, lcfs: LcfsQuote, cca: AuctionSettlement) -> str:
         f"credit transfer reports after the week of "
         f'{LCFS_LAST_CARB_WEEK.isoformat()}."}},\n'
         f'      {{n:"Cap-and-Invest pass-through", v:{cca_pass:.4f}, '
-        f'src:"https://ww2.arb.ca.gov/our-work/programs/'
-        f'cap-and-trade-program/auction-information", '
-        f'note:"${cca.price:.2f}/allowance ({cca.label}) {TIMES} '
+        f'src:"{_js_string(CARB_CCA_PROGRAM_URL)}", '
+        f'note:"${cca.price:.2f}/allowance ({_js_string(cca.label)}) '
+        f"{TIMES} "
         f'{CCA_FACTOR_MT_PER_GAL} MT/gal"}}'
         f'], asOf:"{d.isoformat()}"}}'
     )
@@ -1906,11 +1919,11 @@ def build_or_nontax(month: OrCfpMonth) -> str:
         f"nontax:{{ total:{pass_through:.4f}, parts:[\n"
         f'      {{n:"Clean Fuels Program credit pass-through", '
         f"v:{pass_through:.4f}, "
-        f'src:"https://www.oregon.gov/deq/ghgp/cfp/pages/monthly-data.aspx", '
-        f'note:"OR CFP {month.year_month} VWAP '
+        f'src:"{_js_string(OR_CFP_PROGRAM_URL)}", '
+        f'note:"OR CFP {_js_string(month.year_month)} VWAP '
         f"${month.vwap_per_credit:.2f}/credit {TIMES} {OR_FACTOR:.6f} "
         f'(factor anchored to existing snapshot Jan 2025)"}}'
-        f'], asOf:"{month.year_month}"}}'
+        f'], asOf:"{_js_string(month.year_month)}"}}'
     )
 
 
@@ -1920,9 +1933,9 @@ def build_wa_nontax(wa: AuctionSettlement) -> str:
         f"nontax:{{ total:{pass_through:.4f}, parts:[\n"
         f'      {{n:"Climate Commitment Act allowance pass-through", '
         f"v:{pass_through:.4f}, "
-        f'src:"https://ecology.wa.gov/air-climate/climate-commitment-act/'
-        f'cap-and-invest/auctions-and-market", '
-        f'note:"${wa.price:.2f}/allowance ({wa.label}) {TIMES} '
+        f'src:"{_js_string(WA_CCA_PROGRAM_URL)}", '
+        f'note:"${wa.price:.2f}/allowance ({_js_string(wa.label)}) '
+        f"{TIMES} "
         f'{WA_FACTOR:.5f} (factor anchored to existing snapshot Mar 2026)"}}'
         f'], asOf:"{wa.effective.isoformat()}"}}'
     )
@@ -2061,11 +2074,34 @@ def _excise_of(period: TaxPeriod, code: str) -> float:
 def _js_string(text: str) -> str:
     """Escape text for a double-quoted JavaScript string literal.
 
-    The page is JavaScript source, so a stray quote or backslash in an
-    authority label or a source URL would break parsing for the whole
-    array rather than just its own row.
+    The page is JavaScript source inside an HTML script element, so a
+    hand-entered value can break it two ways: a quote, backslash or
+    control character ends the string literal, and `</script>` ends the
+    element regardless of what the parser thinks it is inside. Either
+    costs the whole snapshot array, not just its own row.
+
+    `json.dumps` covers the first for every control character rather
+    than the two that happen to come to mind; its outer quotes are
+    dropped because the caller supplies them, and `ensure_ascii` is off
+    so the page keeps the characters it was written with instead of
+    growing escapes the rest of it does not use.
+
+    That leaves three JSON does not handle here. U+2028 and U+2029 are
+    line terminators everywhere in JavaScript except inside a string
+    literal, which ES2019 carved out; escaping them costs nothing and
+    keeps the value safe if it is ever emitted anywhere but here. `<`
+    is escaped outright rather than just `</`, because a value carrying
+    `<!--` and a later `<script` can send the HTML tokenizer somewhere
+    the page's own closing tag no longer closes the element.
+
+    They are matched by code point rather than written as characters:
+    two of the three are invisible, so a literal would read as a stray
+    space that the next person to tidy this file would delete.
     """
-    return text.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = json.dumps(text, ensure_ascii=False)[1:-1]
+    for point in (0x3C, 0x2028, 0x2029):
+        escaped = escaped.replace(chr(point), f"\\u{point:04x}")
+    return escaped
 
 
 def build_fixed(tax: StateTax) -> str:
@@ -2079,7 +2115,7 @@ def build_fixed(tax: StateTax) -> str:
     )
     return (
         f"fixed:{{ total:{tax.total:.4f}, parts:[\n"
-        f'{rendered}], asOf:"{tax.as_of}"}}'
+        f'{rendered}], asOf:"{_js_string(tax.as_of)}"}}'
     )
 
 
@@ -2148,11 +2184,11 @@ def build_snapshot_object(
         "{\n"
         f'  date: "{target.isoformat()}",\n'
         f"  federalExcise: {sources.period.federal:.4f},\n"
-        f'  federalSource: "{sources.period.source_url}",\n'
+        f'  federalSource: "{_js_string(sources.period.source_url)}",\n'
         f'  federalVintage: "Federal excise and LUST fee as published for '
         f'the {sources.period.period} edition of the EIA table.",\n'
-        f'  aaaUrl: "{AAA_URL}",\n'
-        f'  notes: "{notes}",\n'
+        f'  aaaUrl: "{_js_string(AAA_URL)}",\n'
+        f'  notes: "{_js_string(notes)}",\n'
         "  data: [\n"
         f"{body}"
         "  ]\n"

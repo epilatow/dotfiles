@@ -1851,14 +1851,81 @@ def _snapshot_block(day: str, codes: list[str]) -> str:
         ('a "quoted" word', 'a \\"quoted\\" word'),
         ("back\\slash", "back\\\\slash"),
         ('both \\ and "', 'both \\\\ and \\"'),
+        ("two\nlines", "two\\nlines"),
+        ("a\ttab", "a\\ttab"),
+        ("ends </script> early", "ends \\u003c/script> early"),
+        ("opens <!-- a comment", "opens \\u003c!-- a comment"),
+        ("breaks\u2028a line", "breaks\\u2028a line"),
+        ("splits\u2029a para", "splits\\u2029a para"),
+        # The page carries this character elsewhere unescaped, so the
+        # escaper must not be the one thing that spells it differently.
+        (f"4.0% {gpb.TIMES} retail", f"4.0% {gpb.TIMES} retail"),
     ],
-    ids=["plain", "quote", "backslash", "both"],
+    ids=[
+        "plain",
+        "quote",
+        "backslash",
+        "both",
+        "newline",
+        "tab",
+        "script_close",
+        "comment_open",
+        "line_separator",
+        "paragraph_separator",
+        "non_ascii_kept",
+    ],
 )
 def test_page_strings_are_escaped_for_javascript(
     raw: str, expected: str
 ) -> None:
     """The page is JS source; one stray quote breaks the whole array."""
     assert gpb._js_string(raw) == expected
+
+
+PAGE_URL_CONSTANTS = (
+    "LCFS_MONITOR_URL",
+    "AAA_URL",
+    "CARB_CCA_PROGRAM_URL",
+    "WA_CCA_PROGRAM_URL",
+    "OR_CFP_PROGRAM_URL",
+)
+
+
+def test_no_single_expression_page_field_skips_the_escaper() -> None:
+    """A field added without _js_string is the failure mode here.
+
+    Driving values through main() only covers the fields some source
+    happens to feed, so the builders are read directly instead. Only
+    fields that are one interpolation and nothing else are checked; a
+    field built from several pieces is the end-to-end test's job.
+
+    Adjacent f-string fragments are joined first, because the wrap at
+    79 columns routinely splits a long `src:"{...}"` across two of
+    them and an unjoined scan would read straight past it.
+    """
+    builders = {
+        chunk.split("(", 1)[0]: chunk
+        for chunk in HELPER.read_text().split("\ndef ")
+        if chunk.startswith("build_")
+    }
+    assert set(builders) == {
+        "build_ca_nontax",
+        "build_or_nontax",
+        "build_wa_nontax",
+        "build_fixed",
+        "build_data_block",
+        "build_snapshot_object",
+    }, f"the discoverable builders changed: {sorted(builders)}"
+    joined = re.sub(r"['\"]\s*\n\s*f?['\"]", "", "\n".join(builders.values()))
+    fields = re.findall(r'\w+: ?"\{([^{}]+)\}"', joined)
+    assert fields, "the field pattern no longer matches the builders"
+    unescaped = [
+        expr
+        for expr in fields
+        if not expr.startswith("_js_string(")
+        and not expr.endswith(".isoformat()")
+    ]
+    assert not unescaped, f"reaching the page unescaped: {unescaped}"
 
 
 def test_a_quote_in_an_authority_label_does_not_break_the_page() -> None:
@@ -1869,9 +1936,11 @@ def test_a_quote_in_an_authority_label_does_not_break_the_page() -> None:
         as_of="2026-07-01",
     )
     rendered = gpb.build_fixed(tax)
+    # The unescaped form closes the field early and leaves a bare word
+    # where the renderer expects a key; either assertion alone catches
+    # a broken escaper.
     assert '\\"no\\"' in rendered
-    # The field must still close where the renderer expects it to.
-    assert rendered.count('n:"') == 1
+    assert 'n:"He said "no"' not in rendered
 
 
 def _page(*blocks: str) -> str:
@@ -1978,6 +2047,57 @@ def _add_snapshot_sources(
         ),
     ):
         yield
+
+
+# The hand-maintained URLs the builders interpolate directly. The many
+# others the page carries -- every TaxPart.src, so the per-state tax and
+# gross-receipts citations -- reach it through one escaped call site in
+# build_fixed, which the authority-label test covers. These are the ones
+# with a call site each, so each is driven with a quote of its own.
+def test_every_hand_entered_string_reaching_the_page_is_escaped(
+    tmp_path: Path,
+) -> None:
+    """A quote anywhere in the emitted object breaks the whole array.
+
+    The auction labels, the source URLs and the notes sentence are
+    hand-entered or composed from hand-entered parts, so each is driven
+    with a quote in it rather than trusting that the tax parts standing
+    alone prove the rest.
+    """
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
+    quoted = gpb.AuctionSettlement(
+        date(2026, 8, 19), 32.48, 'Aug 2026 "Joint" Auction'
+    )
+    with (
+        _backups_under(tmp_path),
+        _add_snapshot_sources(),
+        patch.object(
+            gpb, "latest_auction", autospec=True, return_value=quoted
+        ),
+        contextlib.ExitStack() as patched,
+    ):
+        for name in PAGE_URL_CONSTANTS:
+            patched.enter_context(
+                patch.object(gpb, name, f'https://x.invalid/"{name}"')
+            )
+        assert (
+            gpb.main(["add-snapshot", str(html), "--target", "2026-09-17"])
+            == 0
+        )
+    built = gpb.parse_snapshots(html.read_text()).blocks[0]
+    # Every double quote in the block must be either a field delimiter
+    # or escaped; an unescaped one inside a value is what breaks it.
+    assert '"Joint"' not in built
+    assert '\\"Joint\\"' in built
+    for name in PAGE_URL_CONSTANTS:
+        assert f'"{name}"' not in built, f"{name} reached the page raw"
+        assert f'\\"{name}\\"' in built, f"{name} never reached the page"
+    # The multiplication sign reaches the page through both an escaped
+    # field and an unescaped one; a page that spells it two ways is a
+    # page whose escaper quietly rewrote half of it.
+    assert "\\u00d7" not in built
+    assert built.count(gpb.TIMES) > 1
 
 
 def test_a_benchmark_derived_figure_says_so_on_the_page(
