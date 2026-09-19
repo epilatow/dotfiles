@@ -1476,6 +1476,28 @@ def test_indiana_checked_through_covers_every_shipped_window() -> None:
     assert max(ends) <= gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH
 
 
+def test_the_indiana_code_citation_covers_the_swept_range() -> None:
+    """Widening the sweep must not leave the citation an edition behind.
+
+    The URL names a code edition by year. One year serves every
+    snapshot only for as long as the sweep keeps them all inside it,
+    so the two have to move together.
+    """
+    years = {
+        gpb.TAX_ADJUSTMENTS_CHECKED_FROM.year,
+        gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH.year,
+    }
+    assert len(years) == 1, (
+        "the sweep spans two years, so IN_OIL_INSPECTION_SOURCE_URL "
+        "can no longer name one code edition for every snapshot"
+    )
+    year = years.pop()
+    assert f"/laws/{year}/" in gpb.IN_OIL_INSPECTION_SOURCE_URL, (
+        f"the sweep prices {year}; move IN_OIL_INSPECTION_SOURCE_URL "
+        f"to that code edition"
+    )
+
+
 def test_tax_sheet_carries_the_excise_column_for_indiana(
     tmp_path: Path,
 ) -> None:

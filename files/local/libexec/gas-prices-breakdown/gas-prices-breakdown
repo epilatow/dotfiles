@@ -296,9 +296,16 @@ IN_GUT_STALE_DAYS = 70
 # is what remains collectable while the excise and use tax are
 # suspended, and it is the residual that makes EIA's Indiana columns
 # reconcile: their "other" is the previous month's use tax plus this.
+#
+# The citation names a code edition by year, and one year serves every
+# snapshot only because the override sweep confines them all to one
+# (see TAX_ADJUSTMENTS_CHECKED_FROM..THROUGH). A test enforces that.
+# Moving the sweep to a later year means moving this with it; widening
+# it to span two years means this constant can no longer be one URL,
+# and the citation has to become per-snapshot.
 IN_OIL_INSPECTION_FEE = 0.01
 IN_OIL_INSPECTION_SOURCE_URL = (
-    "https://iga.in.gov/laws/2024/ic/titles/16#16-44-2-18"
+    "https://iga.in.gov/laws/2026/ic/titles/16#16-44-2-18"
 )
 IN_EXCISE_SOURCE_URL = (
     "https://www.in.gov/dor/business-tax/fuel-tax/gasoline-tax/"
