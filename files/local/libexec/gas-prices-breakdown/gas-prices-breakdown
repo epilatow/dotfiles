@@ -1846,9 +1846,12 @@ def _and_list(items: Sequence[str]) -> str:
 def state_tax_notes(period: TaxPeriod, in_gut: InGutRate, day: date) -> str:
     """Summarise where a snapshot's state-tax column came from.
 
-    The override list is derived for `day` rather than written out, so
-    the sentence cannot claim a suspension that had lapsed or miss one
-    that had started.
+    The two clauses that vary by date -- the override list and
+    Indiana's own suspension clause -- are derived for `day` rather
+    than written out, so neither can report a suspension that had
+    lapsed or miss one that had started. Indiana's two taxes are
+    suspended on their own dates, so a backfill into early 2026 falls
+    on neither and a date between the two windows falls on one.
     """
     overridden = sorted(
         {e.state for e in STATE_TAX_ADJUSTMENTS if e.start <= day <= e.end}
@@ -1859,11 +1862,21 @@ def state_tax_notes(period: TaxPeriod, in_gut: InGutRate, day: date) -> str:
         if overridden
         else ""
     )
+    in_suspended = sum(
+        _suspended_on(windows, day) is not None
+        for windows in (IN_EXCISE_SUSPENSIONS, IN_GUT_SUSPENSIONS)
+    )
+    in_clause = (
+        f", with its own {'suspensions' if in_suspended > 1 else 'suspension'}"
+        f" applied"
+        if in_suspended
+        else ""
+    )
     return (
         f"{STATE_TAX_NOTES_MARKER}EIA federal and state motor fuel tax "
         f"table, {period.period} edition; IN composed from its excise, "
         f"oil inspection fee and {in_gut.month_start:%b %Y} gasoline use "
-        f"tax, with its own suspensions applied; "
+        f"tax{in_clause}; "
         f"{override_clause}"
         f"{_and_list(GROSS_RECEIPTS_STATES)} adding the gross-receipts "
         f"taxes the table excludes. "

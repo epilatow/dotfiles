@@ -1370,6 +1370,27 @@ def test_notes_name_the_states_whose_rate_is_overridden() -> None:
     assert "GA" not in after
 
 
+def test_notes_claim_an_indiana_suspension_only_when_one_is_in_force() -> None:
+    """The sentence must not assert a suspension on a date without one.
+
+    Within today's swept range the false branch is reachable only
+    before the first Indiana window opens, which is the backfill
+    stretch this derivation exists for. Extending the sweep past the
+    last window makes it reachable on the far side too, which is the
+    same bug in the other direction.
+    """
+    period = _tax_period()
+    gut = gpb.InGutRate(date(2026, 2, 1), 0.149, "https://x.invalid")
+    before = gpb.state_tax_notes(period, gut, date(2026, 2, 19))
+    one = gpb.state_tax_notes(period, gut, date(2026, 4, 8))
+    both = gpb.state_tax_notes(period, gut, date(2026, 5, 6))
+    assert "suspension" not in before
+    # Only the use tax is suspended until the excise window opens, so
+    # the plural would be claiming a second one that is still collected.
+    assert "with its own suspension applied" in one
+    assert "with its own suspensions applied" in both
+
+
 def test_indiana_is_not_in_the_flat_override_table() -> None:
     """Its composition path returns before the table is consulted.
 
