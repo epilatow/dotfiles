@@ -43,6 +43,11 @@ HELPER = (
 URL = "https://example.invalid/report.xlsx"
 
 
+DAY = date(2026, 9, 17)
+
+CODES = sorted(set(gpb.STATE_CODE.values()))
+
+
 @pytest.fixture(autouse=True)
 def no_backoff_sleep() -> Iterator[list[float]]:
     """Record the retry delays instead of waiting them out."""
@@ -305,6 +310,40 @@ def test_process_exits_one_with_no_traceback(tmp_path: Path) -> None:
 # publisher can change without notice. A run that cannot find what it
 # needs has to say so and leave the snapshot alone, because the
 # alternative is writing a plausible-looking number nobody can trace.
+
+
+@pytest.mark.parametrize(
+    "blob",
+    [
+        b"",
+        b"<html>503 Service Unavailable</html>",
+        b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 600,
+    ],
+    ids=["empty", "error_page", "corrupt_ole2"],
+)
+def test_lcfs_damaged_export_is_reported_not_raised(
+    tmp_path: Path, blob: bytes
+) -> None:
+    """xlrd signals damage through several unrelated exception types.
+
+    Only the innermost is an `XLRDError`; a corrupt container and a
+    truncated transfer surface as other classes entirely, and any of
+    them escaping would be a traceback where the tool promises one
+    reported line. The error page is the case that arrives with a 200,
+    so nothing before this point has reason to treat it as a failure.
+    """
+    book = tmp_path / "lcfs.xls"
+    book.write_bytes(blob)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._read_lcfs_daily(book)
+    assert "CA LCFS" in str(caught.value)
+
+
+def test_lcfs_missing_export_is_reported_not_raised(tmp_path: Path) -> None:
+    """A download that never landed is bad input, not a crash."""
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb._read_lcfs_daily(tmp_path / "never-written.xls")
+    assert "CA LCFS" in str(caught.value)
 
 
 AAA_TODAY = date(2026, 9, 17)
@@ -677,40 +716,6 @@ def test_emitted_program_name_is_current_and_not_half_renamed() -> None:
     assert "cap-and-trade-program/auction-information" in fragment
 
 
-@pytest.mark.parametrize(
-    "blob",
-    [
-        b"",
-        b"<html>503 Service Unavailable</html>",
-        b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 600,
-    ],
-    ids=["empty", "error_page", "corrupt_ole2"],
-)
-def test_lcfs_damaged_export_is_reported_not_raised(
-    tmp_path: Path, blob: bytes
-) -> None:
-    """xlrd signals damage through several unrelated exception types.
-
-    Only the innermost is an `XLRDError`; a corrupt container and a
-    truncated transfer surface as other classes entirely, and any of
-    them escaping would be a traceback where the tool promises one
-    reported line. The error page is the case that arrives with a 200,
-    so nothing before this point has reason to treat it as a failure.
-    """
-    book = tmp_path / "lcfs.xls"
-    book.write_bytes(blob)
-    with pytest.raises(gpb.SnapshotError) as caught:
-        gpb._read_lcfs_daily(book)
-    assert "CA LCFS" in str(caught.value)
-
-
-def test_lcfs_missing_export_is_reported_not_raised(tmp_path: Path) -> None:
-    """A download that never landed is bad input, not a crash."""
-    with pytest.raises(gpb.SnapshotError) as caught:
-        gpb._read_lcfs_daily(tmp_path / "never-written.xls")
-    assert "CA LCFS" in str(caught.value)
-
-
 def test_emitted_ca_nontax_fragment_is_well_formed() -> None:
     """The note is prose inside a quoted JS literal, so it has to escape.
 
@@ -874,6 +879,19 @@ def test_or_cfp_one_day_past_the_limit_fails(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # Federal and state motor fuel tax
 # ---------------------------------------------------------------------------
+
+
+def _tax_period(
+    period: date = date(2026, 7, 1), rate: float = 0.30
+) -> gpb.TaxPeriod:
+    return gpb.TaxPeriod(
+        period=period,
+        per_state=dict.fromkeys(CODES, rate),
+        excise=dict.fromkeys(CODES, round(rate - 0.01, 4)),
+        federal=0.184,
+        source_url="https://example.invalid/fueltaxes.xlsx",
+        missing=(),
+    )
 
 
 def _tax_sheet(
@@ -1117,6 +1135,31 @@ def test_tax_fetch_downloads_then_selects(tmp_path: Path) -> None:
     assert got.source_url == gpb.EIA_FUELTAXES_URL
 
 
+def test_a_blank_excise_cell_is_reported_not_a_key_error() -> None:
+    """A blank column must exit 1, not raise from an unattended job."""
+    period = _tax_period()
+    stripped = dict(period.excise)
+    del stripped["IN"]
+    holed = gpb.TaxPeriod(
+        period=period.period,
+        per_state=period.per_state,
+        excise=stripped,
+        federal=period.federal,
+        source_url=period.source_url,
+        missing=(),
+    )
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.compose_state_tax(
+            "IN",
+            DAY,
+            holed,
+            3.92,
+            gpb.InGutRate(date(2026, 9, 1), 0.239, "https://x.invalid"),
+            {},
+        )
+    assert "leaves IN's excise blank" in str(caught.value)
+
+
 # ---------------------------------------------------------------------------
 # Indiana gasoline use tax
 # ---------------------------------------------------------------------------
@@ -1317,6 +1360,110 @@ def test_in_gut_at_the_freshness_limit_still_answers(tmp_path: Path) -> None:
 # both its excise and its use tax were suspended by executive order.
 
 
+def test_notes_name_the_states_whose_rate_is_overridden() -> None:
+    """The summary must not claim only Indiana when five are adjusted."""
+    period = _tax_period()
+    gut = gpb.InGutRate(date(2026, 5, 1), 0.233, "https://x.invalid")
+    during = gpb.state_tax_notes(period, gut, date(2026, 5, 21))
+    assert "GA" in during and "KY" in during
+    after = gpb.state_tax_notes(period, gut, date(2026, 9, 17))
+    assert "GA" not in after
+
+
+def test_indiana_is_not_in_the_flat_override_table() -> None:
+    """Its composition path returns before the table is consulted.
+
+    An Indiana entry would be silently ignored, so the invariant the
+    TaxAdjustment docstring states is checked rather than trusted.
+    """
+    assert all(e.state != "IN" for e in gpb.STATE_TAX_ADJUSTMENTS)
+
+
+def test_overrides_do_not_overlap_within_a_state() -> None:
+    """Two windows on one state would make the one reported arbitrary."""
+    by_state: dict[str, list[gpb.TaxAdjustment]] = {}
+    for entry in gpb.STATE_TAX_ADJUSTMENTS:
+        by_state.setdefault(entry.state, []).append(entry)
+    for entries in by_state.values():
+        entries.sort(key=lambda e: e.start)
+        for earlier, later in itertools.pairwise(entries):
+            assert earlier.end < later.start
+
+
+def test_every_override_is_a_reduction_with_an_authority() -> None:
+    """A positive figure would be a rate rise, which the table carries."""
+    for entry in gpb.STATE_TAX_ADJUSTMENTS:
+        assert entry.usd_per_gal < 0
+        assert entry.authority
+        assert entry.source_url.startswith("https://")
+        assert entry.state in gpb.STATE_CODE.values()
+
+
+@pytest.mark.parametrize(
+    ("state", "day", "expected"),
+    [
+        ("GA", date(2026, 3, 19), None),
+        ("GA", date(2026, 3, 20), -0.333),
+        ("GA", date(2026, 6, 2), -0.333),
+        ("GA", date(2026, 6, 3), None),
+        ("KY", date(2026, 5, 11), -0.10),
+        ("KY", date(2026, 7, 1), None),
+        ("UT", date(2026, 7, 1), -0.06),
+        ("IL", date(2026, 7, 1), -0.013),
+        ("TX", date(2026, 7, 1), None),
+    ],
+    ids=lambda v: str(v),
+)
+def test_override_windows_are_inclusive_at_both_ends(
+    state: str, day: date, expected: float | None
+) -> None:
+    """A window off by a day mis-prices a whole snapshot."""
+    got = gpb.adjustment_on(state, day)
+    assert (got.usd_per_gal if got else None) == expected
+
+
+def test_no_override_starts_before_the_sweep_began() -> None:
+    """An entry the sweep never covered would be trusted unverified.
+
+    Only the start is bounded. An end may legitimately run past the
+    sweep -- Illinois and Utah are fixed by statute through 2026-12-31
+    -- because the sweep's range limits which dates get priced, not how
+    far a known window may reach.
+    """
+    for entry in gpb.STATE_TAX_ADJUSTMENTS:
+        assert entry.start >= gpb.TAX_ADJUSTMENTS_CHECKED_FROM
+
+
+def test_a_date_outside_the_sweep_is_refused_in_both_directions() -> None:
+    """A date nobody swept and a date with no override look the same."""
+    for day in (
+        gpb.TAX_ADJUSTMENTS_CHECKED_FROM - timedelta(days=1),
+        gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH + timedelta(days=1),
+    ):
+        with pytest.raises(gpb.SnapshotError) as caught:
+            gpb.assert_adjustments_cover(day)
+        assert "swept only for" in str(caught.value)
+
+
+def test_indiana_checked_through_covers_every_shipped_window() -> None:
+    """A window reaching past the check would be trusted unverified."""
+    ends = [
+        end
+        for windows in (gpb.IN_EXCISE_SUSPENSIONS, gpb.IN_GUT_SUSPENSIONS)
+        for _, end, _ in windows
+    ]
+    assert max(ends) <= gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH
+
+
+def test_tax_sheet_carries_the_excise_column_for_indiana(
+    tmp_path: Path,
+) -> None:
+    """Indiana's total is rebuilt from parts, so the narrow column counts."""
+    periods = _periods(tmp_path, {"July 2026": _flat_rates(0.645)})
+    assert periods[0].excise["IN"] == 0.635
+    assert periods[0].per_state["IN"] == 0.645
+
+
 def _gut(rate: float) -> gpb.InGutRate:
     return gpb.InGutRate(date(2026, 9, 1), rate, "https://example.invalid")
 
@@ -1394,209 +1541,9 @@ def test_indiana_suspension_windows_are_ordered_and_disjoint() -> None:
             assert end < start
 
 
-def test_no_override_starts_before_the_sweep_began() -> None:
-    """An entry the sweep never covered would be trusted unverified.
-
-    Only the start is bounded. An end may legitimately run past the
-    sweep -- Illinois and Utah are fixed by statute through 2026-12-31
-    -- because the sweep's range limits which dates get priced, not how
-    far a known window may reach.
-    """
-    for entry in gpb.STATE_TAX_ADJUSTMENTS:
-        assert entry.start >= gpb.TAX_ADJUSTMENTS_CHECKED_FROM
-
-
-def test_delaware_rate_tracks_the_year_it_was_reset_for() -> None:
-    """The rate changes every January 1, so the year decides it."""
-    assert gpb.select_de_hsca_rate(date(2025, 6, 1)) == 0.01120
-    assert gpb.select_de_hsca_rate(date(2026, 6, 1)) == 0.011902
-
-
-def test_delaware_rate_picks_the_newest_regardless_of_table_order() -> None:
-    """The rate returned and the rate age-checked must be one entry."""
-    reversed_table = list(reversed(gpb.DE_HSCA_RATES))
-    with patch.object(gpb, "DE_HSCA_RATES", reversed_table):
-        assert gpb.select_de_hsca_rate(date(2026, 6, 1)) == 0.011902
-
-
-def test_delaware_rate_before_the_table_starts_is_reported() -> None:
-    """A backfill past the recorded years must not guess."""
-    with pytest.raises(gpb.SnapshotError) as caught:
-        gpb.select_de_hsca_rate(date(2019, 1, 1))
-    assert "table starts at" in str(caught.value)
-
-
-def test_delaware_rate_gone_stale_fails_the_run() -> None:
-    """A missed January would otherwise price a year at the old rate."""
-    newest = max(start for start, _ in gpb.DE_HSCA_RATES)
-    with pytest.raises(gpb.SnapshotError) as caught:
-        gpb.select_de_hsca_rate(
-            newest + timedelta(days=gpb.DE_HSCA_STALE_DAYS + 1)
-        )
-    assert "missing a year" in str(caught.value)
-
-
-def test_delaware_rate_at_the_freshness_limit_still_answers() -> None:
-    """Pins the constant itself, not merely some value inside it."""
-    newest = max(start for start, _ in gpb.DE_HSCA_RATES)
-    assert gpb.select_de_hsca_rate(
-        newest + timedelta(days=gpb.DE_HSCA_STALE_DAYS)
-    )
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("plain", "plain"),
-        ('a "quoted" word', 'a \\"quoted\\" word'),
-        ("back\\slash", "back\\\\slash"),
-        ('both \\ and "', 'both \\\\ and \\"'),
-    ],
-    ids=["plain", "quote", "backslash", "both"],
-)
-def test_page_strings_are_escaped_for_javascript(
-    raw: str, expected: str
-) -> None:
-    """The page is JS source; one stray quote breaks the whole array."""
-    assert gpb._js_string(raw) == expected
-
-
-def test_a_quote_in_an_authority_label_does_not_break_the_page() -> None:
-    """An authority string is hand-entered, so it can carry anything."""
-    tax = gpb.StateTax(
-        total=0.30,
-        parts=(gpb.TaxPart('He said "no"', 0.30, "https://x.invalid", ""),),
-        as_of="2026-07-01",
-    )
-    rendered = gpb.build_fixed(tax)
-    assert '\\"no\\"' in rendered
-    # The field must still close where the renderer expects it to.
-    assert rendered.count('n:"') == 1
-
-
-def test_a_blank_excise_cell_is_reported_not_a_key_error() -> None:
-    """A blank column must exit 1, not raise from an unattended job."""
-    period = _tax_period()
-    stripped = dict(period.excise)
-    del stripped["IN"]
-    holed = gpb.TaxPeriod(
-        period=period.period,
-        per_state=period.per_state,
-        excise=stripped,
-        federal=period.federal,
-        source_url=period.source_url,
-        missing=(),
-    )
-    with pytest.raises(gpb.SnapshotError) as caught:
-        gpb.compose_state_tax(
-            "IN",
-            DAY,
-            holed,
-            3.92,
-            gpb.InGutRate(date(2026, 9, 1), 0.239, "https://x.invalid"),
-            {},
-        )
-    assert "leaves IN's excise blank" in str(caught.value)
-
-
-def test_notes_name_the_states_whose_rate_is_overridden() -> None:
-    """The summary must not claim only Indiana when five are adjusted."""
-    period = _tax_period()
-    gut = gpb.InGutRate(date(2026, 5, 1), 0.233, "https://x.invalid")
-    during = gpb.state_tax_notes(period, gut, date(2026, 5, 21))
-    assert "GA" in during and "KY" in during
-    after = gpb.state_tax_notes(period, gut, date(2026, 9, 17))
-    assert "GA" not in after
-
-
-def test_indiana_is_not_in_the_flat_override_table() -> None:
-    """Its composition path returns before the table is consulted.
-
-    An Indiana entry would be silently ignored, so the invariant the
-    TaxAdjustment docstring states is checked rather than trusted.
-    """
-    assert all(e.state != "IN" for e in gpb.STATE_TAX_ADJUSTMENTS)
-
-
-def test_overrides_do_not_overlap_within_a_state() -> None:
-    """Two windows on one state would make the one reported arbitrary."""
-    by_state: dict[str, list[gpb.TaxAdjustment]] = {}
-    for entry in gpb.STATE_TAX_ADJUSTMENTS:
-        by_state.setdefault(entry.state, []).append(entry)
-    for entries in by_state.values():
-        entries.sort(key=lambda e: e.start)
-        for earlier, later in itertools.pairwise(entries):
-            assert earlier.end < later.start
-
-
-def test_every_override_is_a_reduction_with_an_authority() -> None:
-    """A positive figure would be a rate rise, which the table carries."""
-    for entry in gpb.STATE_TAX_ADJUSTMENTS:
-        assert entry.usd_per_gal < 0
-        assert entry.authority
-        assert entry.source_url.startswith("https://")
-        assert entry.state in gpb.STATE_CODE.values()
-
-
-@pytest.mark.parametrize(
-    ("state", "day", "expected"),
-    [
-        ("GA", date(2026, 3, 19), None),
-        ("GA", date(2026, 3, 20), -0.333),
-        ("GA", date(2026, 6, 2), -0.333),
-        ("GA", date(2026, 6, 3), None),
-        ("KY", date(2026, 5, 11), -0.10),
-        ("KY", date(2026, 7, 1), None),
-        ("UT", date(2026, 7, 1), -0.06),
-        ("IL", date(2026, 7, 1), -0.013),
-        ("TX", date(2026, 7, 1), None),
-    ],
-    ids=lambda v: str(v),
-)
-def test_override_windows_are_inclusive_at_both_ends(
-    state: str, day: date, expected: float | None
-) -> None:
-    """A window off by a day mis-prices a whole snapshot."""
-    got = gpb.adjustment_on(state, day)
-    assert (got.usd_per_gal if got else None) == expected
-
-
-def test_a_date_outside_the_sweep_is_refused_in_both_directions() -> None:
-    """A date nobody swept and a date with no override look the same."""
-    for day in (
-        gpb.TAX_ADJUSTMENTS_CHECKED_FROM - timedelta(days=1),
-        gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH + timedelta(days=1),
-    ):
-        with pytest.raises(gpb.SnapshotError) as caught:
-            gpb.assert_adjustments_cover(day)
-        assert "swept only for" in str(caught.value)
-
-
-def test_indiana_checked_through_covers_every_shipped_window() -> None:
-    """A window reaching past the check would be trusted unverified."""
-    ends = [
-        end
-        for windows in (gpb.IN_EXCISE_SUSPENSIONS, gpb.IN_GUT_SUSPENSIONS)
-        for _, end, _ in windows
-    ]
-    assert max(ends) <= gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH
-
-
-def test_tax_sheet_carries_the_excise_column_for_indiana(
-    tmp_path: Path,
-) -> None:
-    """Indiana's total is rebuilt from parts, so the narrow column counts."""
-    periods = _periods(tmp_path, {"July 2026": _flat_rates(0.645)})
-    assert periods[0].excise["IN"] == 0.635
-    assert periods[0].per_state["IN"] == 0.645
-
-
 # ---------------------------------------------------------------------------
 # Gross-receipts taxes the rate table omits
 # ---------------------------------------------------------------------------
-
-
-DAY = date(2026, 9, 17)
 
 
 def _spot(usd: float, year_month: str = "2026-08") -> gpb.SpotQuote:
@@ -1660,6 +1607,44 @@ def test_wholesale_states_without_a_benchmark_are_refused(
     with pytest.raises(gpb.SnapshotError) as caught:
         gpb.resolve_gross_receipts(state, DAY, 4.4, None)
     assert state in str(caught.value)
+
+
+def test_delaware_rate_at_the_freshness_limit_still_answers() -> None:
+    """Pins the constant itself, not merely some value inside it."""
+    newest = max(start for start, _ in gpb.DE_HSCA_RATES)
+    assert gpb.select_de_hsca_rate(
+        newest + timedelta(days=gpb.DE_HSCA_STALE_DAYS)
+    )
+
+
+def test_delaware_rate_gone_stale_fails_the_run() -> None:
+    """A missed January would otherwise price a year at the old rate."""
+    newest = max(start for start, _ in gpb.DE_HSCA_RATES)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.select_de_hsca_rate(
+            newest + timedelta(days=gpb.DE_HSCA_STALE_DAYS + 1)
+        )
+    assert "missing a year" in str(caught.value)
+
+
+def test_delaware_rate_tracks_the_year_it_was_reset_for() -> None:
+    """The rate changes every January 1, so the year decides it."""
+    assert gpb.select_de_hsca_rate(date(2025, 6, 1)) == 0.01120
+    assert gpb.select_de_hsca_rate(date(2026, 6, 1)) == 0.011902
+
+
+def test_delaware_rate_picks_the_newest_regardless_of_table_order() -> None:
+    """The rate returned and the rate age-checked must be one entry."""
+    reversed_table = list(reversed(gpb.DE_HSCA_RATES))
+    with patch.object(gpb, "DE_HSCA_RATES", reversed_table):
+        assert gpb.select_de_hsca_rate(date(2026, 6, 1)) == 0.011902
+
+
+def test_delaware_rate_before_the_table_starts_is_reported() -> None:
+    """A backfill past the recorded years must not guess."""
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.select_de_hsca_rate(date(2019, 1, 1))
+    assert "table starts at" in str(caught.value)
 
 
 def test_spot_uses_the_newest_month_already_published() -> None:
@@ -1849,6 +1834,46 @@ def _snapshot_block(day: str, codes: list[str]) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Page string escaping
+# ---------------------------------------------------------------------------
+
+# The page is JavaScript source inside a script element, so a value that
+# ends a string literal early takes the whole snapshot array with it
+# rather than just the row that carried it. These drive the escaper and
+# the builders directly; the end-to-end case is with the round trips.
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("plain", "plain"),
+        ('a "quoted" word', 'a \\"quoted\\" word'),
+        ("back\\slash", "back\\\\slash"),
+        ('both \\ and "', 'both \\\\ and \\"'),
+    ],
+    ids=["plain", "quote", "backslash", "both"],
+)
+def test_page_strings_are_escaped_for_javascript(
+    raw: str, expected: str
+) -> None:
+    """The page is JS source; one stray quote breaks the whole array."""
+    assert gpb._js_string(raw) == expected
+
+
+def test_a_quote_in_an_authority_label_does_not_break_the_page() -> None:
+    """An authority string is hand-entered, so it can carry anything."""
+    tax = gpb.StateTax(
+        total=0.30,
+        parts=(gpb.TaxPart('He said "no"', 0.30, "https://x.invalid", ""),),
+        as_of="2026-07-01",
+    )
+    rendered = gpb.build_fixed(tax)
+    assert '\\"no\\"' in rendered
+    # The field must still close where the renderer expects it to.
+    assert rendered.count('n:"') == 1
+
+
 def _page(*blocks: str) -> str:
     joined = ",\n".join(blocks)
     return f"<html><script>\nconst SNAPSHOTS = [\n{joined}\n];\n</script>\n"
@@ -1897,22 +1922,6 @@ def test_write_path_backs_the_page_up_first(tmp_path: Path) -> None:
     backups = list(state_dir.glob("backup-*.html"))
     assert len(backups) == 1
     assert backups[0].read_text() == original
-
-
-CODES = sorted(set(gpb.STATE_CODE.values()))
-
-
-def _tax_period(
-    period: date = date(2026, 7, 1), rate: float = 0.30
-) -> gpb.TaxPeriod:
-    return gpb.TaxPeriod(
-        period=period,
-        per_state=dict.fromkeys(CODES, rate),
-        excise=dict.fromkeys(CODES, round(rate - 0.01, 4)),
-        federal=0.184,
-        source_url="https://example.invalid/fueltaxes.xlsx",
-        missing=(),
-    )
 
 
 @contextlib.contextmanager
