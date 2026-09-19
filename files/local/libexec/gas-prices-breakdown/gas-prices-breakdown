@@ -38,13 +38,16 @@ Data sources:
   Hand-maintained and checked by date rather than by age: the tax
   suspensions, holidays and reductions (STATE_TAX_ADJUSTMENTS, plus
   IN_EXCISE_SUSPENSIONS and IN_GUT_SUSPENSIONS for the one state whose
-  two taxes were suspended separately). Delaware's annually reset
-  gross-receipts rate (DE_HSCA_RATES) is hand-maintained too, but
-  bounded by age like the fetched sources. A published rate table says what
-  a tax is, not whether anyone is collecting it, and its notes are not
-  a reliable index of the difference, so these are swept for directly.
-  A run outside TAX_ADJUSTMENTS_CHECKED_FROM..THROUGH fails rather than
-  assert that no override was in force.
+  two taxes were suspended separately). A published rate table says
+  what a tax is, not whether anyone is collecting it, and its notes
+  are not a reliable index of the difference, so these are swept for
+  directly. A run outside TAX_ADJUSTMENTS_CHECKED_FROM..THROUGH fails
+  rather than assert that no override was in force.
+
+  Delaware's gross-receipts rate (DE_HSCA_RATES) is hand-maintained
+  and checked by date too, but on its own rule rather than the sweep's:
+  the state resets it every January 1, so the table must carry an entry
+  for the calendar year being priced.
 
   The EIA spot benchmarks need an API key, read at run time from
   EIA_API_KEY_PATH. The tax table itself does not.
@@ -416,10 +419,6 @@ DE_HSCA_RATES: list[tuple[date, float]] = [
     (date(2025, 1, 1), 0.01120),
     (date(2026, 1, 1), 0.011902),
 ]
-# A rate holds for its calendar year, so the one in force is at most
-# 365 days old. The limit sits just past that: one missed January and
-# the run stops rather than price a year from the prior rate.
-DE_HSCA_STALE_DAYS = 400
 CT_PGET_RATE = 0.081
 # Gross earnings from the first sale of gasoline are capped at $3.00 a
 # gallon by CGS 12-587(a)(4), so above that the tax is a constant 24.3
@@ -1281,7 +1280,13 @@ def select_de_hsca_rate(day: date) -> float:
 
     The rate is recalculated each January 1, so a year nobody entered
     fails rather than silently reusing the last one -- the same reason
-    every other hand-maintained figure here carries a bound.
+    every other hand-maintained figure here carries a bound. This one
+    is the calendar year itself; unlike the day counts the other bounds
+    use, no constant can state this rule exactly. December 31 of a leap
+    year is already 365 days past its January 1, so a bound loose
+    enough to accept an entry's own December must also accept the next
+    New Year's Day -- the one date on which a new rate is certainly in
+    force and certainly missing.
     """
     usable = [(start, rate) for start, rate in DE_HSCA_RATES if start <= day]
     if not usable:
@@ -1290,15 +1295,14 @@ def select_de_hsca_rate(day: date) -> float:
             f"{min(start for start, _ in DE_HSCA_RATES)}"
         )
     # One max() rather than an index, so the rate returned and the rate
-    # whose age is checked cannot be different entries.
+    # whose year is checked cannot be different entries.
     start, rate = max(usable)
-    age = (day - start).days
-    if age > DE_HSCA_STALE_DAYS:
+    if start.year != day.year:
         raise SnapshotError(
-            f"DE HSCA: newest recorded rate takes effect {start}, {age} "
-            f"days before {day}, over the {DE_HSCA_STALE_DAYS}-day limit; "
-            f"Delaware resets it each January 1, so the table is missing "
-            f"a year"
+            f"DE HSCA: newest recorded rate takes effect {start}, which "
+            f"is {start.year}, not the {day.year} being priced; "
+            f"Delaware resets it each January 1, so the table is "
+            f"missing a year"
         )
     return rate
 

@@ -1609,24 +1609,6 @@ def test_wholesale_states_without_a_benchmark_are_refused(
     assert state in str(caught.value)
 
 
-def test_delaware_rate_at_the_freshness_limit_still_answers() -> None:
-    """Pins the constant itself, not merely some value inside it."""
-    newest = max(start for start, _ in gpb.DE_HSCA_RATES)
-    assert gpb.select_de_hsca_rate(
-        newest + timedelta(days=gpb.DE_HSCA_STALE_DAYS)
-    )
-
-
-def test_delaware_rate_gone_stale_fails_the_run() -> None:
-    """A missed January would otherwise price a year at the old rate."""
-    newest = max(start for start, _ in gpb.DE_HSCA_RATES)
-    with pytest.raises(gpb.SnapshotError) as caught:
-        gpb.select_de_hsca_rate(
-            newest + timedelta(days=gpb.DE_HSCA_STALE_DAYS + 1)
-        )
-    assert "missing a year" in str(caught.value)
-
-
 def test_delaware_rate_tracks_the_year_it_was_reset_for() -> None:
     """The rate changes every January 1, so the year decides it."""
     assert gpb.select_de_hsca_rate(date(2025, 6, 1)) == 0.01120
@@ -1634,7 +1616,7 @@ def test_delaware_rate_tracks_the_year_it_was_reset_for() -> None:
 
 
 def test_delaware_rate_picks_the_newest_regardless_of_table_order() -> None:
-    """The rate returned and the rate age-checked must be one entry."""
+    """The rate returned and the rate year-checked must be one entry."""
     reversed_table = list(reversed(gpb.DE_HSCA_RATES))
     with patch.object(gpb, "DE_HSCA_RATES", reversed_table):
         assert gpb.select_de_hsca_rate(date(2026, 6, 1)) == 0.011902
@@ -1645,6 +1627,48 @@ def test_delaware_rate_before_the_table_starts_is_reported() -> None:
     with pytest.raises(gpb.SnapshotError) as caught:
         gpb.select_de_hsca_rate(date(2019, 1, 1))
     assert "table starts at" in str(caught.value)
+
+
+def test_delaware_rate_for_an_unentered_year_fails_the_run() -> None:
+    """A missed January would otherwise price a year at the old rate."""
+    newest = max(start for start, _ in gpb.DE_HSCA_RATES)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.select_de_hsca_rate(date(newest.year + 1, 6, 1))
+    assert "missing a year" in str(caught.value)
+
+
+def test_delaware_entries_are_one_per_year_effective_new_years_day() -> None:
+    """The year comparison is exact only for a table of this shape.
+
+    An entry effective mid-year would make the guard reject every
+    earlier date in that year as a missing year, which it would not be.
+    """
+    starts = [start for start, _ in gpb.DE_HSCA_RATES]
+    assert all((s.month, s.day) == (1, 1) for s in starts)
+    assert starts == sorted(starts)
+    assert len({s.year for s in starts}) == len(starts)
+
+
+def test_delaware_rate_fails_on_the_first_day_of_an_unentered_year() -> None:
+    """The boundary no day count gets right.
+
+    The other hand-maintained figures here are bounded by a count of
+    days. That cannot work for a rule stated in calendar years:
+    December 31 of a leap year is itself 365 days past its January 1,
+    so any count generous enough to accept an entry's own December also
+    accepts the next New Year's Day -- the one date on which the new
+    rate is certainly in force and certainly missing.
+    """
+    newest = max(start for start, _ in gpb.DE_HSCA_RATES)
+    with pytest.raises(gpb.SnapshotError) as caught:
+        gpb.select_de_hsca_rate(date(newest.year + 1, 1, 1))
+    assert "missing a year" in str(caught.value)
+
+
+def test_delaware_rate_on_the_last_day_of_its_year_still_answers() -> None:
+    """The far edge of the entry's own year is still the entry's."""
+    newest = max(start for start, _ in gpb.DE_HSCA_RATES)
+    assert gpb.select_de_hsca_rate(date(newest.year, 12, 31))
 
 
 def test_spot_uses_the_newest_month_already_published() -> None:
