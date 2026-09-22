@@ -30,6 +30,13 @@ mypy_path = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["_repo_shared/tests", "tests"]
 
+[tool.repo-shared.markdown]
+# Skill directories carry mandatory YAML frontmatter, which mdformat
+# rewrites as prose. Entries are bare directory names pruned anywhere
+# in the tree. Skills stay out of both markdown gates and are validated
+# by their own harness (`muse skills validate`) instead.
+extra-exclude-dirs = ["skills"]
+
 [tool.repo-shared.code-quality]
 # The libexec entries are shebang scripts with no `.py` extension, which
 # the gate's `rglob("*.py")` discovery cannot see. Two ways to reach one:

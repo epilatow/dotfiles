@@ -35,6 +35,9 @@ CLAUDE_WRAPPER = (
     / "hooks"
     / "tmux-name.sh"
 )
+MUSE_SKILL = (
+    REPO_ROOT / "files" / "muse" / "skills" / "tmux-namer" / "SKILL.md"
+)
 PANE_START_COMMAND = "display-message -p -t %0 #{pane_start_command}"
 OWNER_READ_ONLY_COMMANDS = [
     PANE_START_COMMAND,
@@ -527,9 +530,13 @@ def test_the_launcher_aliases_run_commands_the_helper_accepts(
     assert result.returncode == 0
     launched = [call.split("\t") for call in log.read_text().splitlines()]
     assert [argv[1] for argv in launched] == ["new", "new"]
-    assert accepted_start_commands() == {
-        os.path.basename(argv[2]) for argv in launched
-    }
+    launched_names = {os.path.basename(argv[2]) for argv in launched}
+    assert launched_names <= accepted_start_commands()
+    # `muse` is launched by the tmuse alias, which is environment state
+    # outside this file; test_tmuse_launcher_shape_is_helper_accepted
+    # pins the shapes it produces. Once that alias is committed here,
+    # eval it above and restore the plain equality this replaced.
+    assert accepted_start_commands() - launched_names == {"muse"}
 
 
 def test_crony_runs_one_shared_remote_control_app_server() -> None:
@@ -1197,6 +1204,8 @@ def test_an_agent_started_inside_a_session_keeps_the_owners_naming(
         ('"claude --unbalanced', False),
         ("claude --dangerously-skip-permissions", True),
         ('"/opt/some path/claude" --dangerously-skip-permissions', True),
+        ("muse", True),
+        ("muse --yolo", True),
         (
             (
                 "/home/u/.local/libexec/tmux-agent-session-namer"
@@ -1376,6 +1385,8 @@ def test_a_shell_session_keeps_its_name_when_an_agent_starts_in_it(
         ("codex;bad",),
         ("codex-hook", "--require-codex-thread-title"),
         ("claude", "--strip-leading-status"),
+        ("muse",),
+        ("muse", "first", "second"),
     ],
 )
 def test_rejects_unknown_or_extra_subcommand(
@@ -1386,3 +1397,151 @@ def test_rejects_unknown_or_extra_subcommand(
 
     assert result.returncode == 2
     assert not fake_tmux[1].exists()
+
+
+def test_muse_renames_with_allocated_slot(
+    fake_tmux: tuple[Path, Path],
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        "muse",
+        "tmuse",
+        extra_env={
+            "FAKE_TMUX_START": "muse --yolo",
+            "FAKE_TMUX_USED_NUMS": "00\n",
+        },
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert fake_tmux[1].read_text().splitlines() == [
+        PANE_START_COMMAND,
+        "wait-for -L tmux-agent-session-namer-slots",
+        "show-options -qv @agent_namer",
+        "show-options -qv @muse_num",
+        "list-sessions -F #{@muse_num}",
+        "set-option @muse_num 01",
+        "set-option @agent_namer muse",
+        "wait-for -U tmux-agent-session-namer-slots",
+        "rename-session muse01-tmuse",
+    ]
+
+
+def test_muse_reuses_its_slot_on_rename(
+    fake_tmux: tuple[Path, Path],
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        "muse",
+        "Second Name",
+        extra_env={
+            "FAKE_TMUX_START": "muse",
+            "FAKE_TMUX_CURRENT_NUM": "04",
+            "FAKE_TMUX_OWNER": "muse",
+        },
+    )
+
+    assert result.returncode == 0
+    assert fake_tmux[1].read_text().splitlines() == [
+        PANE_START_COMMAND,
+        "wait-for -L tmux-agent-session-namer-slots",
+        "show-options -qv @agent_namer",
+        "show-options -qv @muse_num",
+        "wait-for -U tmux-agent-session-namer-slots",
+        "rename-session muse04-Second-Name",
+    ]
+
+
+def test_muse_leaves_a_session_claude_names_alone(
+    fake_tmux: tuple[Path, Path],
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        "muse",
+        "tmuse",
+        extra_env={
+            "FAKE_TMUX_START": "muse",
+            "FAKE_TMUX_OWNER": "claude",
+        },
+    )
+
+    assert result.returncode == 0
+    assert fake_tmux[1].read_text().splitlines() == REFUSED_SLOT_COMMANDS
+
+
+def test_muse_skips_a_shell_pane(
+    fake_tmux: tuple[Path, Path],
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        "muse",
+        "tmuse",
+        extra_env={"FAKE_TMUX_START": ""},
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert fake_tmux[1].read_text().splitlines() == [PANE_START_COMMAND]
+
+
+def test_muse_ignores_a_blank_session_name(
+    fake_tmux: tuple[Path, Path],
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        "muse",
+        "   ",
+        extra_env={"FAKE_TMUX_START": "muse"},
+    )
+
+    assert result.returncode == 0
+    assert not any(
+        command.startswith("rename-session")
+        for command in fake_tmux[1].read_text().splitlines()
+    )
+
+
+def test_tmuse_launcher_shape_is_helper_accepted(
+    tmp_path: Path,
+) -> None:
+    # The tmuse aliases live as uncommitted environment state, so this
+    # pins the contract on the shapes they produce rather than on the
+    # alias definitions themselves: `tmux new` with the muse CLI.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_argv_logger(bin_dir / "tmux", "tmux")
+    log = tmp_path / "argv.log"
+    env = os.environ.copy()
+    env.update(
+        {
+            "ARGV_LOG": str(log),
+            "PATH": f"{bin_dir}:{env['PATH']}",
+        },
+    )
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", "tmux new muse; tmux new muse --yolo"],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    launched = [call.split("\t") for call in log.read_text().splitlines()]
+    assert [argv[1] for argv in launched] == ["new", "new"]
+    assert {
+        os.path.basename(argv[2]) for argv in launched
+    } <= accepted_start_commands()
+
+
+def test_muse_skill_routes_session_naming_through_the_helper() -> None:
+    text = MUSE_SKILL.read_text()
+
+    assert text.startswith("---\nname: tmux-namer\n")
+    assert "description: " in text.split("---\n")[1]
+    assert (
+        '"$HOME/.local/libexec/tmux-agent-session-namer/'
+        'tmux-agent-session-namer" muse' in text
+    )
+    assert "renamed" in text

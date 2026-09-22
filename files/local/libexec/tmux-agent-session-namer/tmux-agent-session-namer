@@ -17,6 +17,10 @@ command of a second pane still moves that name, now through the owner's
 slot and format. To hand a session to a different agent, unset its
 owner with `tmux set-option -u @agent_namer` and start that agent as a
 pane's own command, since the prompt route is refused either way.
+
+A muse run takes the session name as its argument and renames once per
+run: Muse sets no pane title to follow, so the agent itself re-runs
+this with its current name at session start and after every rename.
 """
 
 from __future__ import annotations
@@ -50,8 +54,11 @@ CODEX_THREAD_TITLE_IDS = frozenset(("thread", "thread-title"))
 TMUX_SLOT_LOCK = "tmux-agent-session-namer-slots"
 SESSION_AGENT_OPTION = "@agent_namer"
 # What tmux must have started a pane with for the session to be named:
-# the claude CLI, or this helper, which is how tcodex launches codex.
-AGENT_START_COMMANDS = frozenset(("claude", "tmux-agent-session-namer"))
+# an agent CLI launched directly (claude via tclaude, muse via tmuse),
+# or this helper, which is how tcodex launches codex.
+AGENT_START_COMMANDS = frozenset(
+    ("claude", "muse", "tmux-agent-session-namer")
+)
 STATUS_RIGHT = (
     "#{?window_bigger,"
     "[#{window_offset_x}#,#{window_offset_y}] ,}"
@@ -62,6 +69,7 @@ STATUS_RIGHT = (
 class Agent(StrEnum):
     CLAUDE = "claude"
     CODEX = "codex"
+    MUSE = "muse"
 
 
 class Invocation(StrEnum):
@@ -69,6 +77,7 @@ class Invocation(StrEnum):
     CODEX_CLIENT = "codex-client"
     CODEX_HOOK = "codex-hook"
     CODEX_REMOTE = "codex-remote"
+    MUSE = "muse"
 
 
 class CodexHookEvent(StrEnum):
@@ -446,9 +455,11 @@ def _parse_invocation(argv: list[str]) -> Invocation | None:
         invocation = Invocation(argv[0])
     except ValueError:
         return None
-    if invocation is not Invocation.CODEX_REMOTE and len(argv) != 1:
-        return None
-    return invocation
+    if invocation is Invocation.CODEX_REMOTE:
+        return invocation
+    if invocation is Invocation.MUSE:
+        return invocation if len(argv) == 2 else None
+    return invocation if len(argv) == 1 else None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -460,7 +471,20 @@ def main(argv: list[str] | None = None) -> int:
     if invocation is None:
         return 2
 
-    agent = Agent.CLAUDE if invocation is Invocation.CLAUDE else Agent.CODEX
+    if invocation is Invocation.CLAUDE:
+        agent = Agent.CLAUDE
+    elif invocation is Invocation.MUSE:
+        agent = Agent.MUSE
+    else:
+        agent = Agent.CODEX
+    if agent is Agent.MUSE:
+        # The agent hands over its own session name: Muse sets no pane
+        # title to track and its hooks do not reach interactive
+        # sessions, so nothing here can resolve the name itself. Each
+        # run re-reads the pane gate and the owner, which is what keeps
+        # a rename tracking the session across repeated runs.
+        _rename_tmux(agent, invocation_args[1])
+        return 0
     if agent is Agent.CODEX:
         if invocation is Invocation.CODEX_REMOTE:
             _configure_tmux(agent)
