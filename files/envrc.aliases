@@ -22,6 +22,11 @@ tcodexd()
 {
 	tcodex --dangerously-bypass-approvals-and-sandbox "$@"
 }
+alias tmuse="tmux new muse"
+alias tmused="tmuse --yolo"
+alias topencode="tmux new opencode"
+alias topencoded="topencode --auto"
+alias tpi="tmux new pi"
 alias ls="ls -F"
 
 # wrapper aliases
