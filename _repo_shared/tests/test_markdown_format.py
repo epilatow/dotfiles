@@ -13,7 +13,12 @@ The subclass below picks up consumer-configured knobs from
 
 - ``wrap`` (int, default 79) -- ``mdformat --wrap`` value.
 - ``extra-exclude-dirs`` (list[str], default ``[]``) -- appended
-  to the base default set.
+  to the base default set. Entries are ``.gitignore`` patterns
+  matched against repo-root-relative paths: a bare name prunes
+  that directory anywhere in the tree, a slash-containing entry
+  is anchored at the repo root and may name a directory or an
+  exact file, and ``**`` forms match at any depth. ``!`` negation
+  is rejected -- the knob is additive over the base excludes.
 """
 
 from epilatow_repo_shared.config import markdown_overrides

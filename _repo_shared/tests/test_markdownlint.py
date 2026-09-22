@@ -11,8 +11,12 @@ happens and ignored files are never linted. The repo's
 The subclass below picks up the consumer-configured
 ``extra-exclude-dirs`` knob from ``[tool.repo-shared.markdown]`` in
 the consumer's ``pyproject.toml`` -- the same knob the mdformat gate
-reads -- and appends it to the base ``exclude_dirs``, so a directory
+reads -- and appends it to the base ``exclude_dirs``, so a path
 excluded from the mdformat gate is excluded from this one too.
+Entries are ``.gitignore`` patterns matched against
+repo-root-relative paths (a bare name prunes that directory anywhere
+in the tree; a slash-containing entry is anchored at the repo root
+and may name a directory or an exact file).
 
 Lives under ``_repo_shared/tests/`` in a consumer; pytest finds it
 via the ``testpaths`` entry that ``repo-shared init`` injects into

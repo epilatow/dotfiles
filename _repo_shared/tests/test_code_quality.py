@@ -14,9 +14,14 @@ Three consumer-side customisation knobs, all optional, all under
   file paths for extension-less shebang scripts (``bin/foo``) that
   ``rglob("*.py")`` cannot find. Discovery does not need pyproject
   configuration to cover regular ``.py`` files.
-- ``extra-exclude-dirs`` appends to the base exclude list. Use to
-  skip tracked-but-skip dirs like vendored third-party Python or
-  generated code.
+- ``extra-exclude-dirs`` appends to the base exclude list.
+  Entries are ``.gitignore`` patterns matched against
+  repo-root-relative paths: a bare name (``_build``) prunes that
+  directory anywhere in the tree, a slash-containing entry
+  (``docs/_build``, ``legacy/old.py``) is anchored at the repo root
+  and may name a directory or an exact file, and ``**`` forms
+  match at any depth. ``!`` negation is rejected -- the knob is
+  additive over the base excludes.
 - ``mypy-extra-deps`` + ``mypy-python-version`` supply project-wide
   fallback mypy ``--with`` deps / ``--python-version`` for files
   *without* a PEP 723 ``# /// script`` block. A file with PEP 723
