@@ -31,11 +31,11 @@ mypy_path = ["src"]
 testpaths = ["_repo_shared/tests", "tests"]
 
 [tool.repo-shared.markdown]
-# Skill directories carry mandatory YAML frontmatter, which mdformat
-# rewrites as prose. Entries are bare directory names pruned anywhere
-# in the tree. Skills stay out of both markdown gates and are validated
-# by their own harness (`muse skills validate`) instead.
-extra-exclude-dirs = ["skills"]
+# The Muse skill carries mandatory YAML frontmatter, which mdformat
+# rewrites as prose. Slash-containing entries are anchored at the repo
+# root, so only that skill stays out of both markdown gates; it is
+# validated by its own harness (`muse skills validate`) instead.
+extra-exclude-dirs = ["files/muse/skills"]
 
 [tool.repo-shared.code-quality]
 # The libexec entries are shebang scripts with no `.py` extension, which
