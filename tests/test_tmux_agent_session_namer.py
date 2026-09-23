@@ -38,6 +38,21 @@ CLAUDE_WRAPPER = (
 MUSE_SKILL = (
     REPO_ROOT / "files" / "muse" / "skills" / "tmux-namer" / "SKILL.md"
 )
+PI_EXTENSION = (
+    REPO_ROOT / "files" / "pi" / "agent" / "extensions" / "tmux-namer.ts"
+)
+OPENCODE_PLUGIN = (
+    REPO_ROOT / "files" / "config" / "opencode" / "plugins" / "tmux-namer.ts"
+)
+STATUS_COMMANDS = [
+    "set-option status-left [#{session_name}] ",
+    "set-option status-left-length 34",
+    (
+        "set-option status-right "
+        "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}"
+        "%H:%M %d-%b-%y"
+    ),
+]
 PANE_START_COMMAND = "display-message -p -t %0 #{pane_start_command}"
 OWNER_READ_ONLY_COMMANDS = [
     PANE_START_COMMAND,
@@ -505,10 +520,10 @@ def test_the_launcher_aliases_run_commands_the_helper_accepts(
         },
     )
 
-    # tcodex is a function and runs as written. tclaude is an alias, and
-    # a non-interactive bash expands one only under expand_aliases and
-    # only on input parsed after the alias exists, hence the eval. A sh
-    # without either lands on the "new", "new" assertion below rather
+    # tcodex is a function and runs as written. The others are aliases,
+    # and a non-interactive bash expands one only under expand_aliases
+    # and only on input parsed after the alias exists, hence the eval. A
+    # sh without either lands on the "new"-count assertion below rather
     # than passing quietly.
     result = subprocess.run(
         [
@@ -516,7 +531,7 @@ def test_the_launcher_aliases_run_commands_the_helper_accepts(
             "-c",
             (
                 'shopt -s expand_aliases 2>/dev/null; . "$1"; '
-                "eval tclaude; tcodex"
+                "eval 'tclaude; tmuse; tpi; topencode'; tcodex"
             ),
             "sh",
             str(ENVRC_ALIASES),
@@ -529,14 +544,9 @@ def test_the_launcher_aliases_run_commands_the_helper_accepts(
 
     assert result.returncode == 0
     launched = [call.split("\t") for call in log.read_text().splitlines()]
-    assert [argv[1] for argv in launched] == ["new", "new"]
+    assert [argv[1] for argv in launched] == ["new"] * 5
     launched_names = {os.path.basename(argv[2]) for argv in launched}
-    assert launched_names <= accepted_start_commands()
-    # `muse` is launched by the tmuse alias, which is environment state
-    # outside this file; test_tmuse_launcher_shape_is_helper_accepted
-    # pins the shapes it produces. Once that alias is committed here,
-    # eval it above and restore the plain equality this replaced.
-    assert accepted_start_commands() - launched_names == {"muse"}
+    assert launched_names == accepted_start_commands()
 
 
 def test_crony_runs_one_shared_remote_control_app_server() -> None:
@@ -696,6 +706,7 @@ def test_codex_allocates_slot_and_tracks_thread_title(
         for command in commands
     )
     assert "set-option status-left-length 34" in commands
+    assert "set-option status-left [#{session_name}] " in commands
 
 
 def test_codex_client_trusts_the_launchers_title_override(
@@ -747,6 +758,7 @@ def test_codex_stop_renames_from_explicit_thread_name(
         "show-options -qv @codex_num",
         "set-option @agent_namer codex",
         "wait-for -U tmux-agent-session-namer-slots",
+        *STATUS_COMMANDS,
         "rename-session codex04-Feline-Ideas",
     ]
     codex_messages = [
@@ -797,6 +809,7 @@ def test_codex_stop_falls_back_to_preview_and_allocates_slot(
         "set-option @codex_num 01",
         "set-option @agent_namer codex",
         "wait-for -U tmux-agent-session-namer-slots",
+        *STATUS_COMMANDS,
         "rename-session codex01-Suggest-cat-names-plea",
     ]
 
@@ -1110,6 +1123,7 @@ def test_codex_stop_renames_a_session_it_already_owns(
         "show-options -qv @agent_namer",
         "show-options -qv @codex_num",
         "wait-for -U tmux-agent-session-namer-slots",
+        *STATUS_COMMANDS,
         "rename-session codex04-Feline-Ideas",
     ]
 
@@ -1387,6 +1401,10 @@ def test_a_shell_session_keeps_its_name_when_an_agent_starts_in_it(
         ("claude", "--strip-leading-status"),
         ("muse",),
         ("muse", "first", "second"),
+        ("opencode",),
+        ("opencode", "first", "second"),
+        ("pi",),
+        ("pi", "first", "second"),
     ],
 )
 def test_rejects_unknown_or_extra_subcommand(
@@ -1399,15 +1417,25 @@ def test_rejects_unknown_or_extra_subcommand(
     assert not fake_tmux[1].exists()
 
 
-def test_muse_renames_with_allocated_slot(
+@pytest.mark.parametrize(
+    ("invocation", "start_command"),
+    [
+        ("muse", "muse --yolo"),
+        ("opencode", "opencode"),
+        ("pi", "pi --name Whatever"),
+    ],
+)
+def test_named_run_renames_with_allocated_slot(
     fake_tmux: tuple[Path, Path],
+    invocation: str,
+    start_command: str,
 ) -> None:
     result = run_helper(
         fake_tmux,
-        "muse",
-        "tmuse",
+        invocation,
+        "Session Name",
         extra_env={
-            "FAKE_TMUX_START": "muse --yolo",
+            "FAKE_TMUX_START": start_command,
             "FAKE_TMUX_USED_NUMS": "00\n",
         },
     )
@@ -1418,26 +1446,29 @@ def test_muse_renames_with_allocated_slot(
         PANE_START_COMMAND,
         "wait-for -L tmux-agent-session-namer-slots",
         "show-options -qv @agent_namer",
-        "show-options -qv @muse_num",
-        "list-sessions -F #{@muse_num}",
-        "set-option @muse_num 01",
-        "set-option @agent_namer muse",
+        f"show-options -qv @{invocation}_num",
+        f"list-sessions -F #{{@{invocation}_num}}",
+        f"set-option @{invocation}_num 01",
+        f"set-option @agent_namer {invocation}",
         "wait-for -U tmux-agent-session-namer-slots",
-        "rename-session muse01-tmuse",
+        *STATUS_COMMANDS,
+        f"rename-session {invocation}01-Session-Name",
     ]
 
 
-def test_muse_reuses_its_slot_on_rename(
+@pytest.mark.parametrize("invocation", ["muse", "opencode", "pi"])
+def test_named_run_reuses_its_slot_on_rename(
     fake_tmux: tuple[Path, Path],
+    invocation: str,
 ) -> None:
     result = run_helper(
         fake_tmux,
-        "muse",
+        invocation,
         "Second Name",
         extra_env={
-            "FAKE_TMUX_START": "muse",
+            "FAKE_TMUX_START": invocation,
             "FAKE_TMUX_CURRENT_NUM": "04",
-            "FAKE_TMUX_OWNER": "muse",
+            "FAKE_TMUX_OWNER": invocation,
         },
     )
 
@@ -1446,21 +1477,24 @@ def test_muse_reuses_its_slot_on_rename(
         PANE_START_COMMAND,
         "wait-for -L tmux-agent-session-namer-slots",
         "show-options -qv @agent_namer",
-        "show-options -qv @muse_num",
+        f"show-options -qv @{invocation}_num",
         "wait-for -U tmux-agent-session-namer-slots",
-        "rename-session muse04-Second-Name",
+        *STATUS_COMMANDS,
+        f"rename-session {invocation}04-Second-Name",
     ]
 
 
-def test_muse_leaves_a_session_claude_names_alone(
+@pytest.mark.parametrize("invocation", ["muse", "opencode", "pi"])
+def test_named_run_leaves_a_session_claude_names_alone(
     fake_tmux: tuple[Path, Path],
+    invocation: str,
 ) -> None:
     result = run_helper(
         fake_tmux,
-        "muse",
-        "tmuse",
+        invocation,
+        "Session Name",
         extra_env={
-            "FAKE_TMUX_START": "muse",
+            "FAKE_TMUX_START": invocation,
             "FAKE_TMUX_OWNER": "claude",
         },
     )
@@ -1469,13 +1503,15 @@ def test_muse_leaves_a_session_claude_names_alone(
     assert fake_tmux[1].read_text().splitlines() == REFUSED_SLOT_COMMANDS
 
 
-def test_muse_skips_a_shell_pane(
+@pytest.mark.parametrize("invocation", ["muse", "opencode", "pi"])
+def test_named_run_skips_a_shell_pane(
     fake_tmux: tuple[Path, Path],
+    invocation: str,
 ) -> None:
     result = run_helper(
         fake_tmux,
-        "muse",
-        "tmuse",
+        invocation,
+        "Session Name",
         extra_env={"FAKE_TMUX_START": ""},
     )
 
@@ -1484,29 +1520,39 @@ def test_muse_skips_a_shell_pane(
     assert fake_tmux[1].read_text().splitlines() == [PANE_START_COMMAND]
 
 
-def test_muse_ignores_a_blank_session_name(
+@pytest.mark.parametrize("invocation", ["muse", "opencode", "pi"])
+def test_named_run_renames_to_the_bare_slot_for_an_empty_name(
     fake_tmux: tuple[Path, Path],
+    invocation: str,
 ) -> None:
     result = run_helper(
         fake_tmux,
-        "muse",
+        invocation,
         "   ",
-        extra_env={"FAKE_TMUX_START": "muse"},
+        extra_env={"FAKE_TMUX_START": invocation},
     )
 
     assert result.returncode == 0
-    assert not any(
-        command.startswith("rename-session")
-        for command in fake_tmux[1].read_text().splitlines()
-    )
+    assert fake_tmux[1].read_text().splitlines() == [
+        PANE_START_COMMAND,
+        "wait-for -L tmux-agent-session-namer-slots",
+        "show-options -qv @agent_namer",
+        f"show-options -qv @{invocation}_num",
+        f"list-sessions -F #{{@{invocation}_num}}",
+        f"set-option @{invocation}_num 00",
+        f"set-option @agent_namer {invocation}",
+        "wait-for -U tmux-agent-session-namer-slots",
+        *STATUS_COMMANDS,
+        f"rename-session {invocation}00",
+    ]
 
 
 def test_tmuse_launcher_shape_is_helper_accepted(
     tmp_path: Path,
 ) -> None:
-    # The tmuse aliases live as uncommitted environment state, so this
-    # pins the contract on the shapes they produce rather than on the
-    # alias definitions themselves: `tmux new` with the muse CLI.
+    # The argument-carrying launcher shapes: tmux joins a CLI and its
+    # flags into the one command string it records for the pane, and the
+    # helper's gate has to accept what those produce.
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     _write_argv_logger(bin_dir / "tmux", "tmux")
@@ -1545,3 +1591,25 @@ def test_muse_skill_routes_session_naming_through_the_helper() -> None:
         'tmux-agent-session-namer" muse' in text
     )
     assert "renamed" in text
+
+
+def test_pi_extension_routes_session_naming_through_the_helper() -> None:
+    text = PI_EXTENSION.read_text()
+
+    assert '"pi"' in text
+    assert "tmux-agent-session-namer/tmux-agent-session-namer" in text
+    assert "session_start" in text
+    assert "session_info_changed" in text
+
+
+def test_opencode_plugin_routes_session_naming_through_the_helper() -> None:
+    text = OPENCODE_PLUGIN.read_text()
+
+    assert '"opencode"' in text
+    assert "tmux-agent-session-namer/tmux-agent-session-namer" in text
+    assert "session.created" in text
+    assert "session.updated" in text
+    # Neither the placeholder timestamp title nor a subagent's session
+    # may move the tmux session's name.
+    assert "New session - " in text
+    assert "parentID" in text

@@ -18,9 +18,14 @@ slot and format. To hand a session to a different agent, unset its
 owner with `tmux set-option -u @agent_namer` and start that agent as a
 pane's own command, since the prompt route is refused either way.
 
-A muse run takes the session name as its argument and renames once per
-run: Muse sets no pane title to follow, so the agent itself re-runs
-this with its current name at session start and after every rename.
+A muse, pi, or opencode run takes the session name as its argument and
+renames once per run: Muse sets no pane title to follow, pi's carries
+the working directory, and opencode's is prefixed and truncated, so
+muse's skill, pi's extension, and opencode's plugin each hand the
+current name over at session start and after every rename. An empty
+name renames to the bare agent and slot -- the form a session keeps
+until a real name exists, which is how pi and opencode sessions first
+name themselves.
 """
 
 from __future__ import annotations
@@ -54,10 +59,17 @@ CODEX_THREAD_TITLE_IDS = frozenset(("thread", "thread-title"))
 TMUX_SLOT_LOCK = "tmux-agent-session-namer-slots"
 SESSION_AGENT_OPTION = "@agent_namer"
 # What tmux must have started a pane with for the session to be named:
-# an agent CLI launched directly (claude via tclaude, muse via tmuse),
-# or this helper, which is how tcodex launches codex.
+# an agent CLI launched directly (claude via tclaude, muse via tmuse,
+# pi via tpi, opencode via topencode), or this helper, which is how
+# tcodex launches codex.
 AGENT_START_COMMANDS = frozenset(
-    ("claude", "muse", "tmux-agent-session-namer")
+    (
+        "claude",
+        "muse",
+        "opencode",
+        "pi",
+        "tmux-agent-session-namer",
+    )
 )
 STATUS_RIGHT = (
     "#{?window_bigger,"
@@ -70,6 +82,8 @@ class Agent(StrEnum):
     CLAUDE = "claude"
     CODEX = "codex"
     MUSE = "muse"
+    OPENCODE = "opencode"
+    PI = "pi"
 
 
 class Invocation(StrEnum):
@@ -78,6 +92,16 @@ class Invocation(StrEnum):
     CODEX_HOOK = "codex-hook"
     CODEX_REMOTE = "codex-remote"
     MUSE = "muse"
+    OPENCODE = "opencode"
+    PI = "pi"
+
+
+# Invocations whose single argument is the session name, for agents
+# whose own tooling (a skill, extension, or plugin) tracks renames and
+# re-runs this helper with the current name.
+NAME_ARGUMENT_INVOCATIONS = frozenset(
+    (Invocation.MUSE, Invocation.OPENCODE, Invocation.PI)
+)
 
 
 class CodexHookEvent(StrEnum):
@@ -411,6 +435,18 @@ def _allocate_slot(agent: Agent) -> str | None:
         _run_tmux("wait-for", "-U", TMUX_SLOT_LOCK)
 
 
+def _configure_status() -> None:
+    """Show the bracketed session name left and the clock right.
+
+    A global status line can truncate the left at a length that fits
+    its own format but not an agentNN-name, so every agent-owned
+    session carries its own pair: a wide-enough left and a plain right.
+    """
+    _run_tmux("set-option", "status-left", "[#{session_name}] ")
+    _run_tmux("set-option", "status-left-length", "34")
+    _run_tmux("set-option", "status-right", STATUS_RIGHT)
+
+
 def _configure_tmux(agent: Agent) -> None:
     option = f"@{agent}_num"
     if _allocate_slot(agent) is None:
@@ -425,8 +461,7 @@ def _configure_tmux(agent: Agent) -> None:
 
     _run_tmux("set-hook", "pane-title-changed", hook)
     _run_tmux("rename-session", conditional_name)
-    _run_tmux("set-option", "status-left-length", "34")
-    _run_tmux("set-option", "status-right", STATUS_RIGHT)
+    _configure_status()
 
 
 def _literal_tmux_format(value: str) -> str:
@@ -442,10 +477,9 @@ def _rename_tmux(agent: Agent, title: str) -> None:
     fragment = "".join(
         character for character in fragment if character.isprintable()
     )
-    if not fragment:
-        return
-    name = f"{agent}{slot}-{fragment}"[:30]
-    _run_tmux("rename-session", _literal_tmux_format(name))
+    name = f"{agent}{slot}-{fragment}" if fragment else f"{agent}{slot}"
+    _configure_status()
+    _run_tmux("rename-session", _literal_tmux_format(name[:30]))
 
 
 def _parse_invocation(argv: list[str]) -> Invocation | None:
@@ -457,7 +491,7 @@ def _parse_invocation(argv: list[str]) -> Invocation | None:
         return None
     if invocation is Invocation.CODEX_REMOTE:
         return invocation
-    if invocation is Invocation.MUSE:
+    if invocation in NAME_ARGUMENT_INVOCATIONS:
         return invocation if len(argv) == 2 else None
     return invocation if len(argv) == 1 else None
 
@@ -473,18 +507,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if invocation is Invocation.CLAUDE:
         agent = Agent.CLAUDE
-    elif invocation is Invocation.MUSE:
-        agent = Agent.MUSE
-    else:
-        agent = Agent.CODEX
-    if agent is Agent.MUSE:
-        # The agent hands over its own session name: Muse sets no pane
-        # title to track and its hooks do not reach interactive
-        # sessions, so nothing here can resolve the name itself. Each
-        # run re-reads the pane gate and the owner, which is what keeps
-        # a rename tracking the session across repeated runs.
+    elif invocation in NAME_ARGUMENT_INVOCATIONS:
+        agent = Agent(invocation)
+        # The agent's own tooling hands over its current session name,
+        # so nothing here has to resolve it. Each run re-reads the pane
+        # gate and the owner, which is what keeps a rename tracking the
+        # session across repeated runs.
         _rename_tmux(agent, invocation_args[1])
         return 0
+    else:
+        agent = Agent.CODEX
     if agent is Agent.CODEX:
         if invocation is Invocation.CODEX_REMOTE:
             _configure_tmux(agent)
