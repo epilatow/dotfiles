@@ -143,11 +143,11 @@ Two complementary tools enforce markdown style:
 - **`mdformat`** is the canonical formatter. Owns every mechanical formatting
   decision: line wrap (79 chars), ordered-list numbering, bullet / emphasis /
   strong markers, blank-line spacing, table alignment. Run via `uvx` with the
-  GFM and table plugins:
+  GFM, table, and frontmatter plugins:
 
   ```bash
   uvx --with mdformat-gfm --with mdformat-tables \
-      mdformat --wrap=79 --number <path>
+      --with mdformat-frontmatter mdformat --wrap=79 --number <path>
   ```
 
 - **`markdownlint`** (typically `markdownlint-cli2`) covers content rules

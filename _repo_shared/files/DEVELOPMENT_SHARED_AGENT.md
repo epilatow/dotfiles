@@ -28,53 +28,30 @@ apply.
   additions, do not run tests or begin a review until those changes are
   committed. Amend that commit with incremental fixes before each retest or
   re-review rather than validating an uncommitted working tree.
-- **Self-review every commit before independent review.** Once the work is
-  committed and before the pre-review gate runs, read each commit as its
-  reviewer will, against the checklist in
-  [the review prompt](#the-review-prompt-verbatim), and fix what you find. In
-  particular, check that every claim in the docs, comments, and commit message
-  matches what the code does; that every instance of the problem is fixed (see
-  [Finish the work everywhere it applies]); and that the change is consistent
-  with the code around it. Ask whether the commit combines logically separable
-  changes; smaller cohesive commits review faster and keep a fix for one
-  concern from disturbing another. Split only when each result is complete,
-  independently understandable, and testable, and keep tightly coupled
-  implementation, tests, and documentation together. The reviewer confirms the
-  analysis; it does not do it for you. Edge cases and code paths a reviewer
-  finds are ones the self-review should have found.
-- **A green implementer-owned full-suite gate precedes review.** After
-  committing, the implementing agent runs the repo's full local test suite and
-  applicable quality gates and gets a green result before spawning a review
-  agent. Never hand broken code to a reviewer and make the reviewer discover
-  failures that the required gate would have caught.
-- **The per-commit gate: every commit in a stack, not just the tip.** When the
-  work is more than one commit, run the full suite and the quality gates at
-  each commit in turn, with nothing from later commits present. A stack whose
-  tip is green routinely hides an intermediate that is not: a fix, a rename, or
-  a test update lands one commit later than the change it repairs, and only the
-  tip ever sees both. That intermediate is a real state the world will reach --
-  `git bisect` checks it out, reverting the commit above leaves the tree
-  sitting on it, and a CI job may build any commit of a pushed branch. Running
-  a reduced suite (skipping the slow or browser tests, say) does not discharge
-  this: an intermediate breakage hides precisely where the subset stops
-  looking. Walk the stack in a gate worktree (see below) rather than in the
-  branch's own, which would detach its HEAD.
+- **Audit every committed change before its post-change tests.** Identify the
+  exact commit, not staged, unstaged, or untracked work. While authored context
+  remains available, follow the repository-local
+  `.agents/skills/repo-shared-audit-committed-change/SKILL.md`. Fix findings in
+  the owning commit and rerun the audit before testing. This implementer-owned
+  audit does not replace independent review.
+- **A green implementer-owned gate precedes review.** After the
+  authored-context audit, run the tests and quality gates relevant to the
+  committed change. When the repository requires its full suite, use the
+  repository-local `.agents/skills/repo-shared-run-commit-gates/SKILL.md` for
+  that exact commit. Do not give a reviewer a commit with red applicable gates.
+- **Gate each new commit, not just the tip.** Run applicable gates on every new
+  commit in a stack with no later commits present. For a previously green
+  rewrite, follow the rewrite skill's affected-commit and final-tip rule.
 - **An independent code review precedes handoff.** Once the gates are green,
   the implementing agent spawns the reviewer itself, unasked. An unreviewed
   branch is not ready to hand off as finished. See [Code review](#code-review).
-- **A green exact-candidate full-suite gate precedes every merge.** The
-  implementing agent owns test execution. The pre-review run satisfies this
-  gate when review produces no commit changes and the base has not moved. After
-  review fixes, run the tests or gates affected by each fix, then run the full
-  suite once on the settled candidate before requesting or acting on merge
-  approval -- and re-run the per-commit gate if any commit below the tip
-  changed, which a review-fix rebuild always does. Merge approval never waives
-  either gate. If the base moved, replay the branch onto its current tip, run
-  the full suite on that integrated tree, and re-run the per-commit gate as
-  well: a replay rewrites every commit it carries over, so none of them has
-  been gated in its new form. These are test gates only: rewritten commit SHAs
-  do not by themselves invalidate completed reviews. See the [re-review rule]
-  for the separate re-review triggers. Never merge first and test afterward.
+- **A green exact-candidate gate precedes every merge.** The pre-review result
+  counts if neither content nor applicable gate commands changed. After review
+  fixes, rerun affected gates on the settled tip and changed earlier commits as
+  required by the rewrite skill. If the base moved, gate the integrated tip for
+  affected content. Merge approval waives no gate. SHA changes alone do not
+  require re-review; follow the independent-review skill's finding-disposition
+  rules. Never merge first and test afterward.
 - **Look at file contents, not extensions.** Scripts that have
   `uv run --script` in their shebang are Python scripts, not shell scripts,
   regardless of file extension or lack thereof. Always open the file before
@@ -254,11 +231,12 @@ open" is a flag the change isn't actually done; check whether the deferral is
 real or a rationalization.
 
 Past staleness is never a license for new staleness. When a review finding (or
-self-review) calls out a stale list, classification, table, or convention
-adjacent to your change, do the full work to leave it correct -- including
-restoring quality of pre-existing entries the change touches. If genuinely
-out-of-blast-radius cleanup is needed elsewhere, surface it as a separate
-suggested follow-up; don't use it to excuse skipping the in-scope work.
+committed-change audit) calls out a stale list, classification, table, or
+convention adjacent to your change, do the full work to leave it correct --
+including restoring quality of pre-existing entries the change touches. If
+genuinely out-of-blast-radius cleanup is needed elsewhere, surface it as a
+separate suggested follow-up; don't use it to excuse skipping the in-scope
+work.
 
 ## SCM
 
@@ -287,18 +265,12 @@ Never edit the main checkout directly. Every develop / build / test / debug
 cycle runs in a `git worktree add` under `$REPO/.wt/`, nested under the repo's
 own checkout. For an agent-created branch-backed worktree, the relative path
 under `.wt/` must exactly match the branch name: branch `<branch>` uses
-`$REPO/.wt/<branch>`. Do not invent a separate worktree-purpose name. Detached
-worktrees have no branch to match and follow their applicable naming rule: the
-SHA-based code-review worktrees below, and `$REPO/.wt/gate-<SHA>` for the
-per-commit gate, where `<SHA>` is the tip of the stack being walked. One gate
-worktree serves the whole walk -- check out each commit inside it in turn, so
-the suite's dependencies are installed once rather than per commit -- and it is
-removed when the walk ends, not left for the merge. Keeping it off the
-review-worktree path matters: the review protocol reuses a `code-review-<SHA>`
-this session created and deletes it afterwards, which would take a gate
-worktree with it. Be sure that .gitignore contains .wt/. Once the user has
-approved the merge and the work has landed on `main`, remove the worktree and
-any branches you created as part of the development effort.
+`$REPO/.wt/<branch>`. Do not invent a separate worktree-purpose name. The
+temporary gate and code-review branches below use attached worktrees and
+therefore follow the branch-matching rule. Be sure that .gitignore contains
+.wt/. Once the user has approved the merge and the work has landed on `main`,
+remove the worktree and any branches you created as part of the development
+effort.
 
 **Set the working directory at the start of every command or block of
 commands** -- `cd <abs-path> && <command>`, or `git -C <abs-path>` per command.
@@ -337,93 +309,19 @@ commit to exactly what its description calls for. (Programmatic tooling that
 stages a known-clean worktree it fully controls is the exception; this rule is
 about an agent hand-building commits.)
 
-### Working with local commits
+### Local commit-stack rewrites
 
-Changes to existing local (unpushed) commits should generally fold into the
-commit that introduced the affected code, not into new or follow-on commits. If
-you think a change should be a follow-on, ask first.
+Fold changes into the local, unpushed commit that introduced the affected code;
+ask before using a follow-on commit. Never use `git rebase`, create a merge
+commit, or cherry-pick feature commits directly onto `main`.
 
-When editing a commit mid-stack, be very careful not to leak functionality from
-other commits into the commit you're editing. After amending, double-check the
-commit to verify you didn't make this mistake. Mechanisms that help:
-
-- If commits are orthogonal, reorder so the one being edited is at the top of
-  the stack (using the backup-branch + cherry-pick technique below).
-- If commits overlap, check out the commit that needs fixing, amend it with
-  changes, then cherry-pick the other commits on top using the backup-branch
-  technique below.
-- If commits overlap, you can also make changes in new temporary commits that
-  get moved around in the stack and folded into a lower commit (both operations
-  done via the backup-branch + cherry-pick technique below).
-
-### Never use `git rebase`
-
-Not `rebase -i`, not `--autosquash`, not non-interactive `rebase <upstream>` or
-`--onto`, and not any `GIT_SEQUENCE_EDITOR` automation. Reasons:
-
-- The "review the todo in the editor" safety property doesn't hold for an agent
-  invocation.
-- Mid-rebase conflict resolution is a place silent loss happens.
-- Empty commits are dropped by default without warning.
-- The diff-vs-backup-branch safety check loses its teeth: intended
-  conflict-resolution drift can no longer be distinguished from accidental hunk
-  loss.
-
-For folds, reorders, and mid-stack edits, use the backup-branch + cherry-pick +
-amend technique below. To update a feature branch onto a moved base (the case
-`git rebase main` would normally cover), use that same technique -- see its
-moved-base variant below. Never resolve a moved base with a merge commit (see
-below).
-
-### Never use merge commits
-
-Keep history linear -- never create a merge commit. The place this tempts an
-agent is updating a feature branch onto a moved base: do not merge the new base
-into the branch. Rebase it with the backup-branch + cherry-pick technique below
-instead.
-
-The other place it tempts an agent is landing a branch on `main` after `main`
-has advanced past the branch's base. Do not create a merge commit, and do not
-cherry-pick the branch's commits onto `main` directly. Instead rebase the
-branch onto the new `main` tip (same technique), then fast-forward merge the
-whole branch onto `main`. Rebasing happens on the branch; `main` only ever
-advances by fast-forward.
-
-### Backup-branch + cherry-pick technique
-
-For mid-stack edits, folds, and reorders:
-
-0. Confirm `git -C <path> rev-parse --abbrev-ref HEAD` names the feature
-   branch, using the same `<path>` step 2 will reset. Getting this wrong
-   rewrites the wrong branch.
-1. Create a local backup branch at the current branch's HEAD, named
-   `backup/YYYYMMDD-HHMMSS-<descriptive-name>`.
-2. Reset to the commit that needs to be updated.
-3. Make the edits and amend the commit.
-4. Cherry-pick the remaining commits from the backup branch back onto the
-   current branch.
-5. Run `git diff <backup-branch>` to verify the replay didn't silently drop or
-   duplicate anything. For pure reorders or folds (no content change), the diff
-   should be empty. For edits that change file content, the diff should show
-   exactly the intended edit and nothing else.
-6. Re-run the per-commit gate. Every commit from the amended one upward is a
-   new commit with a tree nobody has tested: the diff-check proves the *tip* is
-   what it should be, and says nothing about the states in between.
-
-The same technique applies to reordering commits in a stack: reset to the
-appropriate ancestor, then cherry-pick commits back in the desired order. The
-diff-check still applies (for pure reorders, the diff should be empty).
-
-It also rebases a branch onto a moved base: reset to the new base commit (not
-an ancestor of the branch), then cherry-pick the branch's own commits back on
-top, resolving conflicts as they arise. Here the diff-check against the old
-branch HEAD is *not* expected to be empty -- it should show exactly what the
-new base introduces plus any conflict resolutions you made, and nothing else.
-Anything more means a commit was dropped, duplicated, or mis-resolved.
-
-To fold a later commit into an earlier one, use the same technique;
-`git commit --fixup` + `git rebase -i --autosquash` is a rebase, and
-[Never use `git rebase`](#never-use-git-rebase) covers it.
+Before changing history, verify the exact feature worktree and branch; never
+rewrite `main` or another session's branch. Prove the commits are local or
+obtain user direction. Read and follow the exact repository-local
+`.agents/skills/repo-shared-rewrite-local-commit-stack/SKILL.md` for the
+backup, replay, recovery, and verification procedure. If it is missing or its
+preconditions fail, stop before changing history. A moved-base replay may
+fast-forward to `main` only after separate merge authorization.
 
 ### Renames
 
@@ -433,129 +331,24 @@ rename). The second commit contains the actual file updates.
 
 ## Commit-message hygiene
 
-`DEVELOPMENT_SHARED.md`'s "Commit messages" section is the canonical rule list.
-A few patterns recur in agent-authored messages despite being on the do-NOT
-list, so flagging them again here:
-
-- **No `Touched:` / `Files changed:` / `Affected:` lists.** The diff enumerates
-  every file; restating that as a labelled list duplicates it and rots whenever
-  an amend changes the file set.
-- **No references to symbols the same diff removes.** A subject like "Replaces
-  the per-utility `_FooHelper.bar` with a generic base" is a trap: future
-  readers grep for the named symbol and find nothing because the same commit
-  deleted it. State the new artifact on its own terms.
-- **No commit-history references.** "The followup notes ...", "the
-  tmp/<slug>-... scope", "as discussed in the earlier review" all point at
-  ephemeral agent-facing scratch. None of that survives in `git log`. If a
-  constraint matters, restate it inline.
-- **No plan references.** Sentences like "Two divergences from the plan's
-  classification", "as the plan calls for", "the plan put X in Y" are dangling
-  pointers -- plan files live in `tmp/` (gitignored), so a future reader of
-  `git log` has no document to compare against. State what the commit does on
-  its own terms; if a non-obvious choice matters, explain the choice itself,
-  not what an unwritten alternative would have been.
-- **No session identifier, ever.** See
-  [Never record a session identifier](#never-record-a-session-identifier)
-  below.
-
-Numbered step comments in code (`# 1. Parse input`, `# 2. Validate`, ...) are
-forbidden by `DEVELOPMENT_SHARED.md`'s "Comments" subsection. Adding or
-removing a step forces renumbering, and the function name plus code structure
-already convey ordering. This applies even when describing a canonical pipeline
-of steps -- the named operation is its own label.
-
-## Attribution trailers
-
-An AI-assisted commit carries one attribution trailer per contributing model,
-last in the message and implementing model first:
-
-```text
-Co-Authored-By: <model> [(<size> context)] via <editor> [<<email>>]
-```
-
-The two halves do different jobs, and only one of them is load-bearing:
-
-- The **name** is free-form and purely informational -- GitHub ignores it when
-  matching, so it is the right place for everything a future reader wants:
-  which model, at what context window, driven by which editor. The editor names
-  in use are `claude-code`, `codex`, and `opencode`.
-- The **email** is the identity key, and it does something only when it
-  matches. GitHub resolves it against the registered addresses of a user
-  account and, on a match, renders a linked contributor row on the commit; an
-  address matching no account earns no link. Its angle brackets are literal --
-  an address written without them is not read as an address at all.
-
-Include an email only where it is known to resolve to the vendor's own GitHub
-account. The verified ones:
-
-- `noreply@anthropic.com` -- resolves to the `claude` account, owned by
-  Anthropic.
-- `noreply@openai.com` and `codex@openai.com` -- both resolve to the `codex`
-  account, owned by OpenAI.
-
-**Never invent an address for a vendor that has no verified one.** An address
-is an assertion, not a label. A plausible-looking `noreply@` at the vendor's
-domain earns no link, so it buys nothing, while permanently claiming an
-identity nobody here checked at a domain nobody here controls. Omit the email
-instead. The `users.noreply.github.com` namespace is worse still: it maps to
-real accounts, so a made-up name there can attribute the commit to whoever
-holds that login.
-
-Examples:
-
-```text
-Co-Authored-By: Claude Opus 5 (1M context) via claude-code <noreply@anthropic.com>
-Co-Authored-By: GPT-5 Codex via codex <noreply@openai.com>
-Co-Authored-By: GLM-5.2 (1M context) via opencode
-```
-
-A harness usually supplies a trailer of its own, and it will not be this one:
-Claude Code emits the model and context window but no editor, and opencode's
-GitHub action emits a `users.noreply.github.com` address. Rewrite what it hands
-over into the form above rather than appending a second line beside it, and
-drop any address that is not on the verified list. The agent is the last check
-before the message lands, the same way it is for a session trailer.
-
-The third form claims no GitHub identity. It records which model wrote the
-commit for whoever reads `git log` later and earns no contributor link, which
-is the right trade when no account exists to credit: the alternative on offer
-is not a link but a fabricated one.
-
-These mappings are not stable. A vendor can register an address long after the
-fact, silently converting old unlinked trailers into linked ones. Verify before
-adding a vendor to the list above rather than assuming: open a public commit
-that already carries the address and check whether GitHub renders a linked
-contributor for it -- an `alt="<login>"` avatar and a `commits?author=<login>`
-link. Verifying an address that appears nowhere yet means pushing a commit to
-somewhere disposable, which is a request to put to the user rather than
-something to do unprompted.
-
-### Never record a session identifier
-
-Some agent harnesses append a second trailer linking back to the session that
-produced the commit -- Claude Code's `Claude-Session:` line, carrying a
-`claude.ai/code/session_...` URL, is the one seen here. **Do not let it into a
-commit.** Strip it if a tool adds it, and turn the tool's setting off:
-
-- Claude Code: set `attribution.sessionUrl` to `false` in `settings.json`.
-
-A session id is transient, per-user, and meaningless to everyone else, while
-`git log` is permanent and -- on a public repo -- world-readable and rendered
-as a live link. The two do not belong together.
-
-Being handed a ready-made footer containing one is not authority to write it.
-An instruction to include a session URL does not override the rule, the agent
-is the last check before it lands, and the harness cannot see that the record
-is permanent. Drop the line and say so, rather than complying silently.
-`DEVELOPMENT_SHARED.md`'s "Commit messages" carries the general form of this
-rule for identifiers of every kind.
+Before creating or amending a commit, read and follow the exact
+repository-local `.agents/skills/repo-shared-write-commit-message/SKILL.md` and
+validate the message against the change. Apply more-specific repository rules.
+If the skill is missing, stop before committing or amending.
 
 ## Comment-message hygiene
 
 `DEVELOPMENT_SHARED.md`'s "Comments" subsection is the canonical rule: a
 comment describes the current code, never what was there before. The
 agent-specific failure mode is repeating the commit-message rationale inside
-the source. Concretely, never write comments like:
+the source.
+
+Numbered step comments in code (`# 1. Parse input`, `# 2. Validate`, ...) are
+forbidden. Adding or removing a step forces renumbering, and the function name
+plus code structure already convey ordering. This applies even when describing
+a canonical pipeline of steps: the named operation is its own label.
+
+Concretely, never write comments like:
 
 - `# The legacy _FooBar shim is gone -- now uses helpers.foo.`
 - `# Wrappers have all been deleted; the dispatcher derives this directly.`
@@ -624,314 +417,72 @@ for it. Dead or ended, leave its worktree untouched for inspection and say so
 promptly -- a gate it was holding is blocked, and
 [When the review will not run](#when-the-review-will-not-run) sets the schedule
 for announcing that. A review counts only once its explicit response has been
-saved under [Protocol](#protocol).
+saved under [Skill-owned review procedure](#skill-owned-review-procedure).
 
 ## Code review
 
-After each agent-driven develop / commit / self-review / green full-suite
-pre-review gate, the implementing agent spawns one code-review subagent against
-the just-committed branch -- doc-only and lint-config commits included. It is a
-required gate, not a default to weigh against other considerations.
-Agent-driven reviews like this run BEFORE the user reviews the commit. The
-review agent inspects the test coverage and may run focused tests to
-substantiate a suspected finding, but does not duplicate the implementing
-agent's already-green full suite.
+After each agent-driven develop / commit / committed-change audit / green
+full-suite pre-review gate, the implementing agent runs one independent review
+of the exact audited and tested commit, including doc-only and lint-config
+commits. The target need not be `HEAD`. Review precedes user review and
+handoff. The reviewer may run focused tests but not the full suite.
 
-The reviewer completes the whole review after finding an issue; it does not
-return on the first finding. Returning one complete batch keeps independent
-review from turning into a serial search where every amend starts another
-full-repo pass.
+Complete the review before acting on findings. Resolve findings in their owning
+commits and rerun affected gates. Before deciding how to handle a finding,
+whether an amendment needs re-review, or how to handle later user feedback,
+read the skill's `references/finding-disposition.md`. A disputed P1/P2 or a fix
+requiring new authority must be brought to the user; do not reject it
+unilaterally.
 
-After the review returns, address each finding directly in the commit (amend)
-and run the tests or gates affected by the fixes. Whether a fix also needs
-another review is settled per fix by the [re-review rule].
+### Standing authorization
 
-Evaluate every P1/P2 finding against the user's original requirements and the
-approved plan, then try to address it within those constraints. A review
-severity is not itself authorization to change the intended behavior, but the
-agent may not unilaterally reject a P1/P2 and continue. If the agent believes a
-P1/P2 is incorrect or outside the requirements, or cannot fix it without
-trading one requirement for another, reversing a previously required behavior,
-or alternating between implementations, stop all implementation, testing,
-review, and merge work and ask the user. Do the same when reviews conflict, the
-same issue recurs, a fix requires new authority, or repeated cycles otherwise
-fail to converge. Resume only after the user provides direction. Do not leave a
-known actionable P1/P2 finding unresolved merely because a particular number of
-review cycles has completed.
+This repository's requirement for an independent review is the owner's standing
+request to spawn a reviewer; do not ask again merely because a tool requires a
+user request. It does not override a categorical session bar. Note at handoff
+that the review ran under this standing authorization.
 
-A P1/P2 finding is also a verdict on the process that produced the commit: the
-analysis or planning stopped short of the case the reviewer found. Before
-fixing it, return to that analysis and look for what else the same gap let
-through -- adjacent code paths, other instances, the edge cases the fix implies
--- and address those in the same amend, not just the case the reviewer named.
-
-Any change the user requests after agent review counts as user review feedback,
-including small follow-up edits during handoff. Amend the requested change and
-rerun the relevant tests or gates, but do not spawn another code-review
-subagent unless the user explicitly asks for one. Rerunning tests after user
-feedback does not imply a re-review.
-
-Findings the agent chooses NOT to address get appended to
-`$REPO/tmp/<slug>-code-review-rejected.md` with reasoning, so the rejected set
-stays visible for the user's review. The agent cannot make that choice for a
-P1/P2 finding without stopping and obtaining user direction first; append it
-only if the user confirms that it should be rejected.
-
-### Re-review is triggered by the fix, not the finding
-
-A finding's severity says whether its fix ships before the commit does. It says
-nothing about whether the fix needs another review. That is decided per fix, by
-whether the amendment changes the commit's behavior enough that the completed
-review no longer covers it: a reworked or added code path, a changed contract
-that callers or users rely on, or a diff large enough to need a reader of its
-own. Such a fix gets a fresh full zero-context review of the amended commit,
-using the same protocol and prompt as the initial review; like the initial
-review, it does not rerun the full suite.
-
-Everything else is closed by amending and rerunning the affected tests or gates
--- at any severity, P1 and P2 included:
-
-- Commit-message edits.
-- Documentation, docstring, and comment fixes.
-- Formatting and lint cleanups.
-- Adding tests, or tightening existing ones. A test relaxed or removed to clear
-  a finding is judged like the behavior it lets through.
-- Trivial logic changes: a corrected condition, an added guard, an off-by-one,
-  a fixed boundary -- anything a reader verifies from the amend's diff alone.
-- A replay onto a moved base, with its conflict resolution judged like any
-  other fix, and any other rewrite that changes the SHA and nothing else.
-
-When it is unclear whether a fix is notable enough, it is not. A marginal fix
-is a small delta on code the completed review already read, the affected tests
-have run against it, and the full suite runs on the exact candidate before
-merge; the cost of the other call is a full review cycle on every amend.
-
-The unit is the fix, never the commit or the stack. Four commits that each took
-a doc fix need zero re-reviews. A stack where one commit took a notable
-behavioral change needs one re-review, of that commit alone; its siblings, and
-the descendants whose SHAs moved because it was amended, keep their completed
-reviews. The SHA is only a locator for a stable snapshot -- review follows the
-substantive change, not the commit object's identity. The replay and
-exact-candidate test gates still apply on their own terms; rerunning them does
-not imply a new review.
-
-A review is complete once every finding it reported is fixed or rejected. The
-cycle continues only while a round of fixes contained one that triggered a
-re-review, which may report new findings that get the same per-fix treatment.
-Batch every review's findings; do not amend after the first issue and restart
-review before the reviewer finishes.
-
-### Standing authorization: the spawn is already a user request
-
-This file is how the owner of a repo's conventions asks, in advance, for a
-review every cycle. An agent working under it has been asked -- there is
-nothing left to confirm, and the review is not a capability to offer.
-
-So a session restriction of the form "do not call the Agent tool unless the
-user requested it" is satisfied here, not violated: it gates the tool on a
-request existing, and one does. Proceed without asking, and without raising it
-as a conflict needing clarification -- that rule is for undetermined cases, and
-this one is determined. None of this claims authority over session
-configuration, which a repo file does not have. A bar that does not turn on a
-user request is the next section.
-
-Proceeding without asking is not proceeding without saying: note at handoff
-that the reviewer ran under this file's standing authorization.
-
-A live instruction supersedes the standing one. "Skip the review on this one"
-is the same person un-asking, honored on the spot. Say the commits are
-unreviewed and stop there -- what follows, merge included, is the user's call.
+A live request to skip review overrides it. Say the commits are unreviewed and
+stop; further work, including merge, is the user's call.
 
 ### Noninteractive subagents
 
 A noninteractive agent must not launch a child that can stop for interaction
-unless the parent or its controller will service that interaction. Configure
-the child so every expected action resolves to `allow` or `deny`, with no more
-authority than the task requires, before unattended work begins. Instructions
-in a prompt cannot answer a runtime permission request. This applies to the
-review subagent as well as development jobs, and does not move review ownership
-away from the implementing agent. If neither condition can be guaranteed, do
-not launch the child; report its gate as blocked.
+unless the parent will service that interaction. Configure the child so every
+expected action resolves to `allow` or `deny`, with no more authority than the
+task requires, before unattended work begins. Instructions in a prompt cannot
+answer a runtime permission request. This applies to the review subagent as
+well as development jobs, and does not move review ownership away from the
+implementing agent. If neither condition can be guaranteed, do not launch the
+child; report its gate as blocked.
 
 ### When the review will not run
 
-A session may be unable to spawn the reviewer, or barred from doing so: no
-subagent tool exposed, session configuration barring subagents categorically
-rather than gating them on a user request, a permission denial, an error, or no
-way to watch or end the subagent once it starts. Any of them is a blocked gate,
-not a waived one.
+A categorical session bar, permission denial, invocation error, or inability to
+observe and stop the child blocks the review gate; it does not waive it. Report
+a known bar in the first reply, before planning. If it arises later, report it
+in the turn the green pre-review gate passes, not at handoff. Explain the
+consequence and ask the user how to proceed.
 
-Say so as early as it is known. A bar visible in the session's own
-configuration is known before any work starts, so it belongs in the first
-reply, ahead of the plan, while the user's options are still cheap. One that
-surfaces at the spawn is due in the turn the green gate passes. Never a wrap-up
-summary, where it arrives too late to act on. The trigger is the outcome, not
-the cause -- any conclusion that no independent review is coming is announced
-on that schedule. Silence is for the case where the review happens.
-
-Say what blocks it and what that costs, then ask how the user wants to proceed.
-Do not substitute a self-review from the implementing session and count the
-gate as met. The value of the reviewer is the zero-context independence that a
-session which authored the code cannot have.
-
-While the gate stays blocked the work is not done: not complete, not ready for
-review, not ready to merge, and no merge or push approval requested. The
-unreviewed state is the first thing said about the branch.
+Do not substitute the implementing session's committed-change audit. While
+blocked, the work is unreviewed and not ready for completion, handoff, merge,
+or push. Lead with that status when reporting the branch.
 
 ### Zero-context review
 
-The review subagent must start with **zero authored context inherited from the
-calling agent**. It does not see the calling agent's conversation, prior plans,
-working notes, or any pre-framing of which decisions are "intentional". It
-receives only two neutral inputs: the commit SHA and the absolute path to a
-clean detached review worktree named only from that SHA. The path locates the
-repository without adding human-authored framing.
+The reviewer receives no inherited implementing conversation, plans, prior
+reviews, or explanations of intent. Supply only the skill's frozen prompt, with
+the full target commit ID and clean review-worktree path; repository
+instructions loaded from that worktree are allowed.
 
-This matters because pre-framing decisions as "intentional" is exactly how
-regressions slip past review. The calling agent's job is to surface the SHA
-neutrally; the review agent's job is to evaluate independently.
+### Skill-owned review procedure
 
-### Protocol
-
-1. Create a clean detached review worktree at `$REPO/.wt/code-review-<SHA>`,
-   where `<SHA>` is the full commit SHA. Reuse an existing path only when this
-   session created it and it is clean, detached, and at that exact commit; one
-   another session created is in use (see
-   [Other agents share this repo and machine]). Never put a human-authored
-   purpose or branch name in the review worktree path.
-2. Spawn the review subagent with the prompt below, substituting `<SHA>` and
-   `<REPO>` with the commit SHA and detached review-worktree path. Hand the
-   agent nothing else -- no extra framing, no "we already decided X", no hints
-   about which findings would be welcome. Supervise it from there per
-   [Supervising a subagent](#supervising-a-subagent); a review that wedges is
-   the case that section exists for.
-3. Save the initial review to `$REPO/tmp/<slug>-code-review.md`. Save every
-   later review with the next unused numeric suffix, such as
-   `$REPO/tmp/<slug>-code-review-2.md` and `$REPO/tmp/<slug>-code-review-3.md`,
-   so no review overwrites another.
-4. Remove the detached review worktree after saving the response. If it is
-   unexpectedly dirty, retain it and surface the problem instead of forcing
-   removal.
-5. Address findings. For each finding, either fix it in the commit (amend) or
-   append the rejected finding to `$REPO/tmp/<slug>-code-review-rejected.md`
-   with reasoning on why it was rejected. Never append a P1/P2 rejection or
-   continue execution without first stopping and obtaining user direction.
-
-### The review prompt (verbatim)
-
-Use exactly this prompt. Do not edit it to add context, reassurance, or
-guidance about which decisions are intentional.
-
-```text
-You are reviewing a single commit on this repo. You have
-zero context from any prior conversation -- evaluate the
-commit on its own merits using only the inputs below and
-the repo state.
-
-Inputs:
-- Authored intent: the commit message itself is the only
-  authored statement of what this commit was supposed to
-  do. Read it as the source of truth, but be aware it
-  was written by the implementing agent after the fact
-  and may rationalize choices that don't match the
-  underlying problem.
-- Commit SHA: <SHA>.
-- Repo path: <REPO>, a clean detached review worktree
-  named only from the commit SHA.
-
-Use the supplied repo path as the working directory. Do not
-search other repositories or the filesystem for the commit.
-Prior reviews, plans, rejected-finding logs, reflogs, and
-superseded versions of this commit are deliberately excluded
-context. Do not inspect them. Review only the specified commit,
-its parent, and the broader tracked repository state needed to
-evaluate that commit.
-
-You are free to read any file in the repo you need to
-understand the broader context. A code review against the
-diff alone misses regressions that only surface when the
-change is read against its callers, consumers, and
-surrounding invariants. Read the full affected file(s),
-not just the diff. The implementing agent owns the green
-test gate and final full-suite run. Do not rerun the full
-local suite. You may run focused tests when needed to
-substantiate a suspected finding; report any command and
-result you rely on.
-
-Do not stop after finding one issue. Complete every review
-check and report the full set of findings in one response.
-
-Answer two distinct questions, separately:
-
-1. Does the commit solve the problem it was supposed to
-   solve? Is the diff in scope? Complete? Anything the
-   authored intent called for that wasn't addressed?
-
-2. Did the commit avoid regressing or breaking anything
-   else? Specifically:
-   - Do the changed and adjacent tests adequately cover the
-     behavior? If you ran focused tests, did they pass?
-   - Any changes that go beyond the authored intent?
-   - Any deleted or modified content the intent didn't
-     call for?
-   - Any docstrings or comments touched that are no
-     longer accurate post-change?
-   - Commit message: does it accurately describe what
-     the diff does? Any rationalizations, omissions, or
-     claims that don't match the actual change?
-   - Doc-sync: did the diff touch anything with a doc
-     footprint -- CLI surfaces, helper APIs, naming
-     rules, test layout, conventions, behaviors -- that
-     should have triggered a doc update but didn't? Read
-     `DEVELOPMENT_SHARED.md` "Doc-sync rule" for the
-     policy, then grep `*.md` for the changed symbols /
-     conventions and flag any stale references.
-   - For code diffs, evaluate the broader logic the
-     changed code participates in. Read the affected
-     file(s) in full plus any callers / consumers
-     reachable from the changed symbols. Test-suite
-     green is necessary but not sufficient.
-
-Tag findings P1 (blocks) / P2 (must-fix-before-shipping)
-/ P3 (nice-to-have).
-```
-
-### Valid vs. invalid rejection rationales
-
-A code-review finding can be appended to
-`$REPO/tmp/<slug>-code-review-rejected.md` only when the reasoning holds up on
-its own merits. For a P1/P2, these rationales support asking the user to reject
-the finding; they never permit the agent to reject it and continue without user
-direction. Examples of *valid* rejections:
-
-- The finding is genuinely out of the diff's blast radius (a different file the
-  diff didn't touch, behavior the change doesn't affect).
-- The finding's "fix" would re-introduce a regression that an earlier commit
-  already resolved.
-- The finding is genuinely cosmetic and the fix would meaningfully enlarge the
-  diff for negligible value (e.g. reflowing untouched surrounding lines just to
-  follow a style guideline the existing code already violates).
-
-The following rationales are NEVER valid for rejecting a finding -- they are
-rationalizations for shipping a half-job:
-
-- "The existing X was already stale" and "doing it thoroughly is out of scope".
-  [Finish the work everywhere it applies] already rules these out: if the diff
-  touched the surface, the agent owns leaving it correct, pre-existing gaps
-  included.
-- "It's only nice-to-have / P3, so it's optional." The P-tag indicates
-  ship-blocking severity, not whether to do the work. P3 findings local to the
-  diff still get fixed.
-- "Adding it would be defensive against an unrelated future regression." If the
-  surface is in the diff's blast radius, the agent owns making it correct now,
-  not punting it to a hypothetical future agent.
-
-If a finding genuinely belongs in a separate follow-up commit (not just a
-rejection), surface that as an explicit suggestion to the user with the
-proposed scope, rather than self-rejecting. The user decides whether to fold it
-in or defer.
+Before implementation begins on work requiring this gate, read and follow the
+exact repository-local
+`.agents/skills/repo-shared-independent-code-review/SKILL.md`. Discovery by
+name alone does not prove the repository copy was loaded. The skill owns
+isolation, same-agent reviewer selection, supervision, report capture, cleanup,
+and post-review finding disposition. If the exact skill is missing or a safe
+child cannot run, apply
+[When the review will not run](#when-the-review-will-not-run).
 
 [delete from a list, never from a pattern]: #delete-from-a-list-never-from-a-pattern
-[finish the work everywhere it applies]: #finish-the-work-everywhere-it-applies
-[other agents share this repo and machine]: #other-agents-share-this-repo-and-machine
-[re-review rule]: #re-review-is-triggered-by-the-fix-not-the-finding

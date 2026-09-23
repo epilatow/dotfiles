@@ -1,0 +1,1 @@
+../../../_repo_shared/dotfiles/agents/skills/repo-shared-rewrite-local-commit-stack/SKILL.md
