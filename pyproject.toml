@@ -31,11 +31,7 @@ mypy_path = ["src"]
 testpaths = ["_repo_shared/tests", "tests"]
 
 [tool.repo-shared.markdown]
-# The Muse skill carries mandatory YAML frontmatter, which mdformat
-# rewrites as prose. Slash-containing entries are anchored at the repo
-# root, so only that skill stays out of both markdown gates; it is
-# validated by its own harness (`muse skills validate`) instead.
-extra-exclude-dirs = ["files/muse/tmux-namer/skills"]
+# No markdown exclusions are currently needed.
 
 [tool.repo-shared.code-quality]
 # The libexec entries are shebang scripts with no `.py` extension, which

@@ -22,8 +22,16 @@ tcodexd()
 {
 	tcodex --dangerously-bypass-approvals-and-sandbox "$@"
 }
-alias tmuse="tmux new muse"
-alias tmused="tmuse --yolo"
+tmuse()
+{
+	tmux new \
+	    "$HOME/.local/libexec/tmux-agent-session-namer/tmux-agent-session-namer" \
+	    muse-run "$@"
+}
+tmused()
+{
+	tmuse --yolo "$@"
+}
 alias topencode="tmux new opencode"
 alias topencoded="topencode --auto"
 alias tpi="tmux new pi"

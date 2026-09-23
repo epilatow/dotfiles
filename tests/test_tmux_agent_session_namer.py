@@ -4,10 +4,8 @@ import ast
 import json
 import os
 import shutil
-import socket
 import sqlite3
 import subprocess
-import tempfile
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
@@ -38,15 +36,6 @@ CLAUDE_WRAPPER = (
     / "hooks"
     / "tmux-name.sh"
 )
-MUSE_SKILL = (
-    REPO_ROOT
-    / "files"
-    / "muse"
-    / "tmux-namer"
-    / "skills"
-    / "tmux-namer"
-    / "SKILL.md"
-)
 MUSE_PLUGIN_MANIFEST = (
     REPO_ROOT
     / "files"
@@ -54,9 +43,6 @@ MUSE_PLUGIN_MANIFEST = (
     / "tmux-namer"
     / ".muse-plugin"
     / "plugin.json"
-)
-MUSE_HOOK_WRAPPER = (
-    REPO_ROOT / "files" / "muse" / "tmux-namer" / "hooks" / "tmux-name.sh"
 )
 PI_EXTENSION = (
     REPO_ROOT / "files" / "pi" / "agent" / "extensions" / "tmux-namer.ts"
@@ -106,11 +92,18 @@ def fake_tmux(tmp_path: Path) -> tuple[Path, Path]:
 printf '%s\\n' "$*" >> "$FAKE_TMUX_LOG"
 case "$1" in
     display-message)
-        printf '%s' "${FAKE_TMUX_START-claude}"
+        case "$*" in
+            *session_name*)
+                printf '%s' "${FAKE_TMUX_SESSION_NAME-}"
+                ;;
+            *)
+                printf '%s' "${FAKE_TMUX_START-claude}"
+                ;;
+        esac
         ;;
     show-options)
-        case "$3" in
-            @agent_namer)
+        case "$*" in
+            *@agent_namer*)
                 printf '%s' "${FAKE_TMUX_OWNER-}"
                 ;;
             *)
@@ -121,7 +114,11 @@ case "$1" in
     list-sessions)
         printf '%s' "${FAKE_TMUX_USED_NUMS-}"
         ;;
+    list-panes)
+        printf '%s' "${FAKE_TMUX_PANES-}"
+        ;;
 esac
+exit 0
 """,
     )
     tmux.chmod(0o755)
@@ -303,6 +300,38 @@ def wait_for_pane_command(
                 f"{PANE_COMMAND_TIMEOUT_SEC}s; expected {expected!r}"
             )
         time.sleep(0.01)
+
+
+def wait_for_session_name(
+    real_tmux_server: tuple[str, str], pane_id: str, expected: str
+) -> None:
+    """Block until `pane_id`'s session reports `expected` as its name."""
+    real_tmux, server = real_tmux_server
+    deadline = time.monotonic() + PANE_COMMAND_TIMEOUT_SEC
+    while True:
+        name = subprocess.run(
+            [
+                real_tmux,
+                "-L",
+                server,
+                "display-message",
+                "-p",
+                "-t",
+                pane_id,
+                "#{session_name}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if name == expected:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"pane {pane_id} still in {name!r} after "
+                f"{PANE_COMMAND_TIMEOUT_SEC}s; expected {expected!r}"
+            )
+        time.sleep(0.1)
 
 
 def create_tmux_session(
@@ -533,6 +562,9 @@ def test_the_launcher_aliases_run_commands_the_helper_accepts(
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     _write_argv_logger(bin_dir / "tmux", "tmux")
+    helper_dir = home / ".local" / "libexec" / "tmux-agent-session-namer"
+    helper_dir.mkdir(parents=True)
+    _write_argv_logger(helper_dir / "tmux-agent-session-namer", "helper")
     log = tmp_path / "argv.log"
     env = os.environ.copy()
     env.update(
@@ -543,18 +575,21 @@ def test_the_launcher_aliases_run_commands_the_helper_accepts(
         },
     )
 
-    # tcodex is a function and runs as written. The others are aliases,
-    # and a non-interactive bash expands one only under expand_aliases
-    # and only on input parsed after the alias exists, hence the eval. A
-    # sh without either lands on the "new"-count assertion below rather
-    # than passing quietly.
+    # tcodex, tmuse, and tmused are functions and run as written. The
+    # rest are aliases, and a non-interactive bash expands one only
+    # under expand_aliases and only on input parsed after the alias
+    # exists, hence the eval. A sh without either lands on the count
+    # assertions below rather than passing quietly. tmuse and tmused
+    # start the helper as the pane command, like tcodex does; the rest
+    # run their agent directly.
     result = subprocess.run(
         [
             "/bin/sh",
             "-c",
             (
                 'shopt -s expand_aliases 2>/dev/null; . "$1"; '
-                "eval 'tclaude; tmuse; tpi; topencode'; tcodex"
+                "eval 'tclaude; tmuse; tmused --foo; tpi; topencode'; "
+                "tcodex"
             ),
             "sh",
             str(ENVRC_ALIASES),
@@ -567,9 +602,22 @@ def test_the_launcher_aliases_run_commands_the_helper_accepts(
 
     assert result.returncode == 0
     launched = [call.split("\t") for call in log.read_text().splitlines()]
-    assert [argv[1] for argv in launched] == ["new"] * 5
-    launched_names = {os.path.basename(argv[2]) for argv in launched}
-    assert launched_names == accepted_start_commands()
+    tmux_calls = [argv[1:] for argv in launched if argv[0] == "tmux"]
+    helper = (
+        f"{home}/.local/libexec/tmux-agent-session-namer/"
+        "tmux-agent-session-namer"
+    )
+    assert [argv[1:] for argv in tmux_calls] == [
+        ["claude"],
+        [helper, "muse-run"],
+        [helper, "muse-run", "--yolo", "--foo"],
+        ["pi"],
+        ["opencode"],
+        [helper, "codex-remote"],
+    ]
+    assert {
+        os.path.basename(argv[1]) for argv in tmux_calls
+    } <= accepted_start_commands()
 
 
 def test_crony_runs_one_shared_remote_control_app_server() -> None:
@@ -1066,8 +1114,8 @@ def test_codex_start_leaves_a_session_claude_names_alone(
             {
                 "continue": True,
                 "systemMessage": (
-                    "tmux naming disabled: claude already names this tmux "
-                    "session."
+                    "tmux naming disabled: claude already names this "
+                    "tmux session."
                 ),
             },
         ),
@@ -1241,8 +1289,8 @@ def test_an_agent_started_inside_a_session_keeps_the_owners_naming(
         ('"claude --unbalanced', False),
         ("claude --dangerously-skip-permissions", True),
         ('"/opt/some path/claude" --dangerously-skip-permissions', True),
-        ("muse", True),
-        ("muse --yolo", True),
+        ("muse", False),
+        ("muse --yolo", False),
         (
             (
                 "/home/u/.local/libexec/tmux-agent-session-namer"
@@ -1425,6 +1473,7 @@ def test_a_shell_session_keeps_its_name_when_an_agent_starts_in_it(
         ("muse",),
         ("muse", "first", "second"),
         ("muse-hook", "extra"),
+        ("muse-watch",),
         ("opencode",),
         ("opencode", "first", "second"),
         ("pi",),
@@ -1444,7 +1493,6 @@ def test_rejects_unknown_or_extra_subcommand(
 @pytest.mark.parametrize(
     ("invocation", "start_command"),
     [
-        ("muse", "muse --yolo"),
         ("opencode", "opencode"),
         ("pi", "pi --name Whatever"),
     ],
@@ -1480,7 +1528,7 @@ def test_named_run_renames_with_allocated_slot(
     ]
 
 
-@pytest.mark.parametrize("invocation", ["muse", "opencode", "pi"])
+@pytest.mark.parametrize("invocation", ["opencode", "pi"])
 def test_named_run_reuses_its_slot_on_rename(
     fake_tmux: tuple[Path, Path],
     invocation: str,
@@ -1508,7 +1556,7 @@ def test_named_run_reuses_its_slot_on_rename(
     ]
 
 
-@pytest.mark.parametrize("invocation", ["muse", "opencode", "pi"])
+@pytest.mark.parametrize("invocation", ["opencode", "pi"])
 def test_named_run_leaves_a_session_claude_names_alone(
     fake_tmux: tuple[Path, Path],
     invocation: str,
@@ -1527,7 +1575,7 @@ def test_named_run_leaves_a_session_claude_names_alone(
     assert fake_tmux[1].read_text().splitlines() == REFUSED_SLOT_COMMANDS
 
 
-@pytest.mark.parametrize("invocation", ["muse", "opencode", "pi"])
+@pytest.mark.parametrize("invocation", ["opencode", "pi"])
 def test_named_run_skips_a_shell_pane(
     fake_tmux: tuple[Path, Path],
     invocation: str,
@@ -1544,7 +1592,7 @@ def test_named_run_skips_a_shell_pane(
     assert fake_tmux[1].read_text().splitlines() == [PANE_START_COMMAND]
 
 
-@pytest.mark.parametrize("invocation", ["muse", "opencode", "pi"])
+@pytest.mark.parametrize("invocation", ["opencode", "pi"])
 def test_named_run_renames_to_the_bare_slot_for_an_empty_name(
     fake_tmux: tuple[Path, Path],
     invocation: str,
@@ -1576,7 +1624,8 @@ def test_tmuse_launcher_shape_is_helper_accepted(
 ) -> None:
     # The argument-carrying launcher shapes: tmux joins a CLI and its
     # flags into the one command string it records for the pane, and the
-    # helper's gate has to accept what those produce.
+    # helper's gate has to accept what those produce. tmuse starts the
+    # helper as the pane command.
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     _write_argv_logger(bin_dir / "tmux", "tmux")
@@ -1590,7 +1639,11 @@ def test_tmuse_launcher_shape_is_helper_accepted(
     )
 
     result = subprocess.run(
-        ["/bin/sh", "-c", "tmux new muse; tmux new muse --yolo"],
+        [
+            "/bin/sh",
+            "-c",
+            "tmux new tmux-agent-session-namer muse-run --yolo",
+        ],
         check=False,
         capture_output=True,
         env=env,
@@ -1599,27 +1652,10 @@ def test_tmuse_launcher_shape_is_helper_accepted(
 
     assert result.returncode == 0
     launched = [call.split("\t") for call in log.read_text().splitlines()]
-    assert [argv[1] for argv in launched] == ["new", "new"]
+    assert [argv[1] for argv in launched] == ["new"]
     assert {
         os.path.basename(argv[2]) for argv in launched
     } <= accepted_start_commands()
-
-
-def test_muse_skill_routes_session_naming_through_the_helper() -> None:
-    text = MUSE_SKILL.read_text()
-
-    assert text.startswith("---\nname: tmux-namer\n")
-    frontmatter = text.split("---\n")[1]
-    assert "description: " in frontmatter
-    # The description is the load trigger the model sees at session
-    # start: without an explicit always-load instruction it stays
-    # focused on the user's request and never loads the skill.
-    assert "Always call read_skill" in frontmatter
-    assert (
-        '"$HOME/.local/libexec/tmux-agent-session-namer/'
-        'tmux-agent-session-namer" muse' in text
-    )
-    assert "renamed" in text
 
 
 def test_pi_extension_routes_session_naming_through_the_helper() -> None:
@@ -1664,587 +1700,566 @@ def write_muse_name_db(
     return path
 
 
-def muse_hook_environment(
+def write_muse_session_log(
+    path: Path, session_id: str, pane: str, socket: str
+) -> Path:
+    """Forge a Muse session log naming the pane it runs on.
+
+    Real logs open with a route_facts record carrying the tmux pane
+    and socket, which is what the watcher resolves sessions through.
+    """
+    day = path / "2026" / "09" / "23" / session_id
+    day.mkdir(parents=True)
+    record = {
+        "kind": "route_facts",
+        "record": {"tmux_pane": pane, "tmux_socket_path": socket},
+    }
+    (day / "session.jsonl").write_text(json.dumps(record) + "\n")
+    return path
+
+
+def muse_pane_environment(
     tmp_path: Path,
+    sessions: Path,
     claims: list[tuple[str, str, str]],
+    session_name: str | None = None,
 ) -> dict[str, str]:
     db = write_muse_name_db(tmp_path / "session-names.db", claims)
-    return {
+    env = {
         "MUSE_SESSION_NAME_DB": str(db),
-        "TMUX_AGENT_SESSION_NAMER_STATE_DIR": str(tmp_path / "state"),
-        # The rewrite grants sockets from this directory; pointing it at
-        # a path that never exists keeps tests hermetic on machines with
-        # a running tmux server.
-        "TMUX_TMPDIR": str(tmp_path / "tmux-tmp"),
+        "FAKE_TMUX_START": "tmux-agent-session-namer muse-run",
+        "FAKE_TMUX_PANES": "%0",
+        "MUSE_SESSIONS_DIR": str(sessions),
     }
+    if session_name is not None:
+        env["FAKE_TMUX_SESSION_NAME"] = session_name
+    return env
 
 
-def muse_socket_dir(
-    live: list[str],
-    stale: list[str],
-) -> tuple[Path, list[socket.socket]]:
-    """Fake a tmux socket directory with live and stale sockets.
-
-    Live entries are bound server sockets, which is what the grant
-    probes for; stale entries are plain files, standing in for dead
-    servers' leftovers. The base sits directly under /tmp because
-    AF_UNIX paths cannot be long. Callers close the returned listeners
-    and remove the base.
-    """
-    base = Path(tempfile.mkdtemp(prefix="muse-hook-sockets"))
-    sockets = base / f"tmux-{os.getuid()}"
-    sockets.mkdir()
-    listeners = []
-    for name in live:
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(str(sockets / name))
-        listener.listen(1)
-        listeners.append(listener)
-    for name in stale:
-        (sockets / name).touch()
-    return base, listeners
+def write_muse_stub(bin_dir: Path, body: str) -> None:
+    """Stand in for the muse CLI the supervisor runs as its child."""
+    muse = bin_dir / "muse"
+    muse.write_text(f"#!/bin/sh\n{body}\n")
+    muse.chmod(0o755)
 
 
-def muse_hook_input(
-    session_id: str,
-    tool_input: Mapping[str, object],
-    tool_name: str = "read_file",
-) -> dict[str, object]:
-    return {
-        "hook_event_name": "PreToolUse",
-        "session_id": session_id,
-        "tool_name": tool_name,
-        "tool_input": dict(tool_input),
-    }
-
-
-def muse_rename_directive(name: str) -> str:
-    return (
-        "Session housekeeping: this Muse session is currently named "
-        f'"{name}". Run "$HOME/.local/libexec/tmux-agent-session-namer/'
-        f'tmux-agent-session-namer" muse "{name}" now, before you '
-        "finish this turn, to keep the tmux session name in sync; skip "
-        "this only if TMUX or TMUX_PANE is unset in your environment. "
-        "The helper itself decides whether renaming applies."
-    )
-
-
-def test_muse_plugin_registers_guarded_pretool_hook() -> None:
+def test_muse_plugin_registers_no_tool_interposition() -> None:
+    # Naming is the supervisor's job now: the bundle must not
+    # interpose on tool calls or prompt the model to rename.
     config = json.loads(MUSE_PLUGIN_MANIFEST.read_text())
 
     assert config["name"] == "tmux-namer"
-    assert config["capabilities"]["hooks"] == [
+    assert config["capabilities"]["hooks"] == []
+    assert config["capabilities"]["skills"] == []
+
+
+def _watch_socket_for_tests() -> str:
+    return os.path.realpath("/tmp/tmux")
+
+
+def test_muse_run_renames_an_unreported_session(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    write_muse_stub(fake_tmux[0], "sleep 2")
+    sessions = write_muse_session_log(
+        tmp_path / "sessions",
+        "session-1",
+        "$9:@1.%0",
+        _watch_socket_for_tests(),
+    )
+    result = run_helper(
+        fake_tmux,
+        "muse-run",
+        extra_env=muse_pane_environment(
+            tmp_path,
+            sessions,
+            [("tmuse", "session-1", "canonical")],
+            session_name="muse00-tmuse",
+        ),
+    )
+
+    assert result.returncode == 0
+    assert (
+        "rename-session -t %0 muse00-tmuse"
+        in fake_tmux[1].read_text().splitlines()
+    )
+
+
+def test_muse_run_matches_real_route_facts_shape(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    # Real session logs carry one compact route_facts record near the
+    # head with bare quotes, e.g.
+    # "payload":{"kind":"route_facts","record":{...,
+    # "tmux_pane":"$67:@74.%74",
+    # "tmux_socket_path":"/private/tmp/tmux-501/default",...}}.
+    write_muse_stub(fake_tmux[0], "sleep 2")
+    sessions = tmp_path / "sessions"
+    day = sessions / "2026" / "09" / "23" / "session-9"
+    day.mkdir(parents=True)
+    record = {
+        "schema_version": 1,
+        "payload_type": "runtime.session.route_facts",
+        "payload": {
+            "kind": "route_facts",
+            "record": {
+                "tmux_pane": "$9:@1.%0",
+                "tmux_socket_path": _watch_socket_for_tests(),
+            },
+        },
+    }
+    (day / "session.jsonl").write_text(
+        json.dumps(record, separators=(",", ":"))
+    )
+    result = run_helper(
+        fake_tmux,
+        "muse-run",
+        extra_env=muse_pane_environment(
+            tmp_path,
+            sessions,
+            [("tmuse", "session-9", "canonical")],
+            session_name="muse00-tmuse",
+        ),
+    )
+
+    assert result.returncode == 0
+    assert (
+        "rename-session -t %0 muse00-tmuse"
+        in fake_tmux[1].read_text().splitlines()
+    )
+
+
+def test_muse_run_does_not_mix_records_across_lines(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    # One line names this pane on another socket, another names another
+    # pane on this socket: neither line maps this pane here, so per-line
+    # matching stays silent where whole-chunk matching would rename.
+    write_muse_stub(fake_tmux[0], "sleep 2")
+    sessions = tmp_path / "sessions"
+    day = sessions / "2026" / "09" / "23" / "mixed"
+    day.mkdir(parents=True)
+    lines = [
         {
-            "id": "tmux-name",
-            "event": "PreToolUse",
-            "command": ["sh", "hooks/tmux-name.sh"],
-            "timeoutMs": 5000,
-            "statusMessage": "Naming tmux session",
-        }
-    ]
-    assert config["capabilities"]["skills"] == [
+            "payload": {
+                "kind": "route_facts",
+                "record": {
+                    "tmux_pane": "$9:@1.%0",
+                    "tmux_socket_path": "/tmp/other-tmux",
+                },
+            },
+        },
         {
-            "id": "tmux-namer",
-            "path": "skills/tmux-namer/SKILL.md",
-        }
+            "payload": {
+                "kind": "route_facts",
+                "record": {
+                    "tmux_pane": "$9:@1.%9",
+                    "tmux_socket_path": _watch_socket_for_tests(),
+                },
+            },
+        },
     ]
-    assert (
-        MUSE_PLUGIN_MANIFEST.parent.parent
-        / config["capabilities"]["skills"][0]["path"]
-    ).is_file()
+    (day / "session.jsonl").write_text(
+        "\n".join(json.dumps(line, separators=(",", ":")) for line in lines)
+    )
+    result = run_helper(
+        fake_tmux,
+        "muse-run",
+        extra_env=muse_pane_environment(
+            tmp_path,
+            sessions,
+            [("thispane", "mixed", "canonical")],
+        ),
+    )
+
+    assert result.returncode == 0
+    assert "rename-session" not in fake_tmux[1].read_text()
 
 
-def test_muse_hook_directs_first_tool_call_to_rename(
+def test_muse_run_matches_an_unresolved_socket_spelling(
     fake_tmux: tuple[Path, Path],
     tmp_path: Path,
 ) -> None:
-    tool_input = {"path": "/tmp/note.txt"}
+    # One side may spell /tmp where the other spells /private/tmp; the
+    # socket matches in either spelling. On systems where /tmp is real
+    # both spellings coincide and the test is vacuous but still passes.
+    write_muse_stub(fake_tmux[0], "sleep 2")
+    sessions = tmp_path / "sessions"
+    day = sessions / "2026" / "09" / "23" / "session-9"
+    day.mkdir(parents=True)
+    record = {
+        "payload": {
+            "kind": "route_facts",
+            "record": {
+                "tmux_pane": "$9:@1.%0",
+                "tmux_socket_path": "/tmp/tmux",
+            },
+        },
+    }
+    (day / "session.jsonl").write_text(
+        json.dumps(record, separators=(",", ":"))
+    )
     result = run_helper(
         fake_tmux,
-        "muse-hook",
-        extra_env=muse_hook_environment(
+        "muse-run",
+        extra_env=muse_pane_environment(
             tmp_path,
+            sessions,
+            [("tmuse", "session-9", "canonical")],
+            session_name="muse00-tmuse",
+        ),
+    )
+
+    assert result.returncode == 0
+    assert (
+        "rename-session -t %0 muse00-tmuse"
+        in fake_tmux[1].read_text().splitlines()
+    )
+
+
+def test_muse_run_without_tmux_still_supervises(
+    fake_tmux: tuple[Path, Path],
+) -> None:
+    write_muse_stub(fake_tmux[0], "exit 0")
+    result = run_helper(fake_tmux, "muse-run", in_tmux=False)
+
+    assert result.returncode == 0
+    assert not fake_tmux[1].exists()
+
+
+def test_muse_run_verifies_a_truncated_long_name(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    # tmux only ever sees the first 30 chars, so the read-back must
+    # compare against the truncated form: comparing the full name
+    # would re-issue the rename on every pass forever.
+    issued = "muse00-" + "a" * 23
+    assert len(issued) == 30
+    write_muse_stub(fake_tmux[0], "sleep 4")
+    sessions = write_muse_session_log(
+        tmp_path / "sessions",
+        "session-1",
+        "$9:@1.%0",
+        _watch_socket_for_tests(),
+    )
+    env = muse_pane_environment(
+        tmp_path,
+        sessions,
+        [("a" * 60, "session-1", "canonical")],
+        session_name=issued,
+    )
+    result = run_helper(fake_tmux, "muse-run", extra_env=env)
+
+    assert result.returncode == 0
+    renames = [
+        line
+        for line in fake_tmux[1].read_text().splitlines()
+        if line.startswith("rename-session")
+    ]
+    assert renames == [f"rename-session -t %0 {issued}"]
+
+
+def test_muse_run_waits_for_its_child(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    write_muse_stub(fake_tmux[0], "sleep 2")
+    sessions = write_muse_session_log(
+        tmp_path / "sessions",
+        "session-1",
+        "$9:@1.%0",
+        _watch_socket_for_tests(),
+    )
+    env = muse_pane_environment(
+        tmp_path,
+        sessions,
+        [("tmuse", "session-1", "canonical")],
+        session_name="muse00-tmuse",
+    )
+    start = time.monotonic()
+    result = run_helper(fake_tmux, "muse-run", extra_env=env)
+    elapsed = time.monotonic() - start
+
+    assert result.returncode == 0
+    assert elapsed >= 1.5
+    assert (
+        "rename-session -t %0 muse00-tmuse"
+        in fake_tmux[1].read_text().splitlines()
+    )
+
+
+def test_muse_run_propagates_its_child_status(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    write_muse_stub(fake_tmux[0], "exit 3")
+    result = run_helper(
+        fake_tmux,
+        "muse-run",
+        extra_env=muse_pane_environment(tmp_path, tmp_path / "empty", []),
+    )
+
+    assert result.returncode == 3
+    assert "rename-session" not in fake_tmux[1].read_text()
+
+
+def test_muse_run_is_silent_without_a_claim(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    write_muse_stub(fake_tmux[0], "sleep 2")
+    sessions = write_muse_session_log(
+        tmp_path / "sessions",
+        "nobody",
+        "$9:@1.%0",
+        _watch_socket_for_tests(),
+    )
+    result = run_helper(
+        fake_tmux,
+        "muse-run",
+        extra_env=muse_pane_environment(tmp_path, sessions, []),
+    )
+
+    assert result.returncode == 0
+    lines = fake_tmux[1].read_text().splitlines()
+    assert "list-panes -a -F #{pane_id}" in lines
+    assert "rename-session" not in fake_tmux[1].read_text()
+
+
+def test_muse_run_prefers_the_newest_session_for_a_pane(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    write_muse_stub(fake_tmux[0], "sleep 2")
+    root = tmp_path / "sessions"
+    old = write_muse_session_log(
+        root, "old-session", "$9:@1.%0", _watch_socket_for_tests()
+    )
+    new = write_muse_session_log(
+        root, "new-session", "$9:@1.%0", _watch_socket_for_tests()
+    )
+    os.utime(old / "2026" / "09" / "23" / "old-session", (1_000_000_000,) * 2)
+    os.utime(new / "2026" / "09" / "23" / "new-session", (2_000_000_000,) * 2)
+    result = run_helper(
+        fake_tmux,
+        "muse-run",
+        extra_env=muse_pane_environment(
+            tmp_path,
+            root,
+            [
+                ("oldname", "old-session", "canonical"),
+                ("newname", "new-session", "canonical"),
+            ],
+            session_name="muse00-newname",
+        ),
+    )
+
+    assert result.returncode == 0
+    assert (
+        "rename-session -t %0 muse00-newname"
+        in fake_tmux[1].read_text().splitlines()
+    )
+
+
+def test_muse_run_ignores_an_unknown_pane(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    write_muse_stub(fake_tmux[0], "sleep 2")
+    sessions = write_muse_session_log(
+        tmp_path / "sessions",
+        "session-1",
+        "$9:@1.%0",
+        _watch_socket_for_tests(),
+    )
+    env = {
+        **muse_pane_environment(
+            tmp_path,
+            sessions,
             [("tmuse", "session-1", "canonical")],
         ),
-        hook_input=muse_hook_input("session-1", tool_input),
-    )
+        "FAKE_TMUX_PANES": "%1",
+    }
+    result = run_helper(fake_tmux, "muse-run", extra_env=env)
 
     assert result.returncode == 0
-    assert json.loads(result.stdout) == {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "updatedInput": tool_input,
-            "additionalContext": muse_rename_directive("tmuse"),
-        }
-    }
-    assert not fake_tmux[1].exists()
+    lines = fake_tmux[1].read_text().splitlines()
+    assert "list-panes -a -F #{pane_id}" in lines
+    assert "rename-session" not in fake_tmux[1].read_text()
 
 
-def test_muse_hook_stays_silent_once_reported(
+def test_muse_run_reports_a_missing_muse(
     fake_tmux: tuple[Path, Path],
     tmp_path: Path,
 ) -> None:
-    tool_input = {"path": "/tmp/note.txt"}
-    extra_env = muse_hook_environment(
-        tmp_path,
-        [("tmuse", "session-1", "canonical")],
-    )
-    first = run_helper(
-        fake_tmux,
-        "muse-hook",
-        extra_env=extra_env,
-        hook_input=muse_hook_input("session-1", tool_input),
-    )
-    assert first.returncode == 0
-    assert (
-        "additionalContext" in json.loads(first.stdout)["hookSpecificOutput"]
-    )
-
-    second = run_helper(
-        fake_tmux,
-        "muse-hook",
-        extra_env=extra_env,
-        hook_input=muse_hook_input("session-1", tool_input),
-    )
-
-    assert second.returncode == 0
-    assert json.loads(second.stdout) == {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "updatedInput": tool_input,
-        }
-    }
-
-
-def test_muse_hook_directs_again_after_rename(
-    fake_tmux: tuple[Path, Path],
-    tmp_path: Path,
-) -> None:
-    tool_input = {"path": "/tmp/note.txt"}
-    extra_env = muse_hook_environment(
-        tmp_path,
-        [("tmuse", "session-1", "canonical")],
-    )
-    state_file = tmp_path / "state" / "muse-names.json"
-    state_file.parent.mkdir(parents=True)
-    state_file.write_text(json.dumps({"session-1": "bay-charon"}))
-
+    # Hide everything but the shebang's uv, so the helper itself starts
+    # and its own OSError path answers instead of the real muse.
+    uv_only = tmp_path / "uvbin"
+    uv_only.mkdir()
+    uv = shutil.which("uv") or "/usr/bin/uv"
+    (uv_only / "uv").symlink_to(Path(uv).resolve())
     result = run_helper(
         fake_tmux,
-        "muse-hook",
-        extra_env=extra_env,
-        hook_input=muse_hook_input("session-1", tool_input),
-    )
-
-    assert result.returncode == 0
-    assert json.loads(result.stdout)["hookSpecificOutput"][
-        "additionalContext"
-    ] == muse_rename_directive("tmuse")
-    assert json.loads(state_file.read_text()) == {"session-1": "tmuse"}
-
-
-def test_muse_hook_approves_silently_without_a_name(
-    fake_tmux: tuple[Path, Path],
-    tmp_path: Path,
-) -> None:
-    tool_input = {"path": "/tmp/note.txt"}
-    result = run_helper(
-        fake_tmux,
-        "muse-hook",
-        extra_env=muse_hook_environment(tmp_path, []),
-        hook_input=muse_hook_input("unknown-session", tool_input),
-    )
-
-    assert result.returncode == 0
-    assert json.loads(result.stdout) == {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "updatedInput": tool_input,
-        }
-    }
-    assert not fake_tmux[1].exists()
-
-
-def test_muse_hook_approves_silently_without_a_database(
-    fake_tmux: tuple[Path, Path],
-    tmp_path: Path,
-) -> None:
-    tool_input = {"path": "/tmp/note.txt"}
-    result = run_helper(
-        fake_tmux,
-        "muse-hook",
+        "muse-run",
         extra_env={
-            "MUSE_SESSION_NAME_DB": str(tmp_path / "missing.db"),
-            "TMUX_AGENT_SESSION_NAMER_STATE_DIR": str(tmp_path / "state"),
+            **muse_pane_environment(tmp_path, tmp_path / "empty", []),
+            "PATH": str(uv_only),
         },
-        hook_input=muse_hook_input("session-1", tool_input),
     )
 
-    assert result.returncode == 0
-    assert (
-        "additionalContext"
-        not in json.loads(result.stdout)["hookSpecificOutput"]
-    )
+    assert result.returncode == 1
+    assert "cannot start muse" in result.stderr
 
 
-def test_muse_hook_approves_silently_when_state_is_unwritable(
+def test_muse_run_does_not_record_a_refused_rename(
     fake_tmux: tuple[Path, Path],
     tmp_path: Path,
 ) -> None:
-    blocker = tmp_path / "blocker"
-    blocker.write_text("not a directory")
-    tool_input = {"path": "/tmp/note.txt"}
-    result = run_helper(
-        fake_tmux,
-        "muse-hook",
-        extra_env={
-            "MUSE_SESSION_NAME_DB": str(
-                write_muse_name_db(
-                    tmp_path / "session-names.db",
-                    [("tmuse", "session-1", "canonical")],
-                )
+    write_muse_stub(fake_tmux[0], "sleep 2")
+    sessions = write_muse_session_log(
+        tmp_path / "sessions",
+        "session-1",
+        "$9:@1.%0",
+        _watch_socket_for_tests(),
+    )
+    env = {
+        **muse_pane_environment(
+            tmp_path,
+            sessions,
+            [("tmuse", "session-1", "canonical")],
+        ),
+        "FAKE_TMUX_OWNER": "claude",
+    }
+    result = run_helper(fake_tmux, "muse-run", extra_env=env)
+
+    assert result.returncode == 0
+    lines = fake_tmux[1].read_text().splitlines()
+    assert "list-panes -a -F #{pane_id}" in lines
+    assert "rename-session" not in fake_tmux[1].read_text()
+
+
+def test_muse_run_retries_an_unverified_rename(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    # The rename goes out but tmux never applies it: the read-back
+    # still shows the old name, so every pass re-issues the rename
+    # instead of remembering and going quiet.
+    write_muse_stub(fake_tmux[0], "sleep 4")
+    sessions = write_muse_session_log(
+        tmp_path / "sessions",
+        "session-1",
+        "$9:@1.%0",
+        _watch_socket_for_tests(),
+    )
+    env = muse_pane_environment(
+        tmp_path,
+        sessions,
+        [("tmuse", "session-1", "canonical")],
+        session_name="stale-name",
+    )
+    result = run_helper(fake_tmux, "muse-run", extra_env=env)
+
+    assert result.returncode == 0
+    renames = [
+        line
+        for line in fake_tmux[1].read_text().splitlines()
+        if line.startswith("rename-session")
+    ]
+    assert len(renames) >= 2
+    assert set(renames) == {"rename-session -t %0 muse00-tmuse"}
+
+
+def test_muse_run_renames_once_per_name(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    # Several passes run while the child sleeps, but the in-memory
+    # record keeps the rename to exactly one issue.
+    write_muse_stub(fake_tmux[0], "sleep 4")
+    sessions = write_muse_session_log(
+        tmp_path / "sessions",
+        "session-1",
+        "$9:@1.%0",
+        _watch_socket_for_tests(),
+    )
+    env = muse_pane_environment(
+        tmp_path,
+        sessions,
+        [("tmuse", "session-1", "canonical")],
+        session_name="muse00-tmuse",
+    )
+    result = run_helper(fake_tmux, "muse-run", extra_env=env)
+
+    assert result.returncode == 0
+    renames = [
+        line
+        for line in fake_tmux[1].read_text().splitlines()
+        if line.startswith("rename-session")
+    ]
+    assert renames == ["rename-session -t %0 muse00-tmuse"]
+
+
+def test_muse_run_renames_on_a_live_server(
+    real_tmux_server: tuple[str, str],
+    tmp_path: Path,
+) -> None:
+    real_tmux, server = real_tmux_server
+    bin_dir = tmp_path / "livebin"
+    bin_dir.mkdir()
+    agent_stub(bin_dir, "muse")
+    db = write_muse_name_db(
+        tmp_path / "live-names.db",
+        [("liveclaim", "live-session", "canonical")],
+    )
+    sessions = tmp_path / "live-sessions"
+    sessions.mkdir(parents=True)
+    pane_env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "MUSE_SESSIONS_DIR": str(sessions),
+        "MUSE_SESSION_NAME_DB": str(db),
+    }
+    subprocess.run(
+        [
+            real_tmux,
+            "-L",
+            server,
+            "new-session",
+            "-d",
+            "-s",
+            "live",
+            *(
+                flag
+                for key, value in pane_env.items()
+                for flag in ("-e", f"{key}={value}")
             ),
-            "TMUX_AGENT_SESSION_NAMER_STATE_DIR": str(blocker),
-        },
-        hook_input=muse_hook_input("session-1", tool_input),
+            str(HELPER),
+            "muse-run",
+        ],
+        check=True,
+    )
+    details = subprocess.run(
+        [
+            real_tmux,
+            "-L",
+            server,
+            "display-message",
+            "-p",
+            "-t",
+            "live",
+            "#{socket_path},#{pane_id}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    socket_path, pane_id = details.split(",")
+    write_muse_session_log(
+        sessions, "live-session", f"$9:@1.{pane_id}", socket_path
     )
 
-    assert result.returncode == 0
-    assert (
-        "additionalContext"
-        not in json.loads(result.stdout)["hookSpecificOutput"]
-    )
-
-
-def test_muse_hook_says_nothing_without_tool_input(
-    fake_tmux: tuple[Path, Path],
-    tmp_path: Path,
-) -> None:
-    result = run_helper(
-        fake_tmux,
-        "muse-hook",
-        extra_env=muse_hook_environment(
-            tmp_path,
-            [("tmuse", "session-1", "canonical")],
-        ),
-        hook_input={
-            "hook_event_name": "PreToolUse",
-            "session_id": "session-1",
-        },
-    )
-
-    assert result.returncode == 0
-    assert result.stdout == ""
-    assert not fake_tmux[1].exists()
-
-
-def test_muse_hook_answers_without_tmux(
-    fake_tmux: tuple[Path, Path],
-    tmp_path: Path,
-) -> None:
-    # Hook runs arrive with a sanitized environment, so the answer
-    # cannot depend on TMUX: the agent addressed by the directive
-    # carries the tmux environment, not the hook.
-    tool_input = {"path": "/tmp/x"}
-    result = run_helper(
-        fake_tmux,
-        "muse-hook",
-        in_tmux=False,
-        extra_env=muse_hook_environment(
-            tmp_path,
-            [("tmuse", "session-1", "canonical")],
-        ),
-        hook_input=muse_hook_input("session-1", tool_input),
-    )
-
-    assert result.returncode == 0
-    assert json.loads(result.stdout) == {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "updatedInput": tool_input,
-            "additionalContext": muse_rename_directive("tmuse"),
-        }
-    }
-    assert not fake_tmux[1].exists()
-
-
-@pytest.fixture
-def muse_home(tmp_path: Path) -> Path:
-    home = tmp_path / "home"
-    installed_helper = (
-        home
-        / ".local"
-        / "libexec"
-        / "tmux-agent-session-namer"
-        / "tmux-agent-session-namer"
-    )
-    installed_helper.parent.mkdir(parents=True)
-    installed_helper.symlink_to(HELPER)
-    return home
-
-
-def test_muse_hook_prepends_silent_rename_to_shell_calls(
-    fake_tmux: tuple[Path, Path],
-    tmp_path: Path,
-) -> None:
-    tool_input = {"command": "ls -la", "description": "List files"}
-    result = run_helper(
-        fake_tmux,
-        "muse-hook",
-        extra_env=muse_hook_environment(
-            tmp_path,
-            [("tmuse", "session-1", "canonical")],
-        ),
-        hook_input=muse_hook_input("session-1", tool_input, "bash"),
-    )
-
-    assert result.returncode == 0
-    assert json.loads(result.stdout) == {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "updatedInput": {
-                "command": (
-                    'UV_CACHE_DIR="${TMPDIR:-/tmp}/'
-                    'tmux-agent-session-namer-uv" '
-                    "$HOME/.local/libexec/tmux-agent-session-namer/"
-                    "tmux-agent-session-namer muse tmuse "
-                    ">/dev/null 2>&1 || true; ls -la"
-                ),
-                "description": "List files",
-            },
-        }
-    }
-    assert not fake_tmux[1].exists()
-
-
-def test_muse_hook_grants_tmux_sockets_to_shell_calls(
-    fake_tmux: tuple[Path, Path],
-    tmp_path: Path,
-) -> None:
-    socket_base, listeners = muse_socket_dir(
-        ["default", "other"], ["dead-server"]
-    )
-    try:
-        tool_input = {"command": "ls -la"}
-        result = run_helper(
-            fake_tmux,
-            "muse-hook",
-            extra_env={
-                **muse_hook_environment(
-                    tmp_path,
-                    [("tmuse", "session-1", "canonical")],
-                ),
-                "TMUX_TMPDIR": str(socket_base),
-            },
-            hook_input=muse_hook_input("session-1", tool_input, "bash"),
-        )
-    finally:
-        for listener in listeners:
-            listener.close()
-        shutil.rmtree(socket_base, ignore_errors=True)
-
-    assert result.returncode == 0
-    updated = json.loads(result.stdout)["hookSpecificOutput"]["updatedInput"]
-    assert updated["unix_socket_paths"] == [
-        os.path.realpath(socket_base / f"tmux-{os.getuid()}" / name)
-        for name in ("default", "other")
-    ]
-
-
-def test_muse_hook_preserves_existing_socket_grants(
-    fake_tmux: tuple[Path, Path],
-    tmp_path: Path,
-) -> None:
-    socket_base, listeners = muse_socket_dir(["default"], [])
-    try:
-        tool_input = {
-            "command": "ls -la",
-            "unix_socket_paths": ["/var/run/docker.sock"],
-        }
-        result = run_helper(
-            fake_tmux,
-            "muse-hook",
-            extra_env={
-                **muse_hook_environment(
-                    tmp_path,
-                    [("tmuse", "session-1", "canonical")],
-                ),
-                "TMUX_TMPDIR": str(socket_base),
-            },
-            hook_input=muse_hook_input("session-1", tool_input, "bash"),
-        )
-    finally:
-        for listener in listeners:
-            listener.close()
-        shutil.rmtree(socket_base, ignore_errors=True)
-
-    assert result.returncode == 0
-    updated = json.loads(result.stdout)["hookSpecificOutput"]["updatedInput"]
-    assert updated["unix_socket_paths"] == [
-        "/var/run/docker.sock",
-        os.path.realpath(socket_base / f"tmux-{os.getuid()}" / "default"),
-    ]
-
-
-def test_muse_hook_omits_the_grant_without_sockets(
-    fake_tmux: tuple[Path, Path],
-    tmp_path: Path,
-) -> None:
-    (tmp_path / "tmux-tmp").mkdir()
-    tool_input = {"command": "ls -la"}
-    result = run_helper(
-        fake_tmux,
-        "muse-hook",
-        extra_env=muse_hook_environment(
-            tmp_path,
-            [("tmuse", "session-1", "canonical")],
-        ),
-        hook_input=muse_hook_input("session-1", tool_input, "bash"),
-    )
-
-    assert result.returncode == 0
-    updated = json.loads(result.stdout)["hookSpecificOutput"]["updatedInput"]
-    assert "unix_socket_paths" not in updated
-    assert updated["command"].endswith("|| true; ls -la")
-
-
-def test_muse_hook_quotes_hostile_session_names(
-    fake_tmux: tuple[Path, Path],
-    tmp_path: Path,
-) -> None:
-    result = run_helper(
-        fake_tmux,
-        "muse-hook",
-        extra_env=muse_hook_environment(
-            tmp_path,
-            [('a"b c', "session-1", "canonical")],
-        ),
-        hook_input=muse_hook_input("session-1", {"command": "true"}, "bash"),
-    )
-
-    assert result.returncode == 0
-    rewritten = json.loads(result.stdout)["hookSpecificOutput"][
-        "updatedInput"
-    ]["command"]
-    assert rewritten.startswith(
-        'UV_CACHE_DIR="${TMPDIR:-/tmp}/tmux-agent-session-namer-uv" '
-        "$HOME/.local/libexec/tmux-agent-session-namer/"
-        "tmux-agent-session-namer muse 'a\"b c' "
-    )
-    assert rewritten.endswith("|| true; true")
-
-
-def test_muse_hook_leaves_shell_without_command_alone(
-    fake_tmux: tuple[Path, Path],
-    tmp_path: Path,
-) -> None:
-    tool_input = {"description": "No command here"}
-    result = run_helper(
-        fake_tmux,
-        "muse-hook",
-        extra_env=muse_hook_environment(
-            tmp_path,
-            [("tmuse", "session-1", "canonical")],
-        ),
-        hook_input=muse_hook_input("session-1", tool_input, "bash"),
-    )
-
-    assert result.returncode == 0
-    assert json.loads(result.stdout) == {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "updatedInput": tool_input,
-        }
-    }
-
-
-def test_muse_hook_rewrites_only_until_the_name_is_reported(
-    fake_tmux: tuple[Path, Path],
-    tmp_path: Path,
-) -> None:
-    # The prepend's socket grant prompts on every call that carries it,
-    # so the rewrite fires once per name and later calls pass through
-    # untouched. A rename moves the session to a new name, which reads
-    # as unreported and rewrites again.
-    tool_input = {"command": "pwd"}
-    extra_env = muse_hook_environment(
-        tmp_path,
-        [("tmuse", "session-1", "canonical")],
-    )
-    first = run_helper(
-        fake_tmux,
-        "muse-hook",
-        extra_env=extra_env,
-        hook_input=muse_hook_input("session-1", tool_input, "bash"),
-    )
-    second = run_helper(
-        fake_tmux,
-        "muse-hook",
-        extra_env=extra_env,
-        hook_input=muse_hook_input("session-1", tool_input, "bash"),
-    )
-
-    assert first.returncode == 0
-    assert second.returncode == 0
-    first_updated = json.loads(first.stdout)["hookSpecificOutput"][
-        "updatedInput"
-    ]
-    assert first_updated["command"] != tool_input["command"]
-    assert json.loads(second.stdout) == {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "updatedInput": tool_input,
-        }
-    }
-
-    renamed_db = write_muse_name_db(
-        tmp_path / "renamed.db",
-        [("other", "session-1", "canonical")],
-    )
-    third = run_helper(
-        fake_tmux,
-        "muse-hook",
-        extra_env={
-            **extra_env,
-            "MUSE_SESSION_NAME_DB": str(renamed_db),
-        },
-        hook_input=muse_hook_input("session-1", tool_input, "bash"),
-    )
-
-    assert third.returncode == 0
-    third_updated = json.loads(third.stdout)["hookSpecificOutput"][
-        "updatedInput"
-    ]
-    assert third_updated["command"] != tool_input["command"]
-
-
-def test_muse_hook_wrapper_reaches_the_helper(
-    fake_tmux: tuple[Path, Path],
-    tmp_path: Path,
-    muse_home: Path,
-) -> None:
-    tool_input = {"path": "/tmp/note.txt"}
-    result = run_helper(
-        fake_tmux,
-        extra_env={
-            "HOME": str(muse_home),
-            **muse_hook_environment(
-                tmp_path,
-                [("tmuse", "session-1", "canonical")],
-            ),
-        },
-        hook_input=muse_hook_input("session-1", tool_input),
-        script=MUSE_HOOK_WRAPPER,
-    )
-
-    assert result.returncode == 0
-    assert json.loads(result.stdout)["hookSpecificOutput"][
-        "additionalContext"
-    ] == muse_rename_directive("tmuse")
+    wait_for_session_name(real_tmux_server, pane_id, "muse00-liveclaim")

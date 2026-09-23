@@ -18,22 +18,21 @@ slot and format. To hand a session to a different agent, unset its
 owner with `tmux set-option -u @agent_namer` and start that agent as a
 pane's own command, since the prompt route is refused either way.
 
-A muse, pi, or opencode run takes the session name as its argument and
-renames once per run: Muse sets no pane title to follow, pi's carries
-the working directory, and opencode's is prefixed and truncated, so
-muse's skill, pi's extension, and opencode's plugin each hand the
-current name over at session start and after every rename. An empty
-name renames to the bare agent and slot -- the form a session keeps
-until a real name exists, which is how pi and opencode sessions first
-name themselves.
+A pi or opencode run takes the session name as its argument and
+renames once per run: pi's pane title carries the working directory,
+and opencode's is prefixed and truncated, so pi's extension and
+opencode's plugin each hand the current name over at session start
+and after every rename. An empty name renames to the bare agent and
+slot -- the form a session keeps until a real name exists, which is
+how pi and opencode sessions first name themselves.
 
-A muse-hook run answers a PreToolUse hook: it approves with the tool
-input echoed back and, only when the session carries a name it has not
-reported yet, prepends a silent rename to shell calls (which the agent
-executes with its own tmux environment, declaring the tmux socket
-grant the sandboxed call needs) or adds a directive for the agent to
-rename through a muse run, since the hook environment itself carries
-no tmux address.
+A muse-run run supervises a Muse session the tmuse way: tmux starts
+this helper as the pane command, the helper forks a watcher child,
+and the parent execs `muse`, so the pane process itself is the agent.
+The watcher maps the pane to its Muse session through the session
+log's route facts, renaming the session to the current name, and
+remembering it for the run. It runs beside any agent sandbox rather
+than inside it, so watching needs no tool call nor an approval.
 """
 
 from __future__ import annotations
@@ -44,7 +43,7 @@ import os
 import re
 import select
 import shlex
-import socket
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -66,30 +65,30 @@ CODEX_SESSION_OWNER_WARNING = (
     "tmux naming disabled: {owner} already names this tmux session."
 )
 CODEX_THREAD_TITLE_IDS = frozenset(("thread", "thread-title"))
-# Where the muse-hook run finds the session name authority and where it
-# records which names it already reported. Both yield to an environment
-# override so tests stay hermetic and unusual installs stay working.
+# Where the watcher finds the session name authority and the session
+# logs. Both yield to an environment override so tests stay hermetic
+# and unusual installs stay working.
 MUSE_SESSION_NAME_DB_ENV = "MUSE_SESSION_NAME_DB"
-MUSE_REPORTED_NAMES_DIR_ENV = "TMUX_AGENT_SESSION_NAMER_STATE_DIR"
-MUSE_REPORTED_NAMES_FILENAME = "muse-names.json"
+MUSE_SESSIONS_DIR_ENV = "MUSE_SESSIONS_DIR"
+MUSE_WATCH_INTERVAL_SECONDS = 2
+MUSE_WATCH_LOG_SCAN_BYTES = 65536
+MUSE_WATCH_SESSION_SCAN_LIMIT = 40
 TMUX_SLOT_LOCK = "tmux-agent-session-namer-slots"
 SESSION_AGENT_OPTION = "@agent_namer"
 # What tmux must have started a pane with for the session to be named:
-# an agent CLI launched directly (claude via tclaude, muse via tmuse,
-# pi via tpi, opencode via topencode), or this helper, which is how
-# tcodex launches codex.
+# an agent CLI launched directly (claude via tclaude, pi via tpi,
+# opencode via topencode), or this helper, which is how tcodex launches
+# codex and tmuse launches muse.
 AGENT_START_COMMANDS = frozenset(
     (
         "claude",
-        "muse",
         "opencode",
         "pi",
         "tmux-agent-session-namer",
     )
 )
 STATUS_RIGHT = (
-    "#{?window_bigger,"
-    "[#{window_offset_x}#,#{window_offset_y}] ,}"
+    "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}"
     "%H:%M %d-%b-%y"
 )
 
@@ -107,8 +106,7 @@ class Invocation(StrEnum):
     CODEX_CLIENT = "codex-client"
     CODEX_HOOK = "codex-hook"
     CODEX_REMOTE = "codex-remote"
-    MUSE = "muse"
-    MUSE_HOOK = "muse-hook"
+    MUSE_RUN = "muse-run"
     OPENCODE = "opencode"
     PI = "pi"
 
@@ -116,9 +114,7 @@ class Invocation(StrEnum):
 # Invocations whose single argument is the session name, for agents
 # whose own tooling (a skill, extension, or plugin) tracks renames and
 # re-runs this helper with the current name.
-NAME_ARGUMENT_INVOCATIONS = frozenset(
-    (Invocation.MUSE, Invocation.OPENCODE, Invocation.PI)
-)
+NAME_ARGUMENT_INVOCATIONS = frozenset((Invocation.OPENCODE, Invocation.PI))
 
 
 class CodexHookEvent(StrEnum):
@@ -335,8 +331,8 @@ def _muse_session_name_db() -> str | None:
 
     The authority lives outside the session log tree, in a platform
     location, so this probes the known ones rather than deriving it.
-    None means naming stays silent: a hook that cannot resolve the name
-    must not disturb the tool call it is gating.
+    None means naming stays silent: a watcher that cannot resolve the
+    name must not disturb the session it is watching.
     """
     override = os.environ.get(MUSE_SESSION_NAME_DB_ENV)
     if override:
@@ -399,223 +395,6 @@ def muse_canonical_session_name(session_id: str) -> str | None:
     return name.strip() if isinstance(name, str) and name.strip() else None
 
 
-def _muse_reported_names_path() -> str:
-    state_dir = os.environ.get(MUSE_REPORTED_NAMES_DIR_ENV)
-    if not state_dir:
-        cache_home = os.environ.get("XDG_CACHE_HOME", "")
-        if not cache_home:
-            cache_home = os.path.join(
-                os.path.expanduser("~"),
-                ".cache",
-            )
-        state_dir = os.path.join(cache_home, "tmux-agent-session-namer")
-    return os.path.join(state_dir, MUSE_REPORTED_NAMES_FILENAME)
-
-
-def _muse_reported_names() -> dict[str, str]:
-    try:
-        with open(_muse_reported_names_path(), encoding="utf-8") as handle:
-            parsed: object = json.load(handle)
-    except OSError, json.JSONDecodeError:
-        return {}
-    if not isinstance(parsed, dict):
-        return {}
-    return {
-        session_id: name
-        for session_id, name in parsed.items()
-        if isinstance(session_id, str) and isinstance(name, str)
-    }
-
-
-def _record_muse_reported_name(session_id: str, name: str) -> bool:
-    try:
-        path = _muse_reported_names_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        reported = _muse_reported_names()
-        reported[session_id] = name
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(reported, handle)
-    except OSError:
-        return False
-    return True
-
-
-def _muse_rename_directive(name: str) -> str:
-    helper = (
-        "$HOME/.local/libexec/tmux-agent-session-namer/"
-        "tmux-agent-session-namer"
-    )
-    return (
-        "Session housekeeping: this Muse session is currently named "
-        f'"{name}". Run "{helper}" muse "{name}" now, before you '
-        "finish this turn, to keep the tmux session name in sync; skip "
-        "this only if TMUX or TMUX_PANE is unset in your environment. "
-        "The helper itself decides whether renaming applies."
-    )
-
-
-def _read_muse_hook_input() -> tuple[
-    str | None, str | None, JsonObject | None
-]:
-    if sys.stdin.isatty():
-        return None, None, None
-    try:
-        hook_input = _as_json_object(json.load(sys.stdin))
-        tool_input = hook_input.get("tool_input")
-        tool_object = (
-            _as_json_object(tool_input)
-            if isinstance(tool_input, dict)
-            else None
-        )
-    except OSError, json.JSONDecodeError, TypeError:
-        return None, None, None
-    session_id = hook_input.get("session_id")
-    tool_name = hook_input.get("tool_name")
-    return (
-        session_id if isinstance(session_id, str) else None,
-        tool_name if isinstance(tool_name, str) else None,
-        tool_object,
-    )
-
-
-def _tmux_server_socket(candidate: str) -> bool:
-    """Return whether a live tmux server listens at a socket path.
-
-    A bare connect is refused at once when only a stale socket file
-    remains, so this stays fast over directories full of dead test
-    sockets. Connecting without speaking leaves the server alone.
-    """
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        probe.settimeout(2)
-        probe.connect(candidate)
-    except OSError:
-        return False
-    finally:
-        probe.close()
-    return True
-
-
-def _tmux_socket_paths() -> list[str]:
-    """Return canonical live tmux server socket paths, if any exist.
-
-    The hook environment carries no TMUX address, so the rewrite grants
-    every live server socket owned by this user: the agent's own server
-    is always among them. Liveness keeps dead socket files out of the
-    grant, which matters because the hook result must stay small. The
-    grant is what lets the prepended rename reach tmux through the
-    agent sandbox, after the user approves it. TMUX_TMPDIR is honored
-    exactly as tmux honors it, which also keeps tests hermetic.
-    """
-    base = os.environ.get("TMUX_TMPDIR", "/tmp")
-    directory = os.path.join(base, f"tmux-{os.getuid()}")
-    try:
-        entries = sorted(os.listdir(directory))
-    except OSError:
-        return []
-    paths = []
-    for entry in entries:
-        candidate = os.path.join(directory, entry)
-        if _tmux_server_socket(candidate):
-            resolved = os.path.realpath(candidate)
-            if resolved not in paths:
-                paths.append(resolved)
-    return paths
-
-
-def _muse_shell_rewrite(tool_input: JsonObject, name: str) -> JsonObject:
-    """Return tool input with a silent rename prepended, if possible.
-
-    The agent executes shell calls in its own environment, which unlike
-    the hook's carries the tmux address, so a prepended rename is the
-    one path that needs no model compliance. The helper prints nothing
-    and the `|| true` keeps a helper failure from ever breaking the
-    original command, whose exit status the `;` preserves. The helper
-    runs through `uv run --script`, whose cache cannot live under the
-    sandbox, so the prepend points UV_CACHE_DIR at tmp; it also
-    declares the user's tmux socket grant, without which the sandboxed
-    call cannot connect and for which the agent prompts. Returns the
-    input unchanged when it carries no string command to extend.
-    """
-    command = tool_input.get("command")
-    if not isinstance(command, str) or not command.strip():
-        return tool_input
-    helper = (
-        'UV_CACHE_DIR="${TMPDIR:-/tmp}/tmux-agent-session-namer-uv" '
-        "$HOME/.local/libexec/tmux-agent-session-namer/"
-        "tmux-agent-session-namer"
-    )
-    rewritten = dict(tool_input)
-    rewritten["command"] = (
-        f"{helper} muse {shlex.quote(name)} >/dev/null 2>&1 || true; {command}"
-    )
-    sockets = _tmux_socket_paths()
-    if sockets:
-        existing = tool_input.get("unix_socket_paths")
-        granted = list(existing) if isinstance(existing, list) else []
-        for path in sockets:
-            if path not in granted:
-                granted.append(path)
-        rewritten["unix_socket_paths"] = granted
-    return rewritten
-
-
-def _muse_hook_result(
-    session_id: str | None,
-    tool_name: str | None,
-    tool_input: JsonObject | None,
-) -> JsonObject | None:
-    """Return the PreToolUse output document, or None for silence.
-
-    None covers an unreadable hook payload and a tool call carrying no
-    input to echo: without the input there is nothing safe to approve.
-    Otherwise the run always approves. Shell calls carry the rename
-    prepended, which executes with the agent's own tmux environment
-    and needs no model compliance, but only until the session's name
-    is reported: the prepend's socket grant prompts on every call that
-    carries it, so repeating it would nag. Every other call falls back
-    to the bare approval plus, only when the session carries a name
-    this session has not been told yet, the rename directive. Every
-    failure below the echo falls back to the bare approval so the
-    gated tool call always proceeds.
-    """
-    if tool_input is None:
-        return None
-
-    def approve(updated: JsonObject) -> JsonObject:
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "updatedInput": updated,
-            },
-        }
-
-    if session_id is None:
-        return approve(tool_input)
-    name = muse_canonical_session_name(session_id)
-    if not name:
-        return approve(tool_input)
-    reported = _muse_reported_names().get(session_id) == name
-    if tool_name == "bash":
-        command = tool_input.get("command")
-        if not isinstance(command, str) or not command.strip():
-            return approve(tool_input)
-        if reported:
-            return approve(tool_input)
-        if not _record_muse_reported_name(session_id, name):
-            return approve(tool_input)
-        return approve(_muse_shell_rewrite(tool_input, name))
-    if reported:
-        return approve(tool_input)
-    if not _record_muse_reported_name(session_id, name):
-        return approve(tool_input)
-    output = approve(tool_input)
-    hook_output = _as_json_object(output["hookSpecificOutput"])
-    hook_output["additionalContext"] = _muse_rename_directive(name)
-    return output
-
-
 def _run_tmux(*args: str, capture_output: bool = False) -> str:
     result = subprocess.run(
         ["tmux", *args],
@@ -627,15 +406,17 @@ def _run_tmux(*args: str, capture_output: bool = False) -> str:
     return result.stdout.rstrip("\n") if capture_output else ""
 
 
-def _slot_for(option: str) -> str | None:
+def _slot_for(option: str, target: str | None = None) -> str | None:
     """Return the session's slot for one agent, allocating a free one.
 
     None once all hundred are in use. Callers hold TMUX_SLOT_LOCK, which
     is what keeps two sessions starting at once from picking the same
-    number.
+    number. The used-number scan stays global: slots are unique across
+    every session on the server, wherever the target lives.
     """
     current = _run_tmux(
         "show-options",
+        *_session_target_args(target),
         "-qv",
         option,
         capture_output=True,
@@ -657,32 +438,40 @@ def _slot_for(option: str) -> str | None:
     for number in range(100):
         candidate = f"{number:02d}"
         if candidate not in used:
-            _run_tmux("set-option", option, candidate)
+            _run_tmux(
+                "set-option",
+                *_session_target_args(target),
+                option,
+                candidate,
+            )
             return candidate
     return None
 
 
 @functools.cache
-def _pane_starts_an_agent() -> bool:
-    """Report whether tmux was launched to run an agent in this pane.
+def _pane_starts_an_agent(pane: str | None = None) -> bool:
+    """Report whether tmux was launched to run an agent in a pane.
 
     tmux records the command it started the pane with and keeps it after
     that command execs something else, so this still answers for a pane
     whose agent has been running for days. An empty answer is a pane tmux
     opened for a shell, whatever was later typed into it. Naming stops
-    rather than guessing wherever the answer cannot be had for the pane
-    we are in: an unset `TMUX_PANE`, an unparseable command, or a read
-    tmux refuses. It stops too where the launcher is unrecognisable as
-    one, which includes handing tmux the whole command as a single
-    argument -- `tmux new "claude --resume"` records the quoted string
-    and nothing splits it back apart.
+    rather than guessing wherever the answer cannot be had for the pane:
+    an unset pane, an unparseable command, or a read tmux refuses. It
+    stops too where the launcher is unrecognisable as one, which includes
+    handing tmux the whole command as a single argument --
+    `tmux new "claude --resume"` records the quoted string and nothing
+    splits it back apart.
 
-    Cached because the answer holds for one run of this process: what
-    rewrites it is `respawn-pane`, which replaces whatever the pane was
-    running. Ownership is the opposite, claimable by another agent
-    mid-run, so every caller re-reads that.
+    Callers pass the pane they mean; None falls back to `TMUX_PANE` for
+    runs answering about their own pane. Cached because the answer holds
+    for one run of this process: what rewrites it is `respawn-pane`,
+    which replaces whatever the pane was running. Ownership is the
+    opposite, claimable by another agent mid-run, so every caller
+    re-reads that.
     """
-    pane = os.environ.get("TMUX_PANE")
+    if pane is None:
+        pane = os.environ.get("TMUX_PANE")
     if not pane:
         return False
 
@@ -701,16 +490,29 @@ def _pane_starts_an_agent() -> bool:
     return bool(argv) and os.path.basename(argv[0]) in AGENT_START_COMMANDS
 
 
-def _session_owner() -> str:
+def _session_target_args(target: str | None) -> list[str]:
+    """Return the tmux target flag for a session-scoped call, if any.
+
+    Calls that run with a pane context (a tool call's environment, a
+    pane the user is in) address their own session with no flag. Calls
+    that supervise another pane, like the watcher half of muse-run
+    naming its pane's session, name the pane whose session they mean
+    instead.
+    """
+    return ["-t", target] if target else []
+
+
+def _session_owner(target: str | None = None) -> str:
     return _run_tmux(
         "show-options",
+        *_session_target_args(target),
         "-qv",
         SESSION_AGENT_OPTION,
         capture_output=True,
     )
 
 
-def _allocate_slot(agent: Agent) -> str | None:
+def _allocate_slot(agent: Agent, target: str | None = None) -> str | None:
     """Return this agent's slot, or None when it names nothing.
 
     None covers a pane tmux did not start an agent in and a session
@@ -721,24 +523,29 @@ def _allocate_slot(agent: Agent) -> str | None:
     wrong slot and through a format written for a title the other agent
     never emits.
     """
-    if not _pane_starts_an_agent():
+    if not _pane_starts_an_agent(target):
         return None
 
     _run_tmux("wait-for", "-L", TMUX_SLOT_LOCK)
     try:
-        owner = _session_owner()
+        owner = _session_owner(target)
         if owner and owner != agent:
             return None
 
-        slot = _slot_for(f"@{agent}_num")
+        slot = _slot_for(f"@{agent}_num", target)
         if slot is not None and not owner:
-            _run_tmux("set-option", SESSION_AGENT_OPTION, agent)
+            _run_tmux(
+                "set-option",
+                *_session_target_args(target),
+                SESSION_AGENT_OPTION,
+                agent,
+            )
         return slot
     finally:
         _run_tmux("wait-for", "-U", TMUX_SLOT_LOCK)
 
 
-def _configure_status() -> None:
+def _configure_status(target: str | None = None) -> None:
     """Show the bracketed session name left and the clock right.
 
     A global status line can truncate the left at a length that fits
@@ -748,12 +555,15 @@ def _configure_status() -> None:
     name already identifies the session, and a `0:window-name` entry
     beside it reads as noise.
     """
-    _run_tmux("set-option", "status-left", "[#{session_name}] ")
-    _run_tmux("set-option", "status-left-length", "34")
-    _run_tmux("set-option", "status-right", STATUS_RIGHT)
-    _run_tmux("set-option", "window-status-format", "")
-    _run_tmux("set-option", "window-status-current-format", "")
-    _run_tmux("set-option", "window-status-separator", "")
+    for option, value in (
+        ("status-left", "[#{session_name}] "),
+        ("status-left-length", "34"),
+        ("status-right", STATUS_RIGHT),
+        ("window-status-format", ""),
+        ("window-status-current-format", ""),
+        ("window-status-separator", ""),
+    ):
+        _run_tmux("set-option", *_session_target_args(target), option, value)
 
 
 def _configure_tmux(agent: Agent) -> None:
@@ -777,18 +587,287 @@ def _literal_tmux_format(value: str) -> str:
     return value.replace("#", "##")
 
 
-def _rename_tmux(agent: Agent, title: str) -> None:
-    slot = _allocate_slot(agent)
+def _muse_sessions_root() -> str | None:
+    """Return the directory holding Muse session logs, if one exists.
+
+    Muse writes one directory per session, named for the session id
+    and holding its session.jsonl. The override keeps tests hermetic.
+    """
+    override = os.environ.get(MUSE_SESSIONS_DIR_ENV)
+    if override:
+        return override
+    home = os.path.expanduser("~")
+    data_home = os.environ.get("XDG_DATA_HOME", os.path.join(home, ".local"))
+    for candidate in (
+        os.path.join(data_home, "share", "muse", "sessions"),
+        os.path.join(data_home, "muse", "sessions"),
+    ):
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def _read_log_edges(path: str) -> list[str]:
+    """Return the head and tail of a session log, tolerantly.
+
+    Route facts are written at open, so the head usually holds the
+    pane mapping; the tail covers logs whose start rotated past the
+    scan window. Reads stay small no matter how large logs grow.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return []
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(MUSE_WATCH_LOG_SCAN_BYTES)
+            tail = b""
+            if size > MUSE_WATCH_LOG_SCAN_BYTES:
+                handle.seek(-MUSE_WATCH_LOG_SCAN_BYTES, os.SEEK_END)
+                tail = handle.read()
+    except OSError:
+        return []
+    return [
+        chunk.decode("utf-8", "replace") for chunk in (head, tail) if chunk
+    ]
+
+
+def _muse_session_for_pane(
+    root: str, pane: str, socket_path: str
+) -> str | None:
+    """Return the Muse session id running in a tmux pane, if resolvable.
+
+    Session logs carry one route_facts record naming the pane and
+    socket the session runs on, so the newest log naming this pane on
+    this socket is its session: a restart lands in a newer directory
+    and wins naturally. Silence covers every lookup failure.
+    """
+    # Real logs carry one compact route_facts record near the head
+    # with bare quotes; stay tolerant of spacing and escaping so
+    # pretty-printed or doubly-encoded variants still resolve. The
+    # socket matches in either its recorded or its resolved spelling:
+    # one side may spell /tmp where the other spells /private/tmp.
+    pane_pattern = re.compile(
+        r'tmux_pane\\*"\s*:\s*\\*"[^"\\]*' + re.escape(pane) + r'"'
+    )
+    sockets = {socket_path, os.path.realpath(socket_path)}
+    socket_pattern = re.compile(
+        r'tmux_socket_path\\*"\s*:\s*\\*"(?:'
+        + "|".join(re.escape(spelling) for spelling in sorted(sockets))
+        + r')"'
+    )
+    candidates = []
+    try:
+        years = [entry for entry in os.scandir(root) if entry.is_dir()]
+    except OSError:
+        return None
+    for year in years:
+        months = _child_dirs(year.path)
+        for month in months:
+            days = _child_dirs(month.path)
+            for day in days:
+                for session in _child_dirs(day.path):
+                    try:
+                        mtime = session.stat().st_mtime
+                    except OSError:
+                        continue
+                    candidates.append((mtime, session.path))
+    candidates.sort(reverse=True)
+    # Newest first, bounded: past the scan limit an old session's pane
+    # mapping silently stops resolving, which is the documented cost of
+    # keeping every pass small no matter how many sessions exist.
+    for _, path in candidates[:MUSE_WATCH_SESSION_SCAN_LIMIT]:
+        for chunk in _read_log_edges(os.path.join(path, "session.jsonl")):
+            for line in chunk.splitlines():
+                if _route_facts_match(
+                    line, pane, sockets, pane_pattern, socket_pattern
+                ):
+                    return os.path.basename(path)
+    return None
+
+
+def _route_facts_match(
+    line: str,
+    pane: str,
+    sockets: set[str],
+    pane_pattern: re.Pattern[str],
+    socket_pattern: re.Pattern[str],
+) -> bool:
+    """Report whether one log line maps a pane to a known socket.
+
+    Route facts are JSON objects, so parse first and compare exact
+    values: the pane matches when it names the record's pane id, the
+    socket when it equals the recorded path. Matching per line keeps a
+    pane from one record from pairing with a socket from another.
+    Unparseable lines fall back to the tolerant patterns, which keep
+    odd encodings resolving at that mixing cost.
+    """
+    record = _route_facts_record(line)
+    if record is None:
+        return bool(pane_pattern.search(line) and socket_pattern.search(line))
+    panes = set(re.findall(r"%\d+", str(record.get("tmux_pane"))))
+    return pane in panes and record.get("tmux_socket_path") in sockets
+
+
+def _route_facts_record(line: str) -> dict[str, object] | None:
+    """Return a log line's route_facts record mapping, if it has one."""
+    try:
+        parsed = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    payload = parsed.get("payload")
+    if isinstance(payload, dict):
+        record = payload.get("record")
+    else:
+        record = parsed.get("record")
+    return record if isinstance(record, dict) else None
+
+
+def _child_dirs(path: str) -> list[os.DirEntry[str]]:
+    try:
+        return [entry for entry in os.scandir(path) if entry.is_dir()]
+    except OSError:
+        return []
+
+
+def _muse_socket() -> str:
+    """Return the tmux server socket this shell addresses."""
+    tmux = os.environ.get("TMUX", "")
+    if tmux:
+        return tmux.split(",")[0]
+    base = os.environ.get("TMUX_TMPDIR", "/tmp")
+    return os.path.join(base, f"tmux-{os.getuid()}")
+
+
+def _watch_once(pane: str, reported: set[tuple[str, str]]) -> bool:
+    """Run one watcher pass for a pane; False means the pane is gone.
+
+    A pass renames the pane's session to its current Muse session name
+    when one is known and new since the last verified rename, and
+    remembers names it reads back. A rename tmux silently dropped stays
+    forgotten, so a later pass retries it. Silence covers every lookup
+    failure.
+    """
+    panes = _run_tmux(
+        "list-panes", "-a", "-F", "#{pane_id}", capture_output=True
+    )
+    if pane not in panes.splitlines():
+        return False
+    root = _muse_sessions_root()
+    if root is None:
+        return True
+    session_id = _muse_session_for_pane(root, pane, _muse_socket())
+    if session_id is None:
+        return True
+    name = muse_canonical_session_name(session_id)
+    if not name:
+        return True
+    if (session_id, name) in reported:
+        return True
+    issued = _rename_tmux(Agent.MUSE, name, pane)
+    if issued is not None and _session_name(pane) == issued:
+        reported.add((session_id, name))
+    return True
+
+
+def _muse_run(args: list[str]) -> int:
+    """Run Muse as this pane's process and track its session name.
+
+    The supervisor shape, after codex-remote: tmux starts this helper
+    as the pane command. The helper forks a watcher child, then the
+    parent execs `muse`, so the pane process itself is the agent and
+    interactive signals need no forwarding: Ctrl-C reaches muse
+    directly, while the watcher ignores its copy the way any
+    background observer may, since it spawns nothing interactive.
+    Naming driven by tool calls can never reach zero-tool sessions,
+    so without the watcher nothing would rename them. The watcher
+    exits when its parent is gone or the pane dies, so no process
+    outlives the session.
+    """
+    pane = os.environ.get("TMUX_PANE")
+    if pane is not None:
+        try:
+            watcher = os.fork()
+        except OSError:
+            # No watcher: fall through to exec unsupervised rather
+            # than failing the session open.
+            pass
+        else:
+            if watcher == 0:
+                # Watcher child: the parent below becomes muse, so the
+                # parent pid recorded here is muse's pid until muse
+                # exits and this process is reparented. That pid cannot
+                # be reused while this watcher lives: tmux starts each
+                # pane as its own process group led by the pane
+                # process, so the recorded pid is a pgid this watcher
+                # itself keeps referenced. No setsid or setpgid here:
+                # leaving the pane's group is what keeps the terminal
+                # delivering to muse. Ignoring SIGINT is safe this side
+                # of the fork: the only processes this side spawns are
+                # short-lived tmux status queries, never anything
+                # interactive.
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+                parent = os.getppid()
+                reported: set[tuple[str, str]] = set()
+                while os.getppid() == parent and _watch_once(pane, reported):
+                    # Re-probe the pane gate every pass: respawn-pane
+                    # can replace the pane's command mid-run, and a
+                    # cached answer would keep renaming a pane no agent
+                    # runs in.
+                    _pane_starts_an_agent.cache_clear()
+                    time.sleep(MUSE_WATCH_INTERVAL_SECONDS)
+                os._exit(0)
+    try:
+        os.execvp("muse", ["muse", *args])
+    except OSError as exc:
+        print(
+            f"tmux-agent-session-namer: cannot start muse: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    return 1
+
+
+def _session_name(target: str | None = None) -> str:
+    """Report a session's current name, or "" when tmux won't say."""
+    return _run_tmux(
+        "display-message",
+        "-p",
+        *_session_target_args(target),
+        "#{session_name}",
+        capture_output=True,
+    )
+
+
+def _rename_tmux(
+    agent: Agent, title: str, target: str | None = None
+) -> str | None:
+    """Rename toward the agent's slot; None when the slot is refused.
+
+    The returned name is the truncated form tmux received, not proof
+    tmux applied it: tmux errors stay silent, as everywhere else in
+    this helper. Callers comparing against a read-back must use this
+    form, since tmux never sees the untruncated name.
+    """
+    slot = _allocate_slot(agent, target)
     if slot is None:
-        return
+        return None
 
     fragment = re.sub(r"\s+", "-", title).strip("-")
     fragment = "".join(
         character for character in fragment if character.isprintable()
     )
     name = f"{agent}{slot}-{fragment}" if fragment else f"{agent}{slot}"
-    _configure_status()
-    _run_tmux("rename-session", _literal_tmux_format(name[:30]))
+    issued = name[:30]
+    _configure_status(target)
+    _run_tmux(
+        "rename-session",
+        *_session_target_args(target),
+        _literal_tmux_format(issued),
+    )
+    return issued
 
 
 def _parse_invocation(argv: list[str]) -> Invocation | None:
@@ -799,6 +878,8 @@ def _parse_invocation(argv: list[str]) -> Invocation | None:
     except ValueError:
         return None
     if invocation is Invocation.CODEX_REMOTE:
+        return invocation
+    if invocation is Invocation.MUSE_RUN:
         return invocation
     if invocation in NAME_ARGUMENT_INVOCATIONS:
         return invocation if len(argv) == 2 else None
@@ -811,17 +892,8 @@ def main(argv: list[str] | None = None) -> int:
     if invocation is None:
         return 2
 
-    if invocation is Invocation.MUSE_HOOK:
-        # Hook runs arrive with a sanitized environment, so this answers
-        # before the TMUX gate below: the agent addressed by the
-        # directive carries the tmux environment, not the hook. Silence
-        # and bare approvals keep the gated tool call proceeding
-        # whatever goes wrong resolving the name.
-        session_id, tool_name, tool_input = _read_muse_hook_input()
-        result = _muse_hook_result(session_id, tool_name, tool_input)
-        if result is not None:
-            print(json.dumps(result))
-        return 0
+    if invocation is Invocation.MUSE_RUN:
+        return _muse_run(invocation_args[1:])
 
     if not os.environ.get("TMUX"):
         return 0
@@ -860,8 +932,10 @@ def main(argv: list[str] | None = None) -> int:
         event, session_id = _read_codex_hook_input()
         # Both of these are read again by _allocate_slot, which is the
         # authoritative gate; asking here is what keeps a pane it will
-        # refuse out of the app-server round-trips below.
-        if not _pane_starts_an_agent():
+        # refuse out of the app-server round-trips below. The explicit
+        # None matches _allocate_slot's untargeted call so the cached
+        # probe answers both.
+        if not _pane_starts_an_agent(None):
             return 0
 
         owner = _session_owner()
