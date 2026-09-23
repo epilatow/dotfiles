@@ -72,6 +72,9 @@ STATUS_COMMANDS = [
         "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}"
         "%H:%M %d-%b-%y"
     ),
+    "set-option window-status-format ",
+    "set-option window-status-current-format ",
+    "set-option window-status-separator ",
 ]
 PANE_START_COMMAND = "display-message -p -t %0 #{pane_start_command}"
 OWNER_READ_ONLY_COMMANDS = [

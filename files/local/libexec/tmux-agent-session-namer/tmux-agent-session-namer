@@ -744,10 +744,16 @@ def _configure_status() -> None:
     A global status line can truncate the left at a length that fits
     its own format but not an agentNN-name, so every agent-owned
     session carries its own pair: a wide-enough left and a plain right.
+    The window list between them is cleared as well: the bracketed
+    name already identifies the session, and a `0:window-name` entry
+    beside it reads as noise.
     """
     _run_tmux("set-option", "status-left", "[#{session_name}] ")
     _run_tmux("set-option", "status-left-length", "34")
     _run_tmux("set-option", "status-right", STATUS_RIGHT)
+    _run_tmux("set-option", "window-status-format", "")
+    _run_tmux("set-option", "window-status-current-format", "")
+    _run_tmux("set-option", "window-status-separator", "")
 
 
 def _configure_tmux(agent: Agent) -> None:
