@@ -35,7 +35,7 @@ testpaths = ["_repo_shared/tests", "tests"]
 # rewrites as prose. Slash-containing entries are anchored at the repo
 # root, so only that skill stays out of both markdown gates; it is
 # validated by its own harness (`muse skills validate`) instead.
-extra-exclude-dirs = ["files/config/muse/skills"]
+extra-exclude-dirs = ["files/muse/tmux-namer/skills"]
 
 [tool.repo-shared.code-quality]
 # The libexec entries are shebang scripts with no `.py` extension, which

@@ -41,8 +41,8 @@ CLAUDE_WRAPPER = (
 MUSE_SKILL = (
     REPO_ROOT
     / "files"
-    / "config"
     / "muse"
+    / "tmux-namer"
     / "skills"
     / "tmux-namer"
     / "SKILL.md"
@@ -1742,6 +1742,16 @@ def test_muse_plugin_registers_guarded_pretool_hook() -> None:
             "statusMessage": "Naming tmux session",
         }
     ]
+    assert config["capabilities"]["skills"] == [
+        {
+            "id": "tmux-namer",
+            "path": "skills/tmux-namer/SKILL.md",
+        }
+    ]
+    assert (
+        MUSE_PLUGIN_MANIFEST.parent.parent
+        / config["capabilities"]["skills"][0]["path"]
+    ).is_file()
 
 
 def test_muse_hook_directs_first_tool_call_to_rename(
