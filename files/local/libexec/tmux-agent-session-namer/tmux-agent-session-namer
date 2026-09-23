@@ -26,6 +26,14 @@ current name over at session start and after every rename. An empty
 name renames to the bare agent and slot -- the form a session keeps
 until a real name exists, which is how pi and opencode sessions first
 name themselves.
+
+A muse-hook run answers a PreToolUse hook: it approves with the tool
+input echoed back and, only when the session carries a name it has not
+reported yet, prepends a silent rename to shell calls (which the agent
+executes with its own tmux environment, declaring the tmux socket
+grant the sandboxed call needs) or adds a directive for the agent to
+rename through a muse run, since the hook environment itself carries
+no tmux address.
 """
 
 from __future__ import annotations
@@ -36,6 +44,8 @@ import os
 import re
 import select
 import shlex
+import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -56,6 +66,12 @@ CODEX_SESSION_OWNER_WARNING = (
     "tmux naming disabled: {owner} already names this tmux session."
 )
 CODEX_THREAD_TITLE_IDS = frozenset(("thread", "thread-title"))
+# Where the muse-hook run finds the session name authority and where it
+# records which names it already reported. Both yield to an environment
+# override so tests stay hermetic and unusual installs stay working.
+MUSE_SESSION_NAME_DB_ENV = "MUSE_SESSION_NAME_DB"
+MUSE_REPORTED_NAMES_DIR_ENV = "TMUX_AGENT_SESSION_NAMER_STATE_DIR"
+MUSE_REPORTED_NAMES_FILENAME = "muse-names.json"
 TMUX_SLOT_LOCK = "tmux-agent-session-namer-slots"
 SESSION_AGENT_OPTION = "@agent_namer"
 # What tmux must have started a pane with for the session to be named:
@@ -92,6 +108,7 @@ class Invocation(StrEnum):
     CODEX_HOOK = "codex-hook"
     CODEX_REMOTE = "codex-remote"
     MUSE = "muse"
+    MUSE_HOOK = "muse-hook"
     OPENCODE = "opencode"
     PI = "pi"
 
@@ -313,6 +330,292 @@ def _read_codex_hook_input() -> tuple[CodexHookEvent | None, str | None]:
     return event, session_id if isinstance(session_id, str) else None
 
 
+def _muse_session_name_db() -> str | None:
+    """Return the session name authority database, if one is present.
+
+    The authority lives outside the session log tree, in a platform
+    location, so this probes the known ones rather than deriving it.
+    None means naming stays silent: a hook that cannot resolve the name
+    must not disturb the tool call it is gating.
+    """
+    override = os.environ.get(MUSE_SESSION_NAME_DB_ENV)
+    if override:
+        return override
+    home = os.path.expanduser("~")
+    data_home = os.environ.get("XDG_DATA_HOME", os.path.join(home, ".local"))
+    candidates = [
+        os.path.join(
+            home,
+            "Library",
+            "Application Support",
+            "muse",
+            "session-name-authority",
+            "session-names.db",
+        ),
+        os.path.join(
+            data_home,
+            "share",
+            "muse",
+            "session-name-authority",
+            "session-names.db",
+        ),
+        os.path.join(
+            data_home,
+            "muse",
+            "session-name-authority",
+            "session-names.db",
+        ),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def muse_canonical_session_name(session_id: str) -> str | None:
+    """Return the authority's canonical name for a session, if any.
+
+    Read-only and total: every lookup failure answers None so callers
+    can stay silent instead of breaking the gated tool call.
+    """
+    db = _muse_session_name_db()
+    if db is None:
+        return None
+    try:
+        connection = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "SELECT normalized_name FROM session_name_claims "
+                "WHERE session_id = ? AND kind = 'canonical'",
+                (session_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+    except OSError, sqlite3.Error:
+        return None
+    if not isinstance(row, tuple) or not row:
+        return None
+    name = row[0]
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
+def _muse_reported_names_path() -> str:
+    state_dir = os.environ.get(MUSE_REPORTED_NAMES_DIR_ENV)
+    if not state_dir:
+        cache_home = os.environ.get("XDG_CACHE_HOME", "")
+        if not cache_home:
+            cache_home = os.path.join(
+                os.path.expanduser("~"),
+                ".cache",
+            )
+        state_dir = os.path.join(cache_home, "tmux-agent-session-namer")
+    return os.path.join(state_dir, MUSE_REPORTED_NAMES_FILENAME)
+
+
+def _muse_reported_names() -> dict[str, str]:
+    try:
+        with open(_muse_reported_names_path(), encoding="utf-8") as handle:
+            parsed: object = json.load(handle)
+    except OSError, json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        session_id: name
+        for session_id, name in parsed.items()
+        if isinstance(session_id, str) and isinstance(name, str)
+    }
+
+
+def _record_muse_reported_name(session_id: str, name: str) -> bool:
+    try:
+        path = _muse_reported_names_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        reported = _muse_reported_names()
+        reported[session_id] = name
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(reported, handle)
+    except OSError:
+        return False
+    return True
+
+
+def _muse_rename_directive(name: str) -> str:
+    helper = (
+        "$HOME/.local/libexec/tmux-agent-session-namer/"
+        "tmux-agent-session-namer"
+    )
+    return (
+        "Session housekeeping: this Muse session is currently named "
+        f'"{name}". Run "{helper}" muse "{name}" now, before you '
+        "finish this turn, to keep the tmux session name in sync; skip "
+        "this only if TMUX or TMUX_PANE is unset in your environment. "
+        "The helper itself decides whether renaming applies."
+    )
+
+
+def _read_muse_hook_input() -> tuple[
+    str | None, str | None, JsonObject | None
+]:
+    if sys.stdin.isatty():
+        return None, None, None
+    try:
+        hook_input = _as_json_object(json.load(sys.stdin))
+        tool_input = hook_input.get("tool_input")
+        tool_object = (
+            _as_json_object(tool_input)
+            if isinstance(tool_input, dict)
+            else None
+        )
+    except OSError, json.JSONDecodeError, TypeError:
+        return None, None, None
+    session_id = hook_input.get("session_id")
+    tool_name = hook_input.get("tool_name")
+    return (
+        session_id if isinstance(session_id, str) else None,
+        tool_name if isinstance(tool_name, str) else None,
+        tool_object,
+    )
+
+
+def _tmux_server_socket(candidate: str) -> bool:
+    """Return whether a live tmux server listens at a socket path.
+
+    A bare connect is refused at once when only a stale socket file
+    remains, so this stays fast over directories full of dead test
+    sockets. Connecting without speaking leaves the server alone.
+    """
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(2)
+        probe.connect(candidate)
+    except OSError:
+        return False
+    finally:
+        probe.close()
+    return True
+
+
+def _tmux_socket_paths() -> list[str]:
+    """Return canonical live tmux server socket paths, if any exist.
+
+    The hook environment carries no TMUX address, so the rewrite grants
+    every live server socket owned by this user: the agent's own server
+    is always among them. Liveness keeps dead socket files out of the
+    grant, which matters because the hook result must stay small. The
+    grant is what lets the prepended rename reach tmux through the
+    agent sandbox, after the user approves it. TMUX_TMPDIR is honored
+    exactly as tmux honors it, which also keeps tests hermetic.
+    """
+    base = os.environ.get("TMUX_TMPDIR", "/tmp")
+    directory = os.path.join(base, f"tmux-{os.getuid()}")
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    paths = []
+    for entry in entries:
+        candidate = os.path.join(directory, entry)
+        if _tmux_server_socket(candidate):
+            resolved = os.path.realpath(candidate)
+            if resolved not in paths:
+                paths.append(resolved)
+    return paths
+
+
+def _muse_shell_rewrite(tool_input: JsonObject, name: str) -> JsonObject:
+    """Return tool input with a silent rename prepended, if possible.
+
+    The agent executes shell calls in its own environment, which unlike
+    the hook's carries the tmux address, so a prepended rename is the
+    one path that needs no model compliance. The helper prints nothing
+    and the `|| true` keeps a helper failure from ever breaking the
+    original command, whose exit status the `;` preserves. The helper
+    runs through `uv run --script`, whose cache cannot live under the
+    sandbox, so the prepend points UV_CACHE_DIR at tmp; it also
+    declares the user's tmux socket grant, without which the sandboxed
+    call cannot connect and for which the agent prompts. Returns the
+    input unchanged when it carries no string command to extend.
+    """
+    command = tool_input.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return tool_input
+    helper = (
+        'UV_CACHE_DIR="${TMPDIR:-/tmp}/tmux-agent-session-namer-uv" '
+        "$HOME/.local/libexec/tmux-agent-session-namer/"
+        "tmux-agent-session-namer"
+    )
+    rewritten = dict(tool_input)
+    rewritten["command"] = (
+        f"{helper} muse {shlex.quote(name)} >/dev/null 2>&1 || true; {command}"
+    )
+    sockets = _tmux_socket_paths()
+    if sockets:
+        existing = tool_input.get("unix_socket_paths")
+        granted = list(existing) if isinstance(existing, list) else []
+        for path in sockets:
+            if path not in granted:
+                granted.append(path)
+        rewritten["unix_socket_paths"] = granted
+    return rewritten
+
+
+def _muse_hook_result(
+    session_id: str | None,
+    tool_name: str | None,
+    tool_input: JsonObject | None,
+) -> JsonObject | None:
+    """Return the PreToolUse output document, or None for silence.
+
+    None covers an unreadable hook payload and a tool call carrying no
+    input to echo: without the input there is nothing safe to approve.
+    Otherwise the run always approves. Shell calls carry the rename
+    prepended, which executes with the agent's own tmux environment
+    and needs no model compliance, but only until the session's name
+    is reported: the prepend's socket grant prompts on every call that
+    carries it, so repeating it would nag. Every other call falls back
+    to the bare approval plus, only when the session carries a name
+    this session has not been told yet, the rename directive. Every
+    failure below the echo falls back to the bare approval so the
+    gated tool call always proceeds.
+    """
+    if tool_input is None:
+        return None
+
+    def approve(updated: JsonObject) -> JsonObject:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": updated,
+            },
+        }
+
+    if session_id is None:
+        return approve(tool_input)
+    name = muse_canonical_session_name(session_id)
+    if not name:
+        return approve(tool_input)
+    reported = _muse_reported_names().get(session_id) == name
+    if tool_name == "bash":
+        command = tool_input.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return approve(tool_input)
+        if reported:
+            return approve(tool_input)
+        if not _record_muse_reported_name(session_id, name):
+            return approve(tool_input)
+        return approve(_muse_shell_rewrite(tool_input, name))
+    if reported:
+        return approve(tool_input)
+    if not _record_muse_reported_name(session_id, name):
+        return approve(tool_input)
+    output = approve(tool_input)
+    hook_output = _as_json_object(output["hookSpecificOutput"])
+    hook_output["additionalContext"] = _muse_rename_directive(name)
+    return output
+
+
 def _run_tmux(*args: str, capture_output: bool = False) -> str:
     result = subprocess.run(
         ["tmux", *args],
@@ -497,13 +800,25 @@ def _parse_invocation(argv: list[str]) -> Invocation | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    if not os.environ.get("TMUX"):
-        return 0
-
     invocation_args = argv if argv is not None else sys.argv[1:]
     invocation = _parse_invocation(invocation_args)
     if invocation is None:
         return 2
+
+    if invocation is Invocation.MUSE_HOOK:
+        # Hook runs arrive with a sanitized environment, so this answers
+        # before the TMUX gate below: the agent addressed by the
+        # directive carries the tmux environment, not the hook. Silence
+        # and bare approvals keep the gated tool call proceeding
+        # whatever goes wrong resolving the name.
+        session_id, tool_name, tool_input = _read_muse_hook_input()
+        result = _muse_hook_result(session_id, tool_name, tool_input)
+        if result is not None:
+            print(json.dumps(result))
+        return 0
+
+    if not os.environ.get("TMUX"):
+        return 0
 
     if invocation is Invocation.CLAUDE:
         agent = Agent.CLAUDE

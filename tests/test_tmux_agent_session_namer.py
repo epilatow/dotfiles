@@ -4,7 +4,10 @@ import ast
 import json
 import os
 import shutil
+import socket
+import sqlite3
 import subprocess
+import tempfile
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
@@ -36,7 +39,24 @@ CLAUDE_WRAPPER = (
     / "tmux-name.sh"
 )
 MUSE_SKILL = (
-    REPO_ROOT / "files" / "muse" / "skills" / "tmux-namer" / "SKILL.md"
+    REPO_ROOT
+    / "files"
+    / "config"
+    / "muse"
+    / "skills"
+    / "tmux-namer"
+    / "SKILL.md"
+)
+MUSE_PLUGIN_MANIFEST = (
+    REPO_ROOT
+    / "files"
+    / "muse"
+    / "tmux-namer"
+    / ".muse-plugin"
+    / "plugin.json"
+)
+MUSE_HOOK_WRAPPER = (
+    REPO_ROOT / "files" / "muse" / "tmux-namer" / "hooks" / "tmux-name.sh"
 )
 PI_EXTENSION = (
     REPO_ROOT / "files" / "pi" / "agent" / "extensions" / "tmux-namer.ts"
@@ -1401,6 +1421,7 @@ def test_a_shell_session_keeps_its_name_when_an_agent_starts_in_it(
         ("claude", "--strip-leading-status"),
         ("muse",),
         ("muse", "first", "second"),
+        ("muse-hook", "extra"),
         ("opencode",),
         ("opencode", "first", "second"),
         ("pi",),
@@ -1585,7 +1606,12 @@ def test_muse_skill_routes_session_naming_through_the_helper() -> None:
     text = MUSE_SKILL.read_text()
 
     assert text.startswith("---\nname: tmux-namer\n")
-    assert "description: " in text.split("---\n")[1]
+    frontmatter = text.split("---\n")[1]
+    assert "description: " in frontmatter
+    # The description is the load trigger the model sees at session
+    # start: without an explicit always-load instruction it stays
+    # focused on the user's request and never loads the skill.
+    assert "Always call read_skill" in frontmatter
     assert (
         '"$HOME/.local/libexec/tmux-agent-session-namer/'
         'tmux-agent-session-namer" muse' in text
@@ -1613,3 +1639,599 @@ def test_opencode_plugin_routes_session_naming_through_the_helper() -> None:
     # may move the tmux session's name.
     assert "New session - " in text
     assert "parentID" in text
+
+
+def write_muse_name_db(
+    path: Path,
+    claims: list[tuple[str, str, str]],
+) -> Path:
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.execute(
+            "CREATE TABLE session_name_claims ("
+            "normalized_name TEXT, session_id TEXT, kind TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO session_name_claims VALUES (?, ?, ?)",
+            claims,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return path
+
+
+def muse_hook_environment(
+    tmp_path: Path,
+    claims: list[tuple[str, str, str]],
+) -> dict[str, str]:
+    db = write_muse_name_db(tmp_path / "session-names.db", claims)
+    return {
+        "MUSE_SESSION_NAME_DB": str(db),
+        "TMUX_AGENT_SESSION_NAMER_STATE_DIR": str(tmp_path / "state"),
+        # The rewrite grants sockets from this directory; pointing it at
+        # a path that never exists keeps tests hermetic on machines with
+        # a running tmux server.
+        "TMUX_TMPDIR": str(tmp_path / "tmux-tmp"),
+    }
+
+
+def muse_socket_dir(
+    live: list[str],
+    stale: list[str],
+) -> tuple[Path, list[socket.socket]]:
+    """Fake a tmux socket directory with live and stale sockets.
+
+    Live entries are bound server sockets, which is what the grant
+    probes for; stale entries are plain files, standing in for dead
+    servers' leftovers. The base sits directly under /tmp because
+    AF_UNIX paths cannot be long. Callers close the returned listeners
+    and remove the base.
+    """
+    base = Path(tempfile.mkdtemp(prefix="muse-hook-sockets"))
+    sockets = base / f"tmux-{os.getuid()}"
+    sockets.mkdir()
+    listeners = []
+    for name in live:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(sockets / name))
+        listener.listen(1)
+        listeners.append(listener)
+    for name in stale:
+        (sockets / name).touch()
+    return base, listeners
+
+
+def muse_hook_input(
+    session_id: str,
+    tool_input: Mapping[str, object],
+    tool_name: str = "read_file",
+) -> dict[str, object]:
+    return {
+        "hook_event_name": "PreToolUse",
+        "session_id": session_id,
+        "tool_name": tool_name,
+        "tool_input": dict(tool_input),
+    }
+
+
+def muse_rename_directive(name: str) -> str:
+    return (
+        "Session housekeeping: this Muse session is currently named "
+        f'"{name}". Run "$HOME/.local/libexec/tmux-agent-session-namer/'
+        f'tmux-agent-session-namer" muse "{name}" now, before you '
+        "finish this turn, to keep the tmux session name in sync; skip "
+        "this only if TMUX or TMUX_PANE is unset in your environment. "
+        "The helper itself decides whether renaming applies."
+    )
+
+
+def test_muse_plugin_registers_guarded_pretool_hook() -> None:
+    config = json.loads(MUSE_PLUGIN_MANIFEST.read_text())
+
+    assert config["name"] == "tmux-namer"
+    assert config["capabilities"]["hooks"] == [
+        {
+            "id": "tmux-name",
+            "event": "PreToolUse",
+            "command": ["sh", "hooks/tmux-name.sh"],
+            "timeoutMs": 5000,
+            "statusMessage": "Naming tmux session",
+        }
+    ]
+
+
+def test_muse_hook_directs_first_tool_call_to_rename(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    tool_input = {"path": "/tmp/note.txt"}
+    result = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env=muse_hook_environment(
+            tmp_path,
+            [("tmuse", "session-1", "canonical")],
+        ),
+        hook_input=muse_hook_input("session-1", tool_input),
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": tool_input,
+            "additionalContext": muse_rename_directive("tmuse"),
+        }
+    }
+    assert not fake_tmux[1].exists()
+
+
+def test_muse_hook_stays_silent_once_reported(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    tool_input = {"path": "/tmp/note.txt"}
+    extra_env = muse_hook_environment(
+        tmp_path,
+        [("tmuse", "session-1", "canonical")],
+    )
+    first = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env=extra_env,
+        hook_input=muse_hook_input("session-1", tool_input),
+    )
+    assert first.returncode == 0
+    assert (
+        "additionalContext" in json.loads(first.stdout)["hookSpecificOutput"]
+    )
+
+    second = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env=extra_env,
+        hook_input=muse_hook_input("session-1", tool_input),
+    )
+
+    assert second.returncode == 0
+    assert json.loads(second.stdout) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": tool_input,
+        }
+    }
+
+
+def test_muse_hook_directs_again_after_rename(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    tool_input = {"path": "/tmp/note.txt"}
+    extra_env = muse_hook_environment(
+        tmp_path,
+        [("tmuse", "session-1", "canonical")],
+    )
+    state_file = tmp_path / "state" / "muse-names.json"
+    state_file.parent.mkdir(parents=True)
+    state_file.write_text(json.dumps({"session-1": "bay-charon"}))
+
+    result = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env=extra_env,
+        hook_input=muse_hook_input("session-1", tool_input),
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["hookSpecificOutput"][
+        "additionalContext"
+    ] == muse_rename_directive("tmuse")
+    assert json.loads(state_file.read_text()) == {"session-1": "tmuse"}
+
+
+def test_muse_hook_approves_silently_without_a_name(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    tool_input = {"path": "/tmp/note.txt"}
+    result = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env=muse_hook_environment(tmp_path, []),
+        hook_input=muse_hook_input("unknown-session", tool_input),
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": tool_input,
+        }
+    }
+    assert not fake_tmux[1].exists()
+
+
+def test_muse_hook_approves_silently_without_a_database(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    tool_input = {"path": "/tmp/note.txt"}
+    result = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env={
+            "MUSE_SESSION_NAME_DB": str(tmp_path / "missing.db"),
+            "TMUX_AGENT_SESSION_NAMER_STATE_DIR": str(tmp_path / "state"),
+        },
+        hook_input=muse_hook_input("session-1", tool_input),
+    )
+
+    assert result.returncode == 0
+    assert (
+        "additionalContext"
+        not in json.loads(result.stdout)["hookSpecificOutput"]
+    )
+
+
+def test_muse_hook_approves_silently_when_state_is_unwritable(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    tool_input = {"path": "/tmp/note.txt"}
+    result = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env={
+            "MUSE_SESSION_NAME_DB": str(
+                write_muse_name_db(
+                    tmp_path / "session-names.db",
+                    [("tmuse", "session-1", "canonical")],
+                )
+            ),
+            "TMUX_AGENT_SESSION_NAMER_STATE_DIR": str(blocker),
+        },
+        hook_input=muse_hook_input("session-1", tool_input),
+    )
+
+    assert result.returncode == 0
+    assert (
+        "additionalContext"
+        not in json.loads(result.stdout)["hookSpecificOutput"]
+    )
+
+
+def test_muse_hook_says_nothing_without_tool_input(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env=muse_hook_environment(
+            tmp_path,
+            [("tmuse", "session-1", "canonical")],
+        ),
+        hook_input={
+            "hook_event_name": "PreToolUse",
+            "session_id": "session-1",
+        },
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert not fake_tmux[1].exists()
+
+
+def test_muse_hook_answers_without_tmux(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    # Hook runs arrive with a sanitized environment, so the answer
+    # cannot depend on TMUX: the agent addressed by the directive
+    # carries the tmux environment, not the hook.
+    tool_input = {"path": "/tmp/x"}
+    result = run_helper(
+        fake_tmux,
+        "muse-hook",
+        in_tmux=False,
+        extra_env=muse_hook_environment(
+            tmp_path,
+            [("tmuse", "session-1", "canonical")],
+        ),
+        hook_input=muse_hook_input("session-1", tool_input),
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": tool_input,
+            "additionalContext": muse_rename_directive("tmuse"),
+        }
+    }
+    assert not fake_tmux[1].exists()
+
+
+@pytest.fixture
+def muse_home(tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    installed_helper = (
+        home
+        / ".local"
+        / "libexec"
+        / "tmux-agent-session-namer"
+        / "tmux-agent-session-namer"
+    )
+    installed_helper.parent.mkdir(parents=True)
+    installed_helper.symlink_to(HELPER)
+    return home
+
+
+def test_muse_hook_prepends_silent_rename_to_shell_calls(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    tool_input = {"command": "ls -la", "description": "List files"}
+    result = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env=muse_hook_environment(
+            tmp_path,
+            [("tmuse", "session-1", "canonical")],
+        ),
+        hook_input=muse_hook_input("session-1", tool_input, "bash"),
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": {
+                "command": (
+                    'UV_CACHE_DIR="${TMPDIR:-/tmp}/'
+                    'tmux-agent-session-namer-uv" '
+                    "$HOME/.local/libexec/tmux-agent-session-namer/"
+                    "tmux-agent-session-namer muse tmuse "
+                    ">/dev/null 2>&1 || true; ls -la"
+                ),
+                "description": "List files",
+            },
+        }
+    }
+    assert not fake_tmux[1].exists()
+
+
+def test_muse_hook_grants_tmux_sockets_to_shell_calls(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    socket_base, listeners = muse_socket_dir(
+        ["default", "other"], ["dead-server"]
+    )
+    try:
+        tool_input = {"command": "ls -la"}
+        result = run_helper(
+            fake_tmux,
+            "muse-hook",
+            extra_env={
+                **muse_hook_environment(
+                    tmp_path,
+                    [("tmuse", "session-1", "canonical")],
+                ),
+                "TMUX_TMPDIR": str(socket_base),
+            },
+            hook_input=muse_hook_input("session-1", tool_input, "bash"),
+        )
+    finally:
+        for listener in listeners:
+            listener.close()
+        shutil.rmtree(socket_base, ignore_errors=True)
+
+    assert result.returncode == 0
+    updated = json.loads(result.stdout)["hookSpecificOutput"]["updatedInput"]
+    assert updated["unix_socket_paths"] == [
+        os.path.realpath(socket_base / f"tmux-{os.getuid()}" / name)
+        for name in ("default", "other")
+    ]
+
+
+def test_muse_hook_preserves_existing_socket_grants(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    socket_base, listeners = muse_socket_dir(["default"], [])
+    try:
+        tool_input = {
+            "command": "ls -la",
+            "unix_socket_paths": ["/var/run/docker.sock"],
+        }
+        result = run_helper(
+            fake_tmux,
+            "muse-hook",
+            extra_env={
+                **muse_hook_environment(
+                    tmp_path,
+                    [("tmuse", "session-1", "canonical")],
+                ),
+                "TMUX_TMPDIR": str(socket_base),
+            },
+            hook_input=muse_hook_input("session-1", tool_input, "bash"),
+        )
+    finally:
+        for listener in listeners:
+            listener.close()
+        shutil.rmtree(socket_base, ignore_errors=True)
+
+    assert result.returncode == 0
+    updated = json.loads(result.stdout)["hookSpecificOutput"]["updatedInput"]
+    assert updated["unix_socket_paths"] == [
+        "/var/run/docker.sock",
+        os.path.realpath(socket_base / f"tmux-{os.getuid()}" / "default"),
+    ]
+
+
+def test_muse_hook_omits_the_grant_without_sockets(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "tmux-tmp").mkdir()
+    tool_input = {"command": "ls -la"}
+    result = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env=muse_hook_environment(
+            tmp_path,
+            [("tmuse", "session-1", "canonical")],
+        ),
+        hook_input=muse_hook_input("session-1", tool_input, "bash"),
+    )
+
+    assert result.returncode == 0
+    updated = json.loads(result.stdout)["hookSpecificOutput"]["updatedInput"]
+    assert "unix_socket_paths" not in updated
+    assert updated["command"].endswith("|| true; ls -la")
+
+
+def test_muse_hook_quotes_hostile_session_names(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    result = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env=muse_hook_environment(
+            tmp_path,
+            [('a"b c', "session-1", "canonical")],
+        ),
+        hook_input=muse_hook_input("session-1", {"command": "true"}, "bash"),
+    )
+
+    assert result.returncode == 0
+    rewritten = json.loads(result.stdout)["hookSpecificOutput"][
+        "updatedInput"
+    ]["command"]
+    assert rewritten.startswith(
+        'UV_CACHE_DIR="${TMPDIR:-/tmp}/tmux-agent-session-namer-uv" '
+        "$HOME/.local/libexec/tmux-agent-session-namer/"
+        "tmux-agent-session-namer muse 'a\"b c' "
+    )
+    assert rewritten.endswith("|| true; true")
+
+
+def test_muse_hook_leaves_shell_without_command_alone(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    tool_input = {"description": "No command here"}
+    result = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env=muse_hook_environment(
+            tmp_path,
+            [("tmuse", "session-1", "canonical")],
+        ),
+        hook_input=muse_hook_input("session-1", tool_input, "bash"),
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": tool_input,
+        }
+    }
+
+
+def test_muse_hook_rewrites_only_until_the_name_is_reported(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    # The prepend's socket grant prompts on every call that carries it,
+    # so the rewrite fires once per name and later calls pass through
+    # untouched. A rename moves the session to a new name, which reads
+    # as unreported and rewrites again.
+    tool_input = {"command": "pwd"}
+    extra_env = muse_hook_environment(
+        tmp_path,
+        [("tmuse", "session-1", "canonical")],
+    )
+    first = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env=extra_env,
+        hook_input=muse_hook_input("session-1", tool_input, "bash"),
+    )
+    second = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env=extra_env,
+        hook_input=muse_hook_input("session-1", tool_input, "bash"),
+    )
+
+    assert first.returncode == 0
+    assert second.returncode == 0
+    first_updated = json.loads(first.stdout)["hookSpecificOutput"][
+        "updatedInput"
+    ]
+    assert first_updated["command"] != tool_input["command"]
+    assert json.loads(second.stdout) == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": tool_input,
+        }
+    }
+
+    renamed_db = write_muse_name_db(
+        tmp_path / "renamed.db",
+        [("other", "session-1", "canonical")],
+    )
+    third = run_helper(
+        fake_tmux,
+        "muse-hook",
+        extra_env={
+            **extra_env,
+            "MUSE_SESSION_NAME_DB": str(renamed_db),
+        },
+        hook_input=muse_hook_input("session-1", tool_input, "bash"),
+    )
+
+    assert third.returncode == 0
+    third_updated = json.loads(third.stdout)["hookSpecificOutput"][
+        "updatedInput"
+    ]
+    assert third_updated["command"] != tool_input["command"]
+
+
+def test_muse_hook_wrapper_reaches_the_helper(
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+    muse_home: Path,
+) -> None:
+    tool_input = {"path": "/tmp/note.txt"}
+    result = run_helper(
+        fake_tmux,
+        extra_env={
+            "HOME": str(muse_home),
+            **muse_hook_environment(
+                tmp_path,
+                [("tmuse", "session-1", "canonical")],
+            ),
+        },
+        hook_input=muse_hook_input("session-1", tool_input),
+        script=MUSE_HOOK_WRAPPER,
+    )
+
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["hookSpecificOutput"][
+        "additionalContext"
+    ] == muse_rename_directive("tmuse")
