@@ -11,24 +11,24 @@ Use this format only when the user requests a development status report or
 explicitly requests periodic development status reports. Do not initiate
 reports or choose a reporting cadence without that request. Repeat the effort
 block for each active effort. Never use a generic "parallel work" heading. Stop
-reporting an effort once it is complete.
+reporting an effort once it is complete. Include all unmerged commits that are
+done or being worked on.
 
 A short request such as "Status report?" counts as a request when development
 work is active.
 
 ```text
-Status \u2014 YYYY-MM-DD HH:MM TZ
+Status - YYYY-MM-DD HH:MM TZ
 
 <effort-summary> \u2014 <worktree-path>
 
-<commit-number>: <latest-hash>: <brief-commit-name> \u2014 <done|WIP>; <N reviews>; [reviewing|review-pending]; [gating|gate-pending]; [updating|updates-pending];
+<commit-number>: <latest-hash>: <brief-commit-name> - <done|WIP>; <N reviews>; [reviewing|review-pending]; [gating|gate-pending]; [updating|updates-pending];
   [amends <commit-number>];
 
 <activity summary>
 ```
 
-Render each U+2014 escape in the template as an em dash in the report. The
-bracketed fields are optional alternatives, not literal brackets. Omit an
+The bracketed fields are optional alternatives, not literal brackets. Omit an
 inapplicable field and its separator. Timestamp every periodic report with the
 local date, time, and time zone. Summarize recent activity and remaining work
 after each effort's commit list.

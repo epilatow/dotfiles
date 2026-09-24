@@ -52,6 +52,11 @@ apply.
   affected content. Merge approval waives no gate. SHA changes alone do not
   require re-review; follow the independent-review skill's finding-disposition
   rules. Never merge first and test afterward.
+- **Status reports follow the skill.** When the user asks for a development
+  status report (short requests like "Status?" or "Status update?" count when
+  development work is active), follow the repository-local
+  `.agents/skills/repo-shared-development-status-report/SKILL.md` for format
+  and state fields. Do not initiate reports or set a cadence without a request.
 - **Look at file contents, not extensions.** Scripts that have
   `uv run --script` in their shebang are Python scripts, not shell scripts,
   regardless of file extension or lack thereof. Always open the file before
