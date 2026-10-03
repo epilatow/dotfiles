@@ -79,6 +79,13 @@ gate        = "command -v codex"
 env.PATH    = "$PATH:$HOME/.local/bin"
 uuid        = "1610d23a-45f6-4cc6-935b-513d9771b10c"
 
+[job.cleanup-codex-cli]
+script      = "~/.local/libexec/cleanup-codex-cli/cleanup-codex-cli"
+args        = ["--apply"]
+gate        = 'test -d "${CODEX_HOME:-$HOME/.codex}/packages/standalone/releases"'
+env.PATH    = "$PATH:$HOME/.local/bin"
+uuid        = "bd1ea33c-c8cb-40bb-925b-a2fbdc2bba9e"
+
 [job.u-www-gas-prices]
 script    = "~/.local/libexec/gas-prices-breakdown/gas-prices-breakdown"
 args      = ["add-snapshot", "~/home/public_html/gas-prices-breakdown.html"]
@@ -182,7 +189,7 @@ uuid = "82d72cf7-de37-4de3-aaee-eb1ea63b3c56"
 
 [job-group.u-daily]
 schedule = "*-*-* 02:30"
-jobs     = ["u-rs", "u-www", "u-misc"]
+jobs     = ["u-rs", "u-www", "u-misc", "cleanup-codex-cli"]
 uuid = "94593230-26d3-45f5-993b-fc4b352111df"
 
 # ----------------------------------------------------------------------------
