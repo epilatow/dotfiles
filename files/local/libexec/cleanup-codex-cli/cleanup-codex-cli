@@ -1,0 +1,191 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = []
+# ///
+"""Prune superseded standalone Codex CLI releases.
+
+Keep the newest installed version for each target, the current symlink's
+target, and releases with open or mapped files. Only stable release directory
+names are eligible. Unknown and incomplete installations are left alone.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+RELEASE_NAME = re.compile(r"(\d+)\.(\d+)\.(\d+)-([a-z0-9_-]+)")
+
+
+@dataclass(frozen=True)
+class Release:
+    path: Path
+    version: tuple[int, int, int]
+    target: str
+    device: int
+    inode: int
+    modified_ns: int
+
+
+def inventory(root: Path) -> list[Release]:
+    releases: list[Release] = []
+    for path in sorted(root.iterdir()):
+        match = RELEASE_NAME.fullmatch(path.name)
+        if match is None:
+            continue
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode):
+            raise RuntimeError(f"Release is not a real directory: {path}")
+        if not (path / "bin" / "codex").is_file():
+            continue
+        releases.append(
+            Release(
+                path,
+                (int(match[1]), int(match[2]), int(match[3])),
+                match[4],
+                info.st_dev,
+                info.st_ino,
+                info.st_mtime_ns,
+            )
+        )
+    return releases
+
+
+def protected_releases(standalone: Path, releases: list[Release]) -> set[Path]:
+    current = standalone / "current"
+    if not current.is_symlink():
+        raise RuntimeError(f"Expected current symlink: {current}")
+    target = current.resolve(strict=True)
+    if target not in {release.path for release in releases}:
+        raise RuntimeError(
+            f"Current release is outside the inventory: {target}"
+        )
+    newest: dict[str, Release] = {}
+    for release in releases:
+        previous = newest.get(release.target)
+        if previous is None or release.version > previous.version:
+            newest[release.target] = release
+    return {target, *(release.path for release in newest.values())}
+
+
+def active_releases(root: Path) -> set[Path]:
+    """Inspect open files, including mapped executables and helper binaries.
+
+    lsof can exit 1 even with matching records on macOS. Accept that status
+    only without diagnostics; warnings or unexpected output fail closed.
+    NUL fields preserve filenames containing whitespace and newlines.
+    """
+    result = subprocess.run(
+        ["lsof", "-nP", "-F0pn", "+D", str(root)],
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode not in (0, 1) or result.stderr:
+        detail = os.fsdecode(result.stderr).strip()
+        raise RuntimeError(f"Cannot inspect active releases: {detail}")
+    active: set[Path] = set()
+    for field in result.stdout.split(b"\0"):
+        field = field.removeprefix(b"\n")
+        if not field:
+            continue
+        if field.startswith(b"p") and field[1:].isdigit():
+            continue
+        if field.startswith(b"f") and len(field) > 1:
+            continue
+        if not field.startswith(b"n"):
+            raise RuntimeError("Unexpected lsof output; refusing cleanup")
+        path = Path(os.fsdecode(field[1:]))
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            raise RuntimeError(f"Unexpected lsof path: {path}") from None
+        if relative.parts:
+            active.add(root / relative.parts[0])
+    return active
+
+
+def cleanup(standalone: Path, *, apply: bool) -> int:
+    root = standalone / "releases"
+    if not root.exists():
+        print("No standalone Codex releases installed.")
+        return 0
+    if root.is_symlink() or standalone.is_symlink():
+        raise RuntimeError("Standalone and releases must be real directories")
+    descriptor = os.open(
+        standalone / "install.lock",
+        os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+        0o600,
+    )
+    with os.fdopen(descriptor, "r+b") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Installation lock busy; deferring cleanup.")
+            return 0
+        releases = inventory(root)
+        protected = protected_releases(standalone, releases)
+        active = active_releases(root)
+        candidates = [
+            release
+            for release in releases
+            if release.path not in protected | active
+        ]
+        for release in releases:
+            if release.path in protected | active:
+                print(f"Keep: {release.path.name}")
+        for release in candidates:
+            print(f"Candidate: {release.path.name}")
+        if not apply:
+            print(f"Dry run: {len(candidates)} release(s) eligible.")
+            return 0
+        deleted = 0
+        for release in candidates:
+            # Refresh protection immediately before acting on a named entry.
+            fresh = inventory(root)
+            if release not in fresh:
+                raise RuntimeError(f"Release changed: {release.path}")
+            if release.path in (
+                protected_releases(standalone, fresh) | active_releases(root)
+            ):
+                print(f"Keep (now protected): {release.path.name}")
+                continue
+            shutil.rmtree(release.path)
+            deleted += 1
+            print(f"Deleted: {release.path.name}", flush=True)
+        print(f"Deleted {deleted} release(s).")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")),
+        help="Codex data directory (default: CODEX_HOME or ~/.codex)",
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="Delete eligible releases"
+    )
+    args = parser.parse_args(argv)
+    try:
+        standalone = args.codex_home.expanduser().resolve() / "packages"
+        if standalone.is_symlink():
+            raise RuntimeError("Packages must be a real directory")
+        return cleanup(standalone / "standalone", apply=args.apply)
+    except (OSError, RuntimeError) as exc:
+        print(f"cleanup-codex-cli: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
