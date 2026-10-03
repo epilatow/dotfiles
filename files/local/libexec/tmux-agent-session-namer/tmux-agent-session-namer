@@ -133,8 +133,8 @@ class JsonRpcClient:
         if process.stdin is None or process.stdout is None:
             raise OSError("app-server pipes unavailable")
         self.process = process
-        self.stdin = cast(IO[bytes], process.stdin)
-        self.stdout = cast(IO[bytes], process.stdout)
+        self.stdin: IO[bytes] = process.stdin
+        self.stdout: IO[bytes] = process.stdout
         self.pending = b""
 
     def send(self, message: JsonObject) -> None:
