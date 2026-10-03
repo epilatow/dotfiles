@@ -18,6 +18,11 @@ keep-awake           = true
 # timeout-sec          = 3600         # default: 1800 sec (30 min)
 # log-keep-runs        = 30
 
+# A job that sets its own env.PATH replaces this value rather than
+# extending it.
+[defaults.env]
+PATH = "$PATH:$HOME/.local/bin:/opt/homebrew/bin"
+
 [defaults.notify.ntfy]
 transport              = "ntfy"
 url                    = "https://ntfy.drymartini.org/automation-crony"
@@ -37,14 +42,12 @@ headers                = { "Email" = "edp@drymartini.org" }
 # default socket is what local `codex --remote unix://` clients attach to.
 command     = "codex app-server --remote-control --listen unix://"
 gate        = "command -v codex"
-env.PATH    = "$PATH:$HOME/.local/bin"
 daemon      = true
 uuid        = "4c392a33-485b-4a2a-abd6-4d029d151769"
 
 [job.u-bins-brew]
 command     = "brew update && brew upgrade && brew cleanup"
 gate        = "command -v brew"
-env.PATH    = "$PATH:/opt/homebrew/bin"
 platforms   = ["darwin"]
 uuid = "681b903c-2a7b-460d-a940-10e267f8585f"
 
@@ -57,58 +60,52 @@ uuid = "5da77278-c34d-4167-ab27-b53af33d2a48"
 [job.u-bins-rust]
 command     = "rustup self update && rustup update"
 gate        = "command -v rustup"
-env.PATH    = "$PATH:$HOME/.cargo/bin"
+env.PATH    = "$PATH:$HOME/.local/bin:/opt/homebrew/bin:$HOME/.cargo/bin"
 uuid = "aaf152b9-04d9-408e-a401-0d6f9bb74b97"
 
 [job.u-bins-uv]
 command     = "mkdir -p $TMPDIR && uv self update && uv tool upgrade --all"
 gate        = "command -v uv"
-env.PATH    = "$PATH:$HOME/.local/bin"
 env.TMPDIR  = "$HOME/.local/tmp"
 uuid = "de84320f-63a4-4b4e-98d5-51bbc708f5bf"
 
 [job.u-bins-claude]
 command     = "claude upgrade"
 gate        = "command -v claude"
-env.PATH    = "$PATH:$HOME/.local/bin"
 uuid        = "2cc62beb-6eca-4beb-91e4-136bd86a5dfe"
 
 [job.u-bins-codex]
 command     = "codex update"
 gate        = "command -v codex"
-env.PATH    = "$PATH:$HOME/.local/bin"
 uuid        = "1610d23a-45f6-4cc6-935b-513d9771b10c"
 
 [job.cleanup-codex-cli]
 script      = "~/.local/libexec/cleanup-codex-cli/cleanup-codex-cli"
 args        = ["--apply"]
 gate        = 'test -d "${CODEX_HOME:-$HOME/.codex}/packages/standalone/releases"'
-env.PATH    = "$PATH:$HOME/.local/bin"
 uuid        = "bd1ea33c-c8cb-40bb-925b-a2fbdc2bba9e"
 
 [job.u-www-gas-prices]
 script    = "~/.local/libexec/gas-prices-breakdown/gas-prices-breakdown"
 args      = ["add-snapshot", "~/home/public_html/gas-prices-breakdown.html"]
-env.PATH  = "$PATH:$HOME/.local/bin"
 hosts     = ["squee"]
 uuid = "7f5100fa-4af2-437f-8321-82aadc0a0ac1"
 
 [job.u-www-cocktails]
 script    = "$HOME/home/bin/publish_cocktails.sh"
-env.PATH  = "/opt/local/bin:$HOME/common/bin:$PATH"
+env.PATH  = "/opt/local/bin:$HOME/common/bin:$PATH:$HOME/.local/bin:/opt/homebrew/bin"
 hosts     = ["squee"]
 uuid = "c43196ed-2fe5-44b7-9585-42d943960aba"
 
 [job.u-www-recipes]
 script    = "$HOME/home/bin/publish_recipes.sh"
-env.PATH  = "$PATH:/opt/local/bin"
+env.PATH  = "$PATH:$HOME/.local/bin:/opt/homebrew/bin:/opt/local/bin"
 hosts     = ["squee"]
 uuid = "7a3d515e-85cd-4d4b-9fa4-e0d208905547"
 
 [job.u-www-dpmr-cal]
 script    = "~/.local/libexec/dpmr-calendar-scrape/dpmr-calendar-scrape"
 args      = ["~/home/public_html/donner-party-mountain-runners.ics"]
-env.PATH  = "$PATH:$HOME/.local/bin"
 hosts     = ["squee"]
 uuid = "d54ced11-0886-4e33-ac3d-d77974a0a75f"
 
@@ -118,44 +115,35 @@ hosts     = ["squee"]
 uuid = "7695800b-6737-4df5-ab20-07af2cf978d2"
 
 [job.u-rs-self]
-command     = '. "$NVM_DIR/nvm.sh" && cd $REPO && ./bin/repo-shared upgrade-tools --push'
+command     = 'eval "$(fnm env --shell bash)" && cd $REPO && ./bin/repo-shared upgrade-tools --push'
 gate        = "test -d $REPO"
 env.REPO    = "$HOME/src/github.com/epilatow/repo-shared"
-env.PATH    = "$PATH:$HOME/.local/bin"
-env.NVM_DIR = "$HOME/.nvm"
 hosts       = ["squee"]
 uuid = "5e24fcff-bb5b-45ea-8152-1557c5467163"
 
 [job.u-rs-dotfiles]
-command     = '. "$NVM_DIR/nvm.sh" && cd $REPO && ./_repo_shared/repo-shared upgrade --push'
+command     = 'eval "$(fnm env --shell bash)" && cd $REPO && ./_repo_shared/repo-shared upgrade --push'
 gate        = "test -d $REPO"
 env.REPO    = "$HOME/src/github.com/epilatow/dotfiles"
-env.PATH    = "$PATH:$HOME/.local/bin"
-env.NVM_DIR = "$HOME/.nvm"
 hosts       = ["squee"]
 uuid = "56f916de-daa1-4455-aa66-e6cbe5c3399f"
 
 [job.u-rs-ha-bt]
-command     = '. "$NVM_DIR/nvm.sh" && cd $REPO && ./_repo_shared/repo-shared upgrade --push'
+command     = 'eval "$(fnm env --shell bash)" && cd $REPO && ./_repo_shared/repo-shared upgrade --push'
 gate        = "test -d $REPO"
 env.REPO    = "$HOME/src/github.com/epilatow/ha-blueprint-toolkit"
-env.PATH    = "$PATH:$HOME/.local/bin"
-env.NVM_DIR = "$HOME/.nvm"
 hosts       = ["squee"]
 uuid = "9654e112-442f-4ae5-b977-51cf84cd2853"
 
 [job.u-rs-utils]
-command     = '. "$NVM_DIR/nvm.sh" && cd $REPO && ./_repo_shared/repo-shared upgrade --push'
+command     = 'eval "$(fnm env --shell bash)" && cd $REPO && ./_repo_shared/repo-shared upgrade --push'
 gate        = "test -d $REPO"
 env.REPO    = "$HOME/src/github.com/epilatow/utils"
-env.PATH    = "$PATH:$HOME/.local/bin"
-env.NVM_DIR = "$HOME/.nvm"
 hosts       = ["squee"]
 uuid = "70f668b3-e0d5-41d7-b40c-307756703a65"
 
 [job.u-misc-tz]
 command   = "darwin-tz-watchdog"
-env.PATH  = "$PATH:$HOME/.local/bin"
 platforms = ["darwin"]
 uuid = "ca506c3d-0026-4705-a09a-16ecf7881f6c"
 
