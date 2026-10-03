@@ -338,8 +338,11 @@ append_dir_to_var PATH /opt/dtbld/bin
 if [ -z "$NO_HOME" ]; then
 	prepend_dir_to_var PATH "$EDPHOME/.cargo/bin" # rust
 
-	# nvm (for node)
-	if [[ -d "$EDPHOME/.nvm" ]]; then
+	# npm
+	type fnm >/dev/null 2>&1
+	if [[ $? == 0 ]]; then
+	    eval $(fnm env)
+	elif [[ -d "$EDPHOME/.nvm" ]]; then
 	    NVM_DIR=$EDPHOME/.nvm; export NVM_DIR
 	    nvm() { (. $NVM_DIR/nvm.sh; nvm "$@" ) }
 	    nvm_alias=$(cat "$NVM_DIR/alias/default" 2>/dev/null)
