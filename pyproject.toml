@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = "8893eb218faf20cef59548f1fa1072a37329742b" }
+epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = "968a16565a069148e2cb7c9cfd31eb75bcbc228e" }
 
 [tool.mypy]
 # `tests/test_gas_prices_breakdown.py` imports its subject through the
