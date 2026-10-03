@@ -169,7 +169,7 @@ uuid = "ca506c3d-0026-4705-a09a-16ecf7881f6c"
 jobs = ["u-bins-nvm", "u-bins-rust", "u-bins-uv", "u-bins-brew", "u-bins-claude", "u-bins-codex"]
 uuid = "ee2e73e4-f89d-4ebf-af65-6631b32b2365"
 
-[job-group.u-weekly]
+[job-group.weekly]
 schedule = "Mon *-*-* 02:00"
 jobs     = ["u-bins"]
 uuid     = "8c5893d7-bea0-421f-9f95-d36b30775fe2"
@@ -187,7 +187,7 @@ uuid = "4977a66e-4c17-40f4-8e67-03012dce9894"
 jobs     = ["u-misc-tz"]
 uuid = "82d72cf7-de37-4de3-aaee-eb1ea63b3c56"
 
-[job-group.u-daily]
+[job-group.daily]
 schedule = "*-*-* 02:30"
 jobs     = ["u-rs", "u-www", "u-misc", "cleanup-codex-cli"]
 uuid = "94593230-26d3-45f5-993b-fc4b352111df"
@@ -200,10 +200,10 @@ uuid = "94593230-26d3-45f5-993b-fc4b352111df"
 # `jobs` list IS the selection (no inherits / exclude / add).
 
 [target.host.truenas-brittan]
-jobs            = ["u-weekly", "u-daily"]
+jobs            = ["weekly", "daily"]
 
 [target.host.truenas-polaris]
-jobs            = ["u-weekly", "u-daily"]
+jobs            = ["weekly", "daily"]
 
 [target.host.squee]
-jobs            = ["u-weekly", "u-daily", "codex-remote-control"]
+jobs            = ["weekly", "daily", "codex-remote-control"]
