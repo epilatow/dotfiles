@@ -26,6 +26,10 @@ uv run pytest
 
 Repository-local tests live under `tests/`.
 
+Live tmux integration tests use the real `tmux` executable from `PATH` and
+temporary agent stubs; installed agent CLIs are not required. The live Muse
+launch test verifies its stub started before checking session naming.
+
 ### Reaching an extension-less script
 
 The tools under `files/local/libexec/` are shebang scripts with no `.py`

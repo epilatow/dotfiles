@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -244,12 +245,17 @@ def real_tmux_server(
         )
 
 
-def agent_stub(bin_dir: Path, name: str) -> Path:
+def agent_stub(
+    bin_dir: Path, name: str, *, started_marker: Path | None = None
+) -> Path:
     """Write an executable named for an agent launcher that just waits.
 
     It execs, the way tcodex's launcher becomes codex, so a session
     built from one holds a pane whose running command is no longer the
     command tmux recorded starting it with.
+
+    The optional marker acknowledges execution when tmux reports a
+    supervising launcher rather than the stub's process.
 
     Rewriting the file is deliberately skipped when the content already
     matches: `write_text` truncates, and truncating a script that a
@@ -257,7 +263,12 @@ def agent_stub(bin_dir: Path, name: str) -> Path:
     that session.
     """
     stub = bin_dir / name
-    body = f"#!/bin/sh\nexec {AGENT_STUB_COMMAND} 300\n"
+    marker = (
+        f": > {shlex.quote(str(started_marker))}\n"
+        if started_marker is not None
+        else ""
+    )
+    body = f"#!/bin/sh\n{marker}exec {AGENT_STUB_COMMAND} 300\n"
     if not stub.exists() or stub.read_text() != body:
         stub.write_text(body)
         stub.chmod(0o755)
@@ -2207,11 +2218,19 @@ def test_muse_run_renames_once_per_name(
 def test_muse_run_renames_on_a_live_server(
     real_tmux_server: tuple[str, str],
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     real_tmux, server = real_tmux_server
+    host_bin = tmp_path / "hostbin"
+    host_bin.mkdir()
+    host_muse = host_bin / "muse"
+    host_muse.write_text("#!/bin/sh\nexit 97\n")
+    host_muse.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{host_bin}:{os.environ['PATH']}")
     bin_dir = tmp_path / "livebin"
     bin_dir.mkdir()
-    agent_stub(bin_dir, "muse")
+    started_marker = tmp_path / "muse-started"
+    agent_stub(bin_dir, "muse", started_marker=started_marker)
     db = write_muse_name_db(
         tmp_path / "live-names.db",
         [("liveclaim", "live-session", "canonical")],
@@ -2241,6 +2260,9 @@ def test_muse_run_renames_on_a_live_server(
             "muse-run",
         ],
         check=True,
+        # An unattached tmux client supplies a pane's PATH even when the
+        # session has a different PATH set through new-session -e.
+        env={**os.environ, **pane_env},
     )
     details = subprocess.run(
         [
@@ -2258,6 +2280,11 @@ def test_muse_run_renames_on_a_live_server(
         text=True,
     ).stdout.strip()
     socket_path, pane_id = details.split(",")
+    deadline = time.monotonic() + PANE_COMMAND_TIMEOUT_SEC
+    while not started_marker.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError("The intended Muse stub did not start")
+        time.sleep(0.01)
     write_muse_session_log(
         sessions, "live-session", f"$9:@1.{pane_id}", socket_path
     )
