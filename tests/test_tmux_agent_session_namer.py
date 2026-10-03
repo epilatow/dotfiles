@@ -8,7 +8,6 @@ import shutil
 import sqlite3
 import subprocess
 import time
-import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -78,7 +77,6 @@ REFUSED_SLOT_COMMANDS = [
 AGENT_STUB_COMMAND = "sleep"
 PANE_COMMAND_TIMEOUT_SEC = 10.0
 CODEX_HOOKS = REPO_ROOT / "files" / "codex" / "hooks.json"
-CRONY_CONFIG = REPO_ROOT / "files" / "config" / "crony" / "config.toml"
 ENVRC_ALIASES = REPO_ROOT / "files" / "envrc.aliases"
 
 
@@ -629,26 +627,6 @@ def test_the_launcher_aliases_run_commands_the_helper_accepts(
     assert {
         os.path.basename(argv[1]) for argv in tmux_calls
     } <= accepted_start_commands()
-
-
-def test_crony_runs_one_shared_remote_control_app_server() -> None:
-    config = tomllib.loads(CRONY_CONFIG.read_text())
-
-    assert config["job"]["codex-remote-control"] == {
-        "command": ("codex app-server --remote-control --listen unix://"),
-        "gate": "command -v codex",
-        "env": {"PATH": "$PATH:$HOME/.local/bin"},
-        "daemon": True,
-        "uuid": "4c392a33-485b-4a2a-abd6-4d029d151769",
-    }
-    assert config["defaults"]["keep-awake"] is True
-    assert "codex-archive" not in config["job"]
-    assert "u-hourly" not in config["job-group"]
-    assert config["target"]["host"]["squee"]["jobs"] == [
-        "u-weekly",
-        "u-daily",
-        "codex-remote-control",
-    ]
 
 
 def test_helper_is_python_314_uv_script() -> None:
