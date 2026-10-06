@@ -44,6 +44,7 @@ command     = "codex app-server --remote-control --listen unix://"
 gate        = "command -v codex"
 daemon      = true
 uuid        = "4c392a33-485b-4a2a-abd6-4d029d151769"
+flags       = ["full-disk-access"]
 
 [job.u-bins-brew]
 command     = "brew update && NONINTERACTIVE=1 brew upgrade"
