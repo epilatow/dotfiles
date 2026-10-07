@@ -40,8 +40,9 @@ be observed and safely ended, report the mandatory gate as blocked.
 Require all of the following before spawning:
 
 - the candidate is a commit, not uncommitted work;
-- the implementer-owned full suite and quality gates are green on that exact
-  commit;
+- the implementer-owned repo-shared and focused checks are green on that exact
+  commit under DEVELOPMENT_SHARED.md's Testing policy; the final full suite
+  belongs to the landing stage, not each pre-review iteration;
 - the candidate and tested commit resolve to the same full commit object ID;
 - the source checkout is attached to a branch; and
 - the current agent can create and later remove its own temporary branch and
@@ -51,8 +52,8 @@ Require all of the following before spawning:
 
 Resolve the selected revision to its full commit object ID; it may be any
 commit in the development stack and need not be `HEAD`. Refuse an abbreviated
-ID or a candidate that does not match the full tested commit ID. Use the
-attached source branch name in the temporary branch:
+ID or a candidate that does not match the commit validated by the shared and
+focused checks. Use the attached source branch name in the temporary branch:
 
 ```text
 code-review/YYYYMMDD-HHMMSS-<source-branch>-<short-SHA>

@@ -143,11 +143,15 @@ After the replay:
    relevant to each changed, amended, or conflict-resolved commit as it is
    reconstructed, before replaying its descendants. Run the relevant gates on
    the completed tip, unless its tree and gate commands match an already-green
-   exact candidate. Markdown-only changes need the Markdown/formatting gates;
+   exact candidate. These are shared and focused development checks; apply
+   DEVELOPMENT_SHARED.md's Testing policy for the final landing full run and
+   isolated failures. Markdown-only changes need the Markdown/formatting gates;
    changes to repo code or tests need their applicable repo gates. Do not rerun
-   gates for unchanged commits merely because their object IDs changed. If a
-   failure was not introduced by the commit under test, use a binary chop to
-   find the commit that introduced it.
+   gates for unchanged commits merely because their object IDs changed. If an
+   isolated failure passes on rerun, analyze whether this change could have
+   caused it before accepting a flake. Do not start a full-suite or historical
+   binary-chop loop for a documented non-regression flake. Investigate history
+   only when evidence makes it relevant to root-causing an actual regression.
 6. Apply the repository's independent-review rules.
 
 Keep the backup branch until the user has accepted the rewritten stack or the

@@ -355,7 +355,7 @@ dependencies = [
 requires-dist = [
     { name = "beautifulsoup4" },
     { name = "curl-cffi" },
-    { name = "epilatow-repo-shared", git = "https://github.com/epilatow/repo-shared?rev=968a16565a069148e2cb7c9cfd31eb75bcbc228e" },
+    { name = "epilatow-repo-shared", git = "https://github.com/epilatow/repo-shared?rev=caa3fcffd4cd920d8d24b35a6dd71bda921ee77e" },
     { name = "icalendar", specifier = ">=7.0" },
     { name = "openpyxl" },
     { name = "pdfplumber" },
@@ -366,7 +366,7 @@ requires-dist = [
 [[package]]
 name = "epilatow-repo-shared"
 version = "0.1.0"
-source = { git = "https://github.com/epilatow/repo-shared?rev=968a16565a069148e2cb7c9cfd31eb75bcbc228e#968a16565a069148e2cb7c9cfd31eb75bcbc228e" }
+source = { git = "https://github.com/epilatow/repo-shared?rev=caa3fcffd4cd920d8d24b35a6dd71bda921ee77e#caa3fcffd4cd920d8d24b35a6dd71bda921ee77e" }
 dependencies = [
     { name = "mdformat" },
     { name = "mdformat-frontmatter" },

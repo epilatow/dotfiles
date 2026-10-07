@@ -130,6 +130,41 @@ or side effects, or flag invariants the type system can't enforce.
 
 - Add tests for new functionality. A change that adds a feature without a test
   is incomplete.
+- During development, run the repo-shared tests and focused tests for the
+  changed behavior, its callers, and shared dependencies. Include relevant
+  end-to-end and platform checks, but do not run unrelated suites merely
+  because they exist in the same repository. Respect GUI and integration opt-in
+  flags; background runs must not display unrequested pop-ups.
+- Green shared and focused checks are sufficient for development and
+  independent review. Run the repository's full suite once before landing,
+  after the change and review fixes are settled. Use its normal defaults;
+  enable additional gated suites only when relevant or explicitly requested.
+- Reuse passing results while the tested content, commands, and conditions
+  remain applicable. After a narrow fix, rerun affected checks. A new commit
+  hash alone does not require another full run; repeat the full suite only when
+  changes or conditions invalidate its coverage.
+
+### Isolated test failures
+
+Let a full run finish and preserve its original results. If only one test
+fails, rerun that test on the same candidate with equivalent test settings and
+conditions. Do not restart the full suite or repeatedly retry to obtain a pass.
+
+A passing rerun alone does not prove harmless flakiness. Analyze the original
+failure and rerun, tracing changed code, callers, fixtures, dependencies, and
+environment or timing effects. An unchanged test is not sufficient evidence
+that the change could not have caused its failure.
+
+If all other required checks completed successfully and the analysis finds no
+plausible regression introduced by the change, flag the test as flaky and
+consider the gates green without another full run. Report the test ID, original
+failure, rerun command and result, and the evidence supporting that decision;
+retain the original non-zero exit status in the test record.
+
+If a plausible regression remains, keep the gates non-green and root cause the
+failure. Fix the issue and rerun affected checks; broaden testing when the
+cause or fix warrants it. A test that fails again does not qualify for the
+passing-rerun exception.
 
 ## Markdown style
 

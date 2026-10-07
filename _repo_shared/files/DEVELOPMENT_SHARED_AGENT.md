@@ -35,23 +35,26 @@ apply.
   the owning commit and rerun the audit before testing. This implementer-owned
   audit does not replace independent review.
 - **A green implementer-owned gate precedes review.** After the
-  authored-context audit, run the tests and quality gates relevant to the
-  committed change. When the repository requires its full suite, use the
+  authored-context audit, run repo-shared and focused checks relevant to the
+  committed change, following [Testing](DEVELOPMENT_SHARED.md#testing). Use the
   repository-local `.agents/skills/repo-shared-run-commit-gates/SKILL.md` for
-  that exact commit. Do not give a reviewer a commit with red applicable gates.
-- **Gate each new commit, not just the tip.** Run applicable gates on every new
-  commit in a stack with no later commits present. For a previously green
-  rewrite, follow the rewrite skill's affected-commit and final-tip rule.
+  that exact commit. Review does not require an early full-suite run. Do not
+  give a reviewer a commit with red applicable gates.
+- **Gate each new commit, not just the tip.** Run shared and focused checks on
+  every new commit in a stack with no later commits present; the final full
+  suite covers the settled tip before landing. For a previously green rewrite,
+  follow the rewrite skill's affected-commit and final-tip rule.
 - **An independent code review precedes handoff.** Once the gates are green,
   the implementing agent spawns the reviewer itself, unasked. An unreviewed
   branch is not ready to hand off as finished. See [Code review](#code-review).
-- **A green exact-candidate gate precedes every merge.** The pre-review result
-  counts if neither content nor applicable gate commands changed. After review
-  fixes, rerun affected gates on the settled tip and changed earlier commits as
-  required by the rewrite skill. If the base moved, gate the integrated tip for
-  affected content. Merge approval waives no gate. SHA changes alone do not
-  require re-review; follow the independent-review skill's finding-disposition
-  rules. Never merge first and test afterward.
+- **A green landing gate precedes every merge.** Run the full suite on the
+  settled candidate before landing. Reuse applicable passing results and rerun
+  affected checks after narrow fixes or base changes. Apply the isolated-test
+  failure policy in [Testing](DEVELOPMENT_SHARED.md#isolated-test-failures); a
+  qualifying non-regression flake is green without another full run. Record
+  which commits the evidence covers. Merge approval waives no gate. SHA changes
+  alone do not require re-review; follow the independent-review skill's
+  finding-disposition rules. Never merge first and test afterward.
 - **Status reports follow the skill.** When the user asks for a development
   status report (short requests like "Status?" or "Status update?" count when
   development work is active), follow the repository-local
@@ -427,10 +430,10 @@ saved under [Skill-owned review procedure](#skill-owned-review-procedure).
 ## Code review
 
 After each agent-driven develop / commit / committed-change audit / green
-full-suite pre-review gate, the implementing agent runs one independent review
-of the exact audited and tested commit, including doc-only and lint-config
-commits. The target need not be `HEAD`. Review precedes user review and
-handoff. The reviewer may run focused tests but not the full suite.
+shared-and-focused pre-review gate, the implementing agent runs one independent
+review of the exact audited and tested commit, including doc-only and
+lint-config commits. The target need not be `HEAD`. Review precedes user review
+and handoff. The reviewer may run focused tests but not the full suite.
 
 Complete the review before acting on findings. Resolve findings in their owning
 commits and rerun affected gates. Before deciding how to handle a finding,
