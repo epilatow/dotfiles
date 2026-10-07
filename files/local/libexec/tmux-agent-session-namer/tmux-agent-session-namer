@@ -26,6 +26,10 @@ and after every rename. An empty name renames to the bare agent and
 slot -- the form a session keeps until a real name exists, which is
 how pi and opencode sessions first name themselves.
 
+The tmux-codex-remote shell launcher runs codex-client to configure
+the pane, then execs Codex after this helper and its uv parent exit.
+Codex session-start and stop hooks use codex-hook to update the name.
+
 A muse-run run supervises a Muse session the tmuse way: tmux starts
 this helper as the pane command, the helper forks a watcher child,
 and the parent execs `muse`, so the pane process itself is the agent.
@@ -77,14 +81,15 @@ TMUX_SLOT_LOCK = "tmux-agent-session-namer-slots"
 SESSION_AGENT_OPTION = "@agent_namer"
 # What tmux must have started a pane with for the session to be named:
 # an agent CLI launched directly (claude via tclaude, pi via tpi,
-# opencode via topencode), or this helper, which is how tcodex launches
-# codex and tmuse launches muse.
+# opencode via topencode), the tcodex shell launcher, or this helper
+# as the tmuse launcher.
 AGENT_START_COMMANDS = frozenset(
     (
         "claude",
         "opencode",
         "pi",
         "tmux-agent-session-namer",
+        "tmux-codex-remote",
     )
 )
 STATUS_RIGHT = (
@@ -105,7 +110,6 @@ class Invocation(StrEnum):
     CLAUDE = "claude"
     CODEX_CLIENT = "codex-client"
     CODEX_HOOK = "codex-hook"
-    CODEX_REMOTE = "codex-remote"
     MUSE_RUN = "muse-run"
     OPENCODE = "opencode"
     PI = "pi"
@@ -775,12 +779,12 @@ def _watch_once(pane: str, reported: set[tuple[str, str]]) -> bool:
 def _muse_run(args: list[str]) -> int:
     """Run Muse as this pane's process and track its session name.
 
-    The supervisor shape, after codex-remote: tmux starts this helper
-    as the pane command. The helper forks a watcher child, then the
-    parent execs `muse`, so the pane process itself is the agent and
-    interactive signals need no forwarding: Ctrl-C reaches muse
-    directly, while the watcher ignores its copy the way any
-    background observer may, since it spawns nothing interactive.
+    Tmux starts this helper as the pane command. The helper forks a
+    watcher child, then the parent execs `muse`, so the Python process
+    itself becomes the agent. Interactive signals need no forwarding:
+    Ctrl-C reaches muse directly, while the watcher ignores its copy
+    the way any background observer may, since it spawns nothing
+    interactive.
     Naming driven by tool calls can never reach zero-tool sessions,
     so without the watcher nothing would rename them. The watcher
     exits when its parent is gone or the pane dies, so no process
@@ -877,8 +881,6 @@ def _parse_invocation(argv: list[str]) -> Invocation | None:
         invocation = Invocation(argv[0])
     except ValueError:
         return None
-    if invocation is Invocation.CODEX_REMOTE:
-        return invocation
     if invocation is Invocation.MUSE_RUN:
         return invocation
     if invocation in NAME_ARGUMENT_INVOCATIONS:
@@ -911,20 +913,6 @@ def main(argv: list[str] | None = None) -> int:
     else:
         agent = Agent.CODEX
     if agent is Agent.CODEX:
-        if invocation is Invocation.CODEX_REMOTE:
-            _configure_tmux(agent)
-            os.execvp(
-                "codex",
-                [
-                    "codex",
-                    "--remote",
-                    "unix://",
-                    "-c",
-                    'tui.terminal_title=["thread-title"]',
-                    *invocation_args[1:],
-                ],
-            )
-
         if invocation is Invocation.CODEX_CLIENT:
             _configure_tmux(agent)
             return 0

@@ -28,7 +28,9 @@ Repository-local tests live under `tests/`.
 
 Live tmux integration tests use the real `tmux` executable from `PATH` and
 temporary agent stubs; installed agent CLIs are not required. The live Muse
-launch test verifies its stub started before checking session naming.
+launch test verifies its stub started before checking session naming. The live
+Codex launch test verifies that the pane process becomes the agent and that its
+isolated uv cache lock is available while the agent runs.
 
 ### Reaching an extension-less script
 

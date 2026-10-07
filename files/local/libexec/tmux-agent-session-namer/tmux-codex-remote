@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+
+# Let uv release its cache lock before this pane becomes the Codex client.
+"$(dirname "$0")/tmux-agent-session-namer" codex-client
+exec codex --remote unix:// -c 'tui.terminal_title=["thread-title"]' "$@"

@@ -15,8 +15,7 @@ alias tclauded="tclaude --dangerously-skip-permissions"
 tcodex()
 {
 	tmux new \
-	    "$HOME/.local/libexec/tmux-agent-session-namer/tmux-agent-session-namer" \
-	    codex-remote "$@"
+	    "$HOME/.local/libexec/tmux-agent-session-namer/tmux-codex-remote" "$@"
 }
 tcodexd()
 {

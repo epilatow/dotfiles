@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ast
+import fcntl
 import json
 import os
 import shlex
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -27,6 +29,7 @@ HELPER = (
     / "tmux-agent-session-namer"
     / "tmux-agent-session-namer"
 )
+CODEX_LAUNCHER = HELPER.with_name("tmux-codex-remote")
 CLAUDE_WRAPPER = (
     REPO_ROOT
     / "files"
@@ -482,7 +485,7 @@ esac
     path.chmod(0o755)
 
 
-def test_remote_mode_configures_tmux_client_before_codex(
+def test_remote_launcher_configures_tmux_client_before_codex(
     tmp_path: Path,
     fake_tmux: tuple[Path, Path],
 ) -> None:
@@ -497,11 +500,12 @@ def test_remote_mode_configures_tmux_client_before_codex(
             "PATH": f"{bin_dir}:{env['PATH']}",
             "TMUX": "/tmp/tmux,fake,0",
             "TMUX_PANE": "%0",
+            "FAKE_TMUX_START": f"{CODEX_LAUNCHER} resume",
         },
     )
 
     result = subprocess.run(
-        [str(HELPER), "codex-remote", "resume", "thread id"],
+        [str(CODEX_LAUNCHER), "resume", "thread id", "", "--foo=a b"],
         check=False,
         capture_output=True,
         env=env,
@@ -517,8 +521,91 @@ def test_remote_mode_configures_tmux_client_before_codex(
     assert any(call.startswith("tmux\trename-session") for call in calls)
     assert calls[-1] == (
         "codex\t--remote\tunix://\t-c\t"
-        'tui.terminal_title=["thread-title"]\tresume\tthread id'
+        'tui.terminal_title=["thread-title"]\tresume\tthread id\t\t--foo=a b'
     )
+
+
+def test_remote_launcher_releases_cache_and_becomes_pane_process(
+    real_tmux_server: tuple[str, str],
+    fake_tmux: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    real_tmux, server = real_tmux_server
+    bin_dir, _log = fake_tmux
+    pid_file = tmp_path / "codex.pid"
+    codex = bin_dir / "codex"
+    codex.write_text(
+        '#!/bin/sh\nprintf "%s" "$$" > "$CODEX_PID_FILE"\n'
+        f"exec {AGENT_STUB_COMMAND} 300\n"
+    )
+    cache_dir = tmp_path / "uv-cache"
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "CODEX_PID_FILE": str(pid_file),
+        "UV_CACHE_DIR": str(cache_dir),
+        "UV_PYTHON": sys.executable,
+        "UV_PYTHON_DOWNLOADS": "never",
+    }
+    pane_id, pane_pid = (
+        subprocess.run(
+            [
+                real_tmux,
+                "-L",
+                server,
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id},#{pane_pid}",
+                str(CODEX_LAUNCHER),
+            ],
+            check=True,
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+        .stdout.strip()
+        .split(",")
+    )
+
+    wait_for_pane_command(real_tmux_server, pane_id, AGENT_STUB_COMMAND)
+    assert pid_file.read_text() == pane_pid
+    assert read_session_option(real_tmux_server, "@agent_namer") == "codex"
+    with (cache_dir / ".lock").open("rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+@pytest.mark.parametrize("setup_status", [0, 23])
+def test_remote_launcher_propagates_setup_and_codex_status(
+    tmp_path: Path,
+    setup_status: int,
+) -> None:
+    # Install beside a path containing spaces, as with the deployed libexec.
+    install_dir = tmp_path / "helper directory"
+    install_dir.mkdir()
+    launcher = install_dir / CODEX_LAUNCHER.name
+    launcher.write_text(CODEX_LAUNCHER.read_text())
+    launcher.chmod(0o755)
+    helper = install_dir / HELPER.name
+    helper.write_text(f"#!/bin/sh\nexit {setup_status}\n")
+    helper.chmod(0o755)
+    marker = tmp_path / "codex-started"
+    codex = install_dir / "codex"
+    codex.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 37\n")
+    codex.chmod(0o755)
+
+    result = subprocess.run(
+        [str(launcher)],
+        check=False,
+        capture_output=True,
+        env={**os.environ, "PATH": f"{install_dir}:{os.environ['PATH']}"},
+        text=True,
+    )
+
+    assert result.returncode == (setup_status or 37)
+    assert marker.exists() is (setup_status == 0)
 
 
 def test_envrc_tcodex_functions_preserve_arguments(tmp_path: Path) -> None:
@@ -550,15 +637,14 @@ def test_envrc_tcodex_functions_preserve_arguments(tmp_path: Path) -> None:
         text=True,
     )
 
-    helper = (
-        f"{home}/.local/libexec/tmux-agent-session-namer/"
-        "tmux-agent-session-namer"
+    launcher = (
+        f"{home}/.local/libexec/tmux-agent-session-namer/tmux-codex-remote"
     )
     assert result.returncode == 0
     assert log.read_text().splitlines() == [
-        f"tmux\tnew\t{helper}\tcodex-remote\tresume\tthread id",
+        f"tmux\tnew\t{launcher}\tresume\tthread id",
         (
-            f"tmux\tnew\t{helper}\tcodex-remote\t"
+            f"tmux\tnew\t{launcher}\t"
             "--dangerously-bypass-approvals-and-sandbox\t--foo"
         ),
     ]
@@ -589,8 +675,8 @@ def test_the_launcher_aliases_run_commands_the_helper_accepts(
     # under expand_aliases and only on input parsed after the alias
     # exists, hence the eval. A sh without either lands on the count
     # assertions below rather than passing quietly. tmuse and tmused
-    # start the helper as the pane command, like tcodex does; the rest
-    # run their agent directly.
+    # start the helper as the pane command; tcodex starts its shell
+    # launcher, and the rest run their agent directly.
     result = subprocess.run(
         [
             "/bin/sh",
@@ -622,7 +708,7 @@ def test_the_launcher_aliases_run_commands_the_helper_accepts(
         [helper, "muse-run", "--yolo", "--foo"],
         ["pi"],
         ["opencode"],
-        [helper, "codex-remote"],
+        [f"{helper_dir}/tmux-codex-remote"],
     ]
     assert {
         os.path.basename(argv[1]) for argv in tmux_calls
@@ -1283,7 +1369,7 @@ def test_an_agent_started_inside_a_session_keeps_the_owners_naming(
         (
             (
                 "/home/u/.local/libexec/tmux-agent-session-namer"
-                "/tmux-agent-session-namer codex-remote resume"
+                "/tmux-codex-remote resume"
             ),
             True,
         ),
