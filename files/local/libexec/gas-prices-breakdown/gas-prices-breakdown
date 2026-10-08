@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.15,<3.16"
-# dependencies = ["openpyxl", "pdfplumber", "xlrd"]
+# dependencies = ["openpyxl", "pdfplumber", "xlrd", "pydantic>=2", "curl_cffi"]
 # ///
 """Manage SNAPSHOTS and embedded markdown in gas-price-breakdown.html.
 
@@ -9,11 +9,21 @@ Subcommands:
   list-snapshots HTML
       Print one line per snapshot: date, state count, notes preview.
 
-  add-snapshot HTML [--target DATE] [--baseline DATE] [--dry-run]
-      Fetch live data and append a snapshot for DATE (default: most recent
-      Thursday). Every priced column is fetched for DATE; the BASELINE
-      snapshot supplies only the row scaffolding -- state names, ordering,
-      and the non-tax entries of states with no priced program.
+  add-snapshot HTML [--target DATE] [--agent CLI] [--model NAME] [--dry-run]
+      Collect and checkpoint data for DATE, invoke the amendment skill,
+      validate its structured result, calculate and append a snapshot.
+      --inputs reuses saved collected data; --state-dir retains run artifacts.
+      --research selects the explicit manual research workflow instead.
+
+  research-template [--target DATE] [--schema | --tax-baseline]
+      Print seed research, its schema, or the selected EIA tax baseline.
+
+  research-source URL [URL ...] [--cache-dir PATH]
+      Retrieve primary documents and retain readable text for evidence.
+
+  validate-research JSON [--target DATE] [--cache-dir PATH]
+      Validate the tax baseline and independently retrieve cited evidence,
+      without fetching price feeds or modifying the page.
 
   remove-snapshot HTML SNAPSHOT_DATE [--dry-run]
       Remove the snapshot whose `date` field is SNAPSHOT_DATE.
@@ -23,31 +33,30 @@ Subcommands:
 
 Data sources:
   Fetched live: AAA state-averages (retail), EIA's federal and state
-  motor fuel tax table, Indiana's gasoline use tax notice, EIA spot
+  motor fuel tax table, Indiana's gasoline use tax notice, Ohio's quarterly
+  PAT tax base, EIA spot
   benchmarks (see EIA_SPOT_SERIES for what they price), the daily
   California LCFS credit assessment (see LCFS_MONITOR_URL for why it is
   not CARB's own series), Oregon DEQ CFP credit-transfer xlsx. Each
   carries a freshness bound; a run fails rather than publish a figure
   too old to describe the date being snapshotted.
 
-  Hand-maintained tables (need quarterly human update): CARB cap-and-invest
-  auction settlements (CARB_CCA_AUCTIONS), Washington CCA auction
-  settlements (WA_CCA_AUCTIONS). A run fails rather than publish from a
-  table whose newest entry is older than CCA_STALE_DAYS.
+  Numeric collectors retrieve published maintained rates and certified
+  CARB/Washington auction results. Retained tables supply dated context.
+  Unknown source formats become explicit amendment requests; required
+  inputs cannot remain unresolved in a successful result.
 
-  Hand-maintained and checked by date rather than by age: the tax
-  suspensions, holidays and reductions (STATE_TAX_ADJUSTMENTS, plus
+  Researched and checked by date rather than by age: the tax and fee
+  corrections (STATE_TAX_ADJUSTMENTS, plus
   IN_EXCISE_SUSPENSIONS and IN_GUT_SUSPENSIONS for the one state whose
-  two taxes were suspended separately). A published rate table says
-  what a tax is, not whether anyone is collecting it, and its notes
-  are not a reliable index of the difference, so these are swept for
-  directly. A run outside TAX_ADJUSTMENTS_CHECKED_FROM..THROUGH fails
-  rather than assert that no override was in force.
+  two taxes were suspended separately). The amendment pass checks
+  applicable changes using collected data and retained sourced rules.
+  Unchanged published inputs do not require a fresh 51-state transcription.
+  The amended blob, rather than the harness exit code, declares success
+  or failure and explains changes or unresolved inputs.
 
-  Delaware's gross-receipts rate (DE_HSCA_RATES) is hand-maintained
-  and checked by date too, but on its own rule rather than the sweep's:
-  the state resets it every January 1, so the table must carry an entry
-  for the calendar year being priced.
+  Delaware's gross-receipts rate requires a published target-year entry;
+  the agent checks its annual notice when no applicable retained rate exists.
 
   The EIA spot benchmarks need an API key, read at run time from
   EIA_API_KEY_PATH. The tax table itself does not.
@@ -59,7 +68,8 @@ Exit status:
      describe it, or, for a --target backfill, not reaching back that
      far. Each fetch is retried (see HTTP_ATTEMPTS) before the run gives
      up, and the failure is reported as error lines rather than a
-     traceback.
+     traceback. Invalid research, an overlapping update, and file I/O
+     failures also return 1.
   2  Bad invocation, or a snapshot the arguments name that the file
      does not contain.
 
@@ -69,27 +79,65 @@ Exit status:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import gzip
+import hashlib
 import http.client
+import io
 import json
 import logging
+import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from enum import StrEnum
+from functools import partial
+from html.parser import HTMLParser
 from pathlib import Path
+from typing import TypedDict
 
 import openpyxl  # type: ignore[import-untyped]
 import pdfplumber
 import xlrd  # type: ignore[import-untyped]
+from curl_cffi import requests as source_requests
+from curl_cffi.requests.exceptions import (
+    CertificateVerifyError,
+    RequestException,
+)
 from pdfplumber.utils.exceptions import PdfminerException
+from pydantic import Field, JsonValue, TypeAdapter, ValidationError
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gas_prices_agent import AgentCli, AgentError, agent_command, run_agent
+from gas_prices_collectors import PrimaryDocument, collect_maintained
+from gas_prices_research import (
+    FEE_ALLOCATION_POLICY,
+    Adjustment,
+    Auction,
+    DatedRate,
+    ResearchData,
+    ResearchModel,
+    ReviewOutcome,
+    SourceEvidence,
+    StateReview,
+    Suspension,
+    excluded_fee_source,
+    official_url,
+    required_topics,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -122,13 +170,10 @@ USER_AGENT = (
 # CARB Cap-and-Invest joint-auction current-vintage settlement prices.
 # Source: the program page below, whose "Summary of California-Quebec
 # Joint Auction Settlement Prices and Results" (results_summary.pdf)
-# carries the settlement price. Auctions run Feb / May / Aug / Nov; add
-# the new settlement here within the quarter, or the next run fails
-# (see CCA_STALE_DAYS).
-CARB_CCA_PROGRAM_URL = (
-    "https://ww2.arb.ca.gov/our-work/programs/cap-and-trade-program/"
-    "auction-information"
-)
+# carries the settlement price. Auctions run Feb / May / Aug / Nov.
+# These are embedded fallback entries; --research supplies refreshed
+# settlements for scheduled runs.
+CARB_CCA_PROGRAM_URL = "https://ww2.arb.ca.gov/our-work/programs/cap-and-trade-program/auction-information"
 CARB_CCA_AUCTIONS: list[tuple[date, float, str]] = [
     (date(2025, 11, 19), 28.32, "Nov 2025 Joint Auction #45"),
     (date(2026, 2, 18), 27.94, "Feb 2026 Joint Auction #46"),
@@ -139,7 +184,7 @@ CARB_CCA_AUCTIONS: list[tuple[date, float, str]] = [
 # Washington Climate Commitment Act allowance auction settlements.
 # Source: the program page below, whose per-auction Summary Report
 # carries the settlement price, the auction date, and the certification
-# date. Quarterly; same maintenance obligation as the CARB table above.
+# date. These quarterly entries are the fallback when --research is absent.
 WA_CCA_PROGRAM_URL = (
     "https://ecology.wa.gov/air-climate/climate-commitment-act/"
     "cap-and-invest/auctions-and-market"
@@ -190,28 +235,9 @@ CCA_FACTOR_MT_PER_GAL = 0.00878  # CA: MT/gal CO2 (CARB-documented)
 WA_FACTOR = 0.52 / 65.26  # WA: $/gal per $/allowance (Mar 2026 anchor)
 OR_FACTOR = 0.10 / 43.73  # OR: $/gal per $/credit (Jan 2025 anchor)
 
-# California LCFS credit price.
-#
-# CARB's own weekly credit transfer reports are the authoritative series
-# -- a volume-weighted average of transfers that actually completed --
-# and they are what this script used until CARB stopped publishing them.
-# The last report covers the week of 2026-07-20, and the monthly series
-# and the LCFS Data Dashboard stop at the same point. Nothing newer has
-# appeared on any of the three.
-#
-# So the price comes instead from the daily Argus assessment that Neste
-# republishes in its LCFS monitor, which offers an export of the series.
-# That is a broker assessment rather than a transacted average, and the
-# two do not agree exactly: over the weeks where both existed the
-# assessment ran a few percent above CARB. A few percent of a component
-# that is itself around three percent of the pump price is far smaller
-# than the error in quoting a July price in September, which is the only
-# alternative CARB's silence leaves.
-#
-# If CARB resumes publishing, whether to switch back is worth revisiting
-# -- this is not meant as a permanent replacement for the regulator's own
-# numbers.
-LCFS_LAST_CARB_WEEK = date(2026, 7, 20)
+# Neste republishes the daily Argus LCFS price assessment as an export.
+# An assessment and CARB's average of completed transfers measure different
+# things; neither establishes the pass-through paid by a retail customer.
 LCFS_MONITOR_URL = "https://ir-service.appspot.com/v/nesteoil/monitor/LCFS/en"
 # `r` is the monitor's cache-buster, not a revision of the series: any
 # value returns the same bytes, so it is not pinning an old export.
@@ -237,10 +263,7 @@ AAA_STALE_DAYS = 3
 # in the month it falls. The limit sits about a month past that worst
 # case, which is enough to tell a late publication from a stopped one.
 OR_CFP_STALE_DAYS = 125
-OR_CFP_URL = (
-    "https://www.oregon.gov/deq/ghgp/Documents/"
-    "CFPCreditTransferActivityReport.xlsx"
-)
+OR_CFP_URL = "https://www.oregon.gov/deq/ghgp/Documents/CFPCreditTransferActivityReport.xlsx"
 # The program's own landing page, cited on the page beside the figure;
 # the xlsx above is what the run actually reads.
 OR_CFP_PROGRAM_URL = (
@@ -305,7 +328,7 @@ IN_GUT_STALE_DAYS = 70
 # and the citation has to become per-snapshot.
 IN_OIL_INSPECTION_FEE = 0.01
 IN_OIL_INSPECTION_SOURCE_URL = (
-    "https://iga.in.gov/laws/2026/ic/titles/16#16-44-2-18"
+    "https://iga.in.gov/ic/2026/Title_16/Article_44/Chapter_2.pdf"
 )
 IN_EXCISE_SOURCE_URL = (
     "https://www.in.gov/dor/business-tax/fuel-tax/gasoline-tax/"
@@ -326,10 +349,10 @@ IN_EXCISE_SOURCE_URL = (
 # tax is reset monthly and the two halves were suspended on different
 # dates. Each entry is (start, end inclusive, authority).
 IN_EXCISE_SUSPENSIONS: list[tuple[date, date, str]] = [
-    (date(2026, 5, 6), date(2026, 10, 5), "EO 26-11 through 26-25-1"),
+    (date(2026, 5, 6), date(2026, 11, 4), "EO 26-11 through 26-33"),
 ]
 IN_GUT_SUSPENSIONS: list[tuple[date, date, str]] = [
-    (date(2026, 4, 8), date(2026, 10, 5), "EO 26-09 through 26-25-1"),
+    (date(2026, 4, 8), date(2026, 11, 4), "EO 26-09 through 26-33"),
 ]
 IN_SUSPENSION_NOTICE_URL = (
     "https://www.in.gov/dor/i-am-a/business-corp/gasoline-use-tax/"
@@ -338,11 +361,11 @@ IN_SUSPENSION_NOTICE_URL = (
 
 @dataclass(frozen=True)
 class TaxAdjustment:
-    """A legislative override of a published rate, for one window.
+    """A correction to a published tax or fee rate, for one window.
 
     `usd_per_gal` is signed and added to the figure the tax table
-    publishes, so a suspension or holiday is negative. Every state but
-    Indiana resolves to one such figure; Indiana's two taxes were
+    publishes: relief is negative and a missing fee is positive. Every
+    state but Indiana resolves to one such figure; Indiana's two taxes were
     suspended on different dates and its use tax moves monthly, so it is
     composed from its parts instead.
     """
@@ -356,6 +379,14 @@ class TaxAdjustment:
 
 
 STATE_TAX_ADJUSTMENTS: list[TaxAdjustment] = [
+    TaxAdjustment(
+        state="CO",
+        start=date(2026, 10, 1),
+        end=date(2027, 6, 30),
+        usd_per_gal=-0.003125,
+        authority="Environmental Response Surcharge rate change",
+        source_url="https://tax.colorado.gov/fuel-tax-and-fee-rates",
+    ),
     # Georgia suspended the excise under O.C.G.A. 48-9-3 outright. The
     # underground storage tank fee is levied elsewhere and is not an
     # excise, so it kept being collected.
@@ -365,6 +396,15 @@ STATE_TAX_ADJUSTMENTS: list[TaxAdjustment] = [
         end=date(2026, 6, 2),
         usd_per_gal=-0.333,
         authority="HB 1199, extended by EO 05.15.26.02",
+        source_url="https://dor.georgia.gov/"
+        "2026-suspension-georgia-motor-fuel-taxes-faqs",
+    ),
+    TaxAdjustment(
+        state="GA",
+        start=date(2026, 9, 29),
+        end=date(2026, 11, 5),
+        usd_per_gal=-0.333,
+        authority="EO 09.28.26.01, extended by EO 10.06.26.01",
         source_url="https://dor.georgia.gov/"
         "2026-suspension-georgia-motor-fuel-taxes-faqs",
     ),
@@ -382,11 +422,29 @@ STATE_TAX_ADJUSTMENTS: list[TaxAdjustment] = [
     TaxAdjustment(
         state="KY",
         start=date(2026, 5, 11),
-        end=date(2026, 6, 30),
+        end=date(2026, 6, 10),
         usd_per_gal=-0.10,
-        authority="EO 2026-235",
-        source_url="https://revenue.ky.gov/Business/Motor-Fuels-Tax/"
-        "Pages/default.aspx",
+        authority="EO 2026-235 (statewide; later extension was local only)",
+        source_url="https://www.kentucky.gov/Pages/Activity-stream.aspx?"
+        "n=GovernorBeshear&prId=2770",
+    ),
+    TaxAdjustment(
+        state="MN",
+        start=date(2026, 7, 1),
+        end=date(2026, 10, 31),
+        usd_per_gal=0.02,
+        authority="Petroleum Tank Cleanup Fee collection period",
+        source_url="https://www.revenue.state.mn.us/petroleum-tax-tank-cleanup-fee",
+    ),
+    TaxAdjustment(
+        state="OH",
+        start=date(2026, 10, 4),
+        end=date(2027, 1, 2),
+        # The statute's 0.01 cent is 0.0001 dollar per gallon.
+        # The petroleum activity tax is separate and remains payable.
+        usd_per_gal=0.0001 - 0.385,
+        authority="HB 519 (motor fuel tax reduced to 0.01 cent/gal)",
+        source_url="https://www.legislature.ohio.gov/download?key=28854",
     ),
     TaxAdjustment(
         state="UT",
@@ -394,32 +452,35 @@ STATE_TAX_ADJUSTMENTS: list[TaxAdjustment] = [
         end=date(2026, 12, 31),
         usd_per_gal=-0.06,
         authority="HB 575",
-        source_url="https://le.utah.gov/~2026/bills/static/HB0575.html",
+        source_url="https://le.utah.gov/~2026/bills/hbillenr/HB0575.pdf",
     ),
 ]
 
 # A window that lapsed and one that was quietly extended look identical
-# from here, and Indiana's was extended five times. So the tables carry
-# how far a human has actually swept rather than being trusted past
+# from here, and Indiana's has been extended repeatedly. The tables carry
+# how far research has actually reached rather than being trusted past
 # their last known window, in either direction: a snapshot outside the
 # checked range fails rather than assert that no override was in force.
 # Move these only after re-sweeping.
 TAX_ADJUSTMENTS_CHECKED_FROM = date(2026, 1, 1)
-TAX_ADJUSTMENTS_CHECKED_THROUGH = date(2026, 10, 5)
+TAX_ADJUSTMENTS_CHECKED_THROUGH = date(2026, 10, 8)
+RESEARCH_EIA_TAX_PERIOD: date | None = None
+RESEARCH_EIA_BASELINE_SHA256: str | None = None
+RESEARCH_DATA: ResearchData | None = None
 
 # EIA's table is explicit that its rates exclude "any state taxes based
-# on gross or net receipts", which drops four real per-gallon costs:
-# Connecticut's PGET, Delaware's HSCA, Ohio's PAT and Hawaii's GET. New
+# on gross or net receipts", and its notes omit Washington's tax on
+# wholesale value too. Restore Connecticut's PGET, Delaware's HSCA,
+# Ohio's PAT, Hawaii's GET and Washington's PPT. New
 # Jersey's gross receipts tax is not among them, because the state sets
 # it as a per-gallon figure that EIA carries.
 #
 # Hawaii's is levied on the seller's gross income, and the pump price is
-# that income, so the rate applies to retail directly. The other three
-# are levied on the first sale into the state, which is a wholesale
-# price nobody publishes per state any more -- EIA's own refiner series
-# ended in March 2022 -- so they are taken against a spot benchmark.
+# that income, so the rate applies to retail directly. The other taxes
+# apply to wholesale value. Ohio publishes its prescribed quarterly PAT
+# base directly; CT, DE and WA use the disclosed spot proxies below.
 # Delaware recalculates its rate every January 1 from a lookback
-# formula, so unlike the other three these are dated and the run fails
+# formula, so these are dated and the run fails
 # rather than price a year nobody entered. Each entry is
 # (effective from, rate).
 DE_HSCA_RATES: list[tuple[date, float]] = [
@@ -428,36 +489,83 @@ DE_HSCA_RATES: list[tuple[date, float]] = [
 ]
 CT_PGET_RATE = 0.081
 # Gross earnings from the first sale of gasoline are capped at $3.00 a
-# gallon by CGS 12-587(a)(4), so above that the tax is a constant 24.3
-# cents regardless of the benchmark. Rack sits above spot, so a spot
-# quote at or over the cap proves the cap binds; below it the benchmark
-# is doing real work and understates, since it omits the rack margin.
+# gallon by CGS 12-587(a)(4). Apply that cap to the benchmark calculation;
+# an estimated base does not establish the actual taxable rack price.
 CT_PGET_CAP_USD = 3.00
 OH_PAT_RATE = 0.0065
+OH_PAT_URL = "https://tax.ohio.gov/business/petroleum-activity-tax"
+UNQUANTIFIED_FEE_NOTES = {
+    "DE": "Gasoline retailer and distributor licensing charges are "
+    "unquantified and excluded: no matched gasoline-throughput allocation "
+    "is available. Source: "
+    "https://delcode.delaware.gov/title30/c051/sc01/index.html",
+    "IN": "Gasoline use-tax registration charges are unquantified and "
+    "excluded: no matched gasoline-throughput allocation is available. "
+    "Source: https://www.in.gov/dor/i-am-a/business-corp/gasoline-use-tax/",
+    "LA": "UST registration charges are unquantified and excluded: tank "
+    "counts and gasoline throughput are not allocated here. The prorated "
+    "motor-fuel trust fee remains included. Source: "
+    "https://www.deq.louisiana.gov/underground-storage-tank-ust-registrations",
+    "MA": "Annual UST tank charges are unquantified and excluded: tank "
+    "counts and gasoline throughput are not allocated here. The published "
+    "per-gallon delivery fee remains included. Source: "
+    "https://www.mass.gov/info-details/ust-frequently-asked-questions",
+    "ME": "Annual Petroleum Marketing Fund fee is unquantified and "
+    "excluded: its rounded annual-volume units do not establish a fixed "
+    "per-gallon charge. The oil-import fee remains included. Source: "
+    "https://legislature.maine.gov/statutes/10/title10sec1681.html",
+    "MS": "Annual UST tank charges are unquantified and excluded: tank "
+    "counts and gasoline throughput are not allocated here. The per-gallon "
+    "environmental fee remains included. Source: "
+    "https://www.mdeq.ms.gov/water/groundwater-assessment-and-remediation/"
+    "underground-storage-tanks/",
+    "OR": "Petroleum load fee: $10 per load. Unquantified and excluded "
+    "from per-gallon state-cost totals; the supply-chain residual includes "
+    "this excluded fee. Source: "
+    "https://www.oregon.gov/dor/programs/businesses/Pages/petroleum.aspx",
+    "TX": "Petroleum products delivery fee: the fee depends on delivery "
+    "volume and product mix. Unquantified and excluded from per-gallon "
+    "state-cost totals; the supply-chain residual includes this excluded "
+    "fee. Source: https://comptroller.texas.gov/taxes/fuels/delivery-fee.php",
+    "PA": "Annual storage-tank registration charges are unquantified and "
+    "excluded: tank counts and gasoline throughput are not allocated here. "
+    "The per-gallon gasoline UST fee remains included. Source: "
+    "https://www.pa.gov/services/dep/register-a-storage-tank-with-the-"
+    "department-of-environmental-protection",
+    "WI": "Business registration and renewal charges are unquantified and "
+    "excluded: no gasoline-specific throughput allocation is available. "
+    "The per-gallon inspection fee remains included. Source: "
+    "https://www.revenue.wi.gov/dor%20publications/pb307.pdf",
+}
 # Hawaii's state rate. All four counties add a 0.5% surcharge on top,
 # which this page excludes along with every other county and local levy,
 # so the figure is the state's alone and is labelled as such.
 HI_GET_RATE = 0.04
+WA_PPT_RATE: float | None = None
+NY_SALES_TAX: float | None = None
+NY_SALES_SOURCE_URL = (
+    "https://www.tax.ny.gov/forms/publications/st/pub718f.htm"
+)
 
 # Spot benchmarks standing in for the rack price each tax is levied on:
-# New York Harbor for the two Atlantic states, Gulf Coast for Ohio.
+# New York Harbor for the two Atlantic states, and
+# Los Angeles RBOB as the available West Coast proxy for Washington.
 EIA_SPOT_API = "https://api.eia.gov/v2/petroleum/pri/spt/data/"
 EIA_SPOT_SERIES = {
     "CT": "EER_EPMRU_PF4_Y35NY_DPG",
     "DE": "EER_EPMRU_PF4_Y35NY_DPG",
-    "OH": "EER_EPMRU_PF4_RGC_DPG",
+    "WA": "EER_EPMRR_PF4_Y05LA_DPG",
 }
 # Hawaii needs no benchmark, so it is not in the series map above. Each
 # state cites its own taxing authority rather than the table these taxes
 # are being added back to, which is the source that leaves them out.
 GROSS_RECEIPTS_SOURCE_URLS = {
-    "CT": "https://portal.ct.gov/DRS/Taxes/Petroleum-Products-Tax/"
-    "Tax-Information",
-    "DE": "https://revenue.delaware.gov/business-tax-forms/"
-    "hazardous-substance-cleanup-act/",
+    "CT": "https://portal.ct.gov/DRS/Taxes/Petroleum-Products-Tax/Tax-Information",
+    "DE": "https://news.delaware.gov/2025/11/04/"
+    "new-hsca-rate-goes-into-effect-in-january-2026/",
     "HI": "https://tax.hawaii.gov/geninfo/get/",
-    "OH": "https://tax.ohio.gov/business/ohio-business-taxes/"
-    "petroleum-activity-tax/",
+    "OH": OH_PAT_URL,
+    "WA": "https://dor.wa.gov/taxes-rates/other-taxes/petroleum-products-tax",
 }
 GROSS_RECEIPTS_STATES = tuple(sorted(GROSS_RECEIPTS_SOURCE_URLS))
 # The series is monthly and lands a few weeks after the month closes,
@@ -574,13 +682,9 @@ class FetchError(SnapshotError):
     """An HTTP source could not be read."""
 
 
-# Retry budget for a single URL. A run reads four sources in sequence
-# and any one of them failing ends it, so a source that is briefly
-# unreachable costs the whole day's snapshot unless the run waits it
-# out. Delays grow 5s, 15s, 45s, which with the attempts' own timeouts
-# bounds one URL at about five minutes and a run whose every source
-# needs retrying at about twenty -- inside the job timeout, so a slow
-# recovery still finishes rather than being killed partway.
+# A briefly unreachable source need not cost the whole snapshot. Delays
+# grow 5s, 15s, 45s, which with the attempts' own timeouts bounds one URL
+# at about five minutes before a persistent failure is reported.
 HTTP_ATTEMPTS = 4
 HTTP_BACKOFF_SEC = 5.0
 HTTP_BACKOFF_FACTOR = 3.0
@@ -636,8 +740,7 @@ def _http_bytes_once(url: str, headers: dict[str, str] | None = None) -> bytes:
         headers={
             "User-Agent": USER_AGENT,
             "Accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "*/*;q=0.8"
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
             ),
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip",
@@ -670,7 +773,7 @@ def _http_bytes(url: str, headers: dict[str, str] | None = None) -> bytes:
             if attempt >= HTTP_ATTEMPTS:
                 raise FetchError(
                     f"GET {url}: {_describe(exc)} "
-                    f"(giving up after {attempt} attempts)"
+                    + f"(giving up after {attempt} attempts)"
                 ) from exc
             delay = HTTP_BACKOFF_SEC * HTTP_BACKOFF_FACTOR ** (attempt - 1)
             log.warning(
@@ -727,7 +830,7 @@ def _load_workbook(path: Path, source: str) -> openpyxl.Workbook:
     except (zipfile.BadZipFile, KeyError) as exc:
         raise SnapshotError(
             f"{source}: downloaded file is not a readable xlsx "
-            f"({_describe(exc)})"
+            + f"({_describe(exc)})"
         ) from exc
 
 
@@ -767,7 +870,7 @@ def _aaa_as_of(html: str) -> date:
     except ValueError as exc:
         raise SnapshotError(
             f"AAA: unreadable 'as of' date {match.group(0)!r}: "
-            f"{_describe(exc)}"
+            + f"{_describe(exc)}"
         ) from exc
 
 
@@ -835,11 +938,10 @@ class TaxPeriod:
     environmental charges EIA groups beside it. Both it and `federal`
     are dollars per gallon, matching what the page stores.
 
-    Four states are knowingly short here. EIA excludes taxes levied on
-    gross or net receipts, which leaves out Connecticut's PGET,
-    Delaware's HSCA, Ohio's PAT and Hawaii's GET; the supplement that
-    restores them is applied by the caller, not baked in, so this stays
-    a faithful reading of the published table.
+    EIA's exclusions and per-state qualifications are retained in
+    `notes`. The caller adds researched corrections and supported
+    value-based taxes separately, keeping this a faithful reading of
+    the published table rather than claiming it is complete.
 
     `excise` carries the narrower State tax column, the excise alone
     without the charges grouped beside it. It exists for Indiana, whose
@@ -858,6 +960,7 @@ class TaxPeriod:
     federal: float
     source_url: str
     missing: tuple[str, ...]
+    notes: dict[str, str] = field(default_factory=dict)
 
 
 # Sheets are named for the month they take effect, sometimes carrying a
@@ -944,6 +1047,7 @@ def _read_tax_sheet(
     """
     per_state: dict[str, float] = {}
     excise: dict[str, float] = {}
+    notes: dict[str, str] = {}
     federal: float | None = None
     seen: set[str] = set()
     for row in wb[sheet_name].iter_rows(values_only=True):
@@ -957,6 +1061,9 @@ def _read_tax_sheet(
         if code is None:
             continue
         seen.add(code)
+        notes[code] = " ".join(
+            cell for cell in row[4:] if isinstance(cell, str)
+        )
         rate = _tax_cell(row, 3)
         if rate is not None:
             per_state[code] = rate
@@ -979,6 +1086,7 @@ def _read_tax_sheet(
         federal=federal,
         source_url=EIA_FUELTAXES_URL,
         missing=tuple(sorted(seen - set(per_state))),
+        notes=notes,
     )
 
 
@@ -1010,7 +1118,7 @@ def select_in_gut(rates: dict[date, float], target: date) -> InGutRate:
     if not usable:
         raise SnapshotError(
             f"IN GUT: no rate in force on {target}; the notice starts at "
-            f"{min(rates)}"
+            + f"{min(rates)}"
         )
     month_start = max(usable)
     age = (target - month_start).days
@@ -1178,6 +1286,116 @@ class SpotQuote:
 
 
 @dataclass(frozen=True)
+class PatQuote:
+    """Ohio's published tax base for one calendar quarter."""
+
+    start: date
+    end: date
+    published: date
+    usd_per_gal: float
+    source_url: str
+
+
+class _PatLinks(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, str]] = []
+        self.href: str | None = None
+        self.label: list[str] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag == "a":
+            self.href = dict(attrs).get("href")
+            self.label = []
+
+    def handle_data(self, data: str) -> None:
+        if self.href is not None:
+            self.label.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self.href is not None:
+            self.links.append((self.href, " ".join(self.label)))
+            self.href = None
+
+
+def pat_quarter(day: date) -> tuple[date, date]:
+    start = date(day.year, 1 + 3 * ((day.month - 1) // 3), 1)
+    following = (
+        date(start.year + 1, 1, 1)
+        if start.month == 10
+        else date(start.year, start.month + 3, 1)
+    )
+    return start, following - timedelta(days=1)
+
+
+def _pat_period(text: str) -> tuple[date, date] | None:
+    match = re.search(
+        r"(\d{1,2}/\d{1,2}/\d{4})\s*[-\u2013]\s*"
+        r"(\d{1,2}/\d{1,2}/\d{4})",
+        text,
+    )
+    if match is None:
+        return None
+    try:
+        return (
+            date.strptime(match[1], "%m/%d/%Y"),
+            date.strptime(match[2], "%m/%d/%Y"),
+        )
+    except ValueError as exc:
+        raise SnapshotError("OH PAT: malformed period") from exc
+
+
+def parse_pat_notice(text: str, url: str, day: date) -> PatQuote:
+    period_line = re.search(r"Period:\s*([^\n]+)", text)
+    period = _pat_period(period_line[1]) if period_line else None
+    price = re.search(
+        r"Unleaded\s+Regular\s+Gasoline\s+\$([0-9]+\.[0-9]+)", text
+    )
+    publication = re.search(
+        r"Publication Date:\s*([A-Za-z]+\s+\d{1,2},\s+\d{4})", text
+    )
+    if (
+        period is None
+        or period != pat_quarter(day)
+        or price is None
+        or publication is None
+    ):
+        raise SnapshotError("OH PAT: notice lacks the applicable tax base")
+    try:
+        published = date.strptime(publication[1], "%B %d, %Y")
+    except ValueError as exc:
+        raise SnapshotError("OH PAT: malformed publication date") from exc
+    amount = float(price[1])
+    if published > day or not 0 < amount < 20:
+        raise SnapshotError("OH PAT: unavailable or invalid quarterly value")
+    return PatQuote(period[0], period[1], published, amount, url)
+
+
+def fetch_oh_pat_for_target_date(day: date, cache_dir: Path) -> PatQuote:
+    """Find and verify the official notice for the priced quarter."""
+    parser = _PatLinks()
+    parser.feed(
+        fetch_source_bytes(OH_PAT_URL).decode("utf-8", errors="replace")
+    )
+    quarter = pat_quarter(day)
+    urls = {
+        urllib.parse.urljoin(OH_PAT_URL, href)
+        for href, label in parser.links
+        if "PAT Average Wholesale Prices" in " ".join(label.split())
+        and _pat_period(label) == quarter
+    }
+    if len(urls) != 1:
+        raise SnapshotError(
+            f"OH PAT: expected one notice for {quarter}, found {len(urls)}"
+        )
+    url = urls.pop()
+    document = fetch_source_document(url, cache_dir)
+    return parse_pat_notice(document.text, url, day)
+
+
+@dataclass(frozen=True)
 class GrossReceiptsTax:
     """A per-gallon tax the published rate table leaves out."""
 
@@ -1225,7 +1443,7 @@ def load_spot_series(series: str, key: str) -> dict[str, float]:
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         raise SnapshotError(
             f"EIA spot {series}: response is not the expected shape "
-            f"({_describe(exc)})"
+            + f"({_describe(exc)})"
         ) from exc
     out: dict[str, float] = {}
     for row in rows:
@@ -1315,14 +1533,28 @@ def select_de_hsca_rate(day: date) -> float:
 
 
 def resolve_gross_receipts(
-    state: str, day: date, retail: float, spot: SpotQuote | None
+    state: str,
+    day: date,
+    retail: float,
+    spot: SpotQuote | None,
+    pat: PatQuote | None = None,
 ) -> GrossReceiptsTax:
-    """Return the gross-receipts tax the rate table omits for `state`.
+    """Return the supported value-based tax omitted from EIA for `state`.
 
-    Hawaii's is a share of the pump price and needs no benchmark. The
-    other three are a share of the first sale into the state, which is
-    what `spot` stands in for.
+    Hawaii uses retail, Ohio its prescribed quarterly base, and the remaining
+    supported states a disclosed wholesale spot proxy.
     """
+    if state == "OH":
+        if pat is None or (pat.start, pat.end) != pat_quarter(day):
+            raise SnapshotError("OH PAT: needs the applicable quarter notice")
+        return GrossReceiptsTax(
+            state=state,
+            usd_per_gal=round(OH_PAT_RATE * pat.usd_per_gal, 4),
+            label="Petroleum activity tax (0.6500%)",
+            basis=f"0.6500% {TIMES} ${pat.usd_per_gal:.3f}/gal, "
+            f"Ohio's published tax base for {pat.start} to {pat.end}",
+            exact=True,
+        )
     if state == "HI":
         amount = round(HI_GET_RATE * retail, 4)
         return GrossReceiptsTax(
@@ -1334,6 +1566,32 @@ def resolve_gross_receipts(
             f"local levy is",
             exact=True,
         )
+    if state == "WA":
+        if WA_PPT_RATE is None:
+            raise SnapshotError(
+                "WA petroleum products collection is unresolved; "
+                "supply researched collection evidence and an effective rate"
+            )
+        if WA_PPT_RATE == 0:
+            return GrossReceiptsTax(
+                state=state,
+                usd_per_gal=0.0,
+                label="Petroleum products tax (not collected)",
+                basis="Research establishes noncollection on this date",
+                exact=True,
+            )
+        if spot is None:
+            raise SnapshotError("WA: needs a West Coast spot benchmark")
+        return GrossReceiptsTax(
+            state=state,
+            usd_per_gal=round(WA_PPT_RATE * spot.usd_per_gal, 4),
+            label=f"Petroleum products tax ({WA_PPT_RATE:.4%})",
+            basis=f"{WA_PPT_RATE:.4%} {TIMES} ${spot.usd_per_gal:.3f}, "
+            f"the {spot.year_month} Los Angeles RBOB spot benchmark "
+            "standing in for unpublished Washington wholesale value; "
+            "regional price and rack-margin differences make this an estimate",
+            exact=False,
+        )
     if spot is None:
         raise SnapshotError(f"{state}: needs a spot benchmark to be priced")
     if state == "CT":
@@ -1342,28 +1600,27 @@ def resolve_gross_receipts(
         return GrossReceiptsTax(
             state=state,
             usd_per_gal=round(CT_PGET_RATE * base, 4),
-            label=f"Petroleum products gross earnings tax "
-            f"({CT_PGET_RATE:.1%})",
+            label="Petroleum products gross earnings tax "
+            + f"({CT_PGET_RATE:.1%})",
             basis=(
                 f"{CT_PGET_RATE:.1%} {TIMES} ${CT_PGET_CAP_USD:.2f} "
-                f"statutory cap"
+                + "statutory cap applied to the spot benchmark; the "
+                f"{spot.year_month} benchmark does not establish the "
+                "actual taxable rack price"
                 if capped
                 else f"{CT_PGET_RATE:.1%} {TIMES} ${base:.3f}, the "
                 f"{spot.year_month} spot benchmark standing in for an "
                 f"unpublished rack price; below the "
                 f"${CT_PGET_CAP_USD:.2f} cap, so the benchmark carries "
-                f"the figure and it runs low"
+                f"the figure; rack-price differences make this an estimate"
             ),
-            # Above the cap the benchmark drops out of the arithmetic, so
-            # the figure is the statute's rather than an estimate.
-            exact=capped,
+            exact=False,
         )
     rate, label = {
         "DE": (
             select_de_hsca_rate(day),
             "Hazardous substance cleanup act tax",
         ),
-        "OH": (OH_PAT_RATE, "Petroleum activity tax"),
     }[state]
     return GrossReceiptsTax(
         state=state,
@@ -1864,7 +2121,7 @@ def state_tax_notes(period: TaxPeriod, in_gut: InGutRate, day: date) -> str:
         {e.state for e in STATE_TAX_ADJUSTMENTS if e.start <= day <= e.end}
     )
     override_clause = (
-        f"{_and_list(overridden)} carrying a suspension or reduction the "
+        f"{_and_list(overridden)} carrying tax or fee corrections the "
         f"table does not reflect; "
         if overridden
         else ""
@@ -1873,19 +2130,18 @@ def state_tax_notes(period: TaxPeriod, in_gut: InGutRate, day: date) -> str:
         _suspended_on(windows, day) is not None
         for windows in (IN_EXCISE_SUSPENSIONS, IN_GUT_SUSPENSIONS)
     )
+    suspension_label = "suspensions" if in_suspended > 1 else "suspension"
     in_clause = (
-        f", with its own {'suspensions' if in_suspended > 1 else 'suspension'}"
-        f" applied"
-        if in_suspended
-        else ""
+        f", with its own {suspension_label} applied" if in_suspended else ""
     )
     return (
         f"{STATE_TAX_NOTES_MARKER}EIA federal and state motor fuel tax "
         f"table, {period.period} edition; IN composed from its excise, "
         f"oil inspection fee and {in_gut.month_start:%b %Y} gasoline use "
         f"tax{in_clause}; "
+        "NY adding the statewide motor-fuel sales tax excluded from EIA; "
         f"{override_clause}"
-        f"{_and_list(GROSS_RECEIPTS_STATES)} adding the gross-receipts "
+        f"{_and_list(GROSS_RECEIPTS_STATES)} adding the value-based "
         f"taxes the table excludes. "
     )
 
@@ -1924,10 +2180,8 @@ def build_ca_nontax(d: date, lcfs: LcfsQuote, cca: AuctionSettlement) -> str:
         f'note:"Credit ${lcfs.usd_per_mt:.2f}/MT ({lcfs.as_of.isoformat()}) '
         f"{TIMES} {LCFS_FACTOR:.6f}. Daily Argus assessment, via Neste's "
         f"LCFS monitor. An assessed market price, not CARB's "
-        f"volume-weighted average of completed transfers, so it is close "
-        f"but not exact. Used because CARB stopped publishing its weekly "
-        f"credit transfer reports after the week of "
-        f'{LCFS_LAST_CARB_WEEK.isoformat()}."}},\n'
+        "volume-weighted average of completed transfers. The per-gallon "
+        'pass-through is an estimate, not an observed retail charge."},\n'
         f'      {{n:"Cap-and-Invest pass-through", v:{cca_pass:.4f}, '
         f'src:"{_js_string(CARB_CCA_PROGRAM_URL)}", '
         f'note:"${cca.price:.2f}/allowance ({_js_string(cca.label)}) '
@@ -1984,6 +2238,29 @@ class StateTax:
     as_of: str
 
 
+def unquantified_fee_note(state: str) -> str:
+    """Disclose allocation exclusions without pricing them as zero."""
+    notes = (
+        [UNQUANTIFIED_FEE_NOTES[state]]
+        if state in UNQUANTIFIED_FEE_NOTES
+        else []
+    )
+    if RESEARCH_DATA is not None:
+        for review in RESEARCH_DATA.state_reviews:
+            if review.state == state:
+                notes.extend(
+                    f"{fee.name}: unquantified and excluded. {fee.reason} "
+                    f"Source: {fee.source_url}"
+                    for fee in review.unquantified_fees
+                )
+    if notes:
+        notes.append(
+            "Per-gallon state-cost totals omit these charges; the "
+            "supply-chain residual includes them."
+        )
+    return " ".join(notes)
+
+
 def compose_state_tax(
     code: str,
     day: date,
@@ -1991,21 +2268,26 @@ def compose_state_tax(
     retail: float,
     in_gut: InGutRate,
     spot: dict[str, SpotQuote],
+    pat: PatQuote | None = None,
 ) -> StateTax:
     """Resolve what one state charges per gallon on `day`.
 
     Most states are the published table's own figure, adjusted for any
     override in force. Indiana is built from its parts instead, because
     its use tax is reset monthly and its two taxes were suspended from
-    different dates. The four states whose gross-receipts taxes the
-    table excludes get them added back.
+    different dates. Supported taxes on retail or wholesale value are
+    added separately when the published table excludes them.
     """
     assert_adjustments_cover(day)
+    exclusion_note = unquantified_fee_note(code)
     if code == "IN":
         indiana = resolve_indiana_tax(day, _excise_of(period, "IN"), in_gut)
         parts = [
             TaxPart(
-                "Gasoline excise", indiana.excise, IN_EXCISE_SOURCE_URL, ""
+                "Gasoline excise",
+                indiana.excise,
+                IN_EXCISE_SOURCE_URL,
+                exclusion_note,
             ),
             TaxPart(
                 "Oil inspection fee",
@@ -2039,6 +2321,7 @@ def compose_state_tax(
             (
                 "Excise plus the sales, inspection and environmental "
                 "charges the published table groups with it"
+                + (". " + exclusion_note if exclusion_note else "")
             ),
         )
     ]
@@ -2058,7 +2341,7 @@ def compose_state_tax(
             )
         parts.append(
             TaxPart(
-                "Suspension or reduction",
+                "Tax or fee adjustment",
                 override.usd_per_gal,
                 override.source_url,
                 f"{override.authority}, in force {override.start} to "
@@ -2066,14 +2349,29 @@ def compose_state_tax(
                 f"this overrides",
             )
         )
+    if code == "NY":
+        if NY_SALES_TAX is None:
+            raise SnapshotError("NY motor-fuel sales tax is unresolved")
+        total = round(total + NY_SALES_TAX, 4)
+        parts.append(
+            TaxPart(
+                "State motor-fuel sales tax",
+                NY_SALES_TAX,
+                NY_SALES_SOURCE_URL,
+                "Collected statewide cents-per-gallon rate; "
+                "the geographically limited MCTD increment is excluded",
+            )
+        )
     if code in GROSS_RECEIPTS_STATES:
-        extra = resolve_gross_receipts(code, day, retail, spot.get(code))
+        extra = resolve_gross_receipts(code, day, retail, spot.get(code), pat)
         total = round(total + extra.usd_per_gal, 4)
         parts.append(
             TaxPart(
                 extra.label,
                 extra.usd_per_gal,
-                GROSS_RECEIPTS_SOURCE_URLS[code],
+                pat.source_url
+                if code == "OH" and pat is not None
+                else GROSS_RECEIPTS_SOURCE_URLS[code],
                 extra.basis if extra.exact else f"Estimated. {extra.basis}",
             )
         )
@@ -2154,6 +2452,7 @@ class SnapshotSources:
     cca: AuctionSettlement
     wa: AuctionSettlement
     orm: OrCfpMonth
+    pat: PatQuote
 
 
 def build_data_block(
@@ -2175,6 +2474,7 @@ def build_data_block(
             retail[code],
             sources.in_gut,
             sources.spot,
+            sources.pat,
         )
         chunk = swap_fixed(chunk, build_fixed(tax))
         chunk = drop_adval(chunk)
@@ -2195,6 +2495,7 @@ def build_snapshot_object(
     baseline_block: str,
     retail: dict[str, float],
     sources: SnapshotSources,
+    amendment_explanation: str = "",
 ) -> str:
     baseline_data = extract_data_block(baseline_block)
     body = build_data_block(baseline_data, target, retail, sources)
@@ -2204,6 +2505,8 @@ def build_snapshot_object(
         + state_tax_notes(sources.period, sources.in_gut, target)
         + passthrough_notes(sources.lcfs, sources.cca, sources.wa, sources.orm)
     )
+    if amendment_explanation:
+        notes += " Input amendments: " + amendment_explanation
     return (
         "{\n"
         f'  date: "{target.isoformat()}",\n'
@@ -2262,10 +2565,9 @@ def sanity_check_snapshot(snapshot: str, target: date) -> None:
         raise SnapshotError(
             f"sanity: expected 51 state-tax totals, got {len(totals)}"
         )
-    # Every state charges something per gallon, and no state is close to
-    # a dollar; either bound means a source was misread.
-    if not all(0.0 < v < 1.0 for v in totals):
-        bad = [v for v in totals if not (0.0 < v < 1.0)]
+    # A full tax suspension can legitimately leave a zero total.
+    if not all(0.0 <= v < 1.0 for v in totals):
+        bad = [v for v in totals if not (0.0 <= v < 1.0)]
         raise SnapshotError(
             f"sanity: state-tax totals outside plausible range: {bad}"
         )
@@ -2315,6 +2617,47 @@ def block_summary(block: str) -> tuple[str, int, str]:
     return iso_date, n_states, notes
 
 
+def verify_append(original: str, prepared: str, target: date) -> None:
+    """Accept one sane snapshot, preserving history and surrounding HTML."""
+    before = parse_snapshots(original)
+    after = parse_snapshots(prepared)
+    added = find_block_for_date(after.blocks, target.isoformat())
+    if added is None:
+        raise SnapshotError("page lacks the requested snapshot")
+    survivors = list(after.blocks)
+    survivors.remove(added)
+    if (
+        survivors != before.blocks
+        or after.preamble != before.preamble
+        or after.postamble != before.postamble
+    ):
+        raise SnapshotError(
+            "page changed published history or surrounding HTML"
+        )
+    sanity_check_snapshot(added, target)
+
+
+def publish_snapshot(html: Path, original: str, prepared: str) -> None:
+    """Back up and atomically replace an unchanged snapshot input."""
+    if read_html(html) != original:
+        raise SnapshotError(
+            "page changed while building the snapshot; refusing to overwrite"
+        )
+    backup = backup_html(html)
+    log.info("backed up to %s", backup)
+    with tempfile.NamedTemporaryFile(
+        dir=html.parent, prefix=".gas-prices-", delete=False
+    ) as temp:
+        candidate = Path(temp.name)
+    try:
+        write_with_canonical_mode(candidate, prepared)
+        os.replace(candidate, html)
+    finally:
+        candidate.unlink(missing_ok=True)
+    if read_html(html) != prepared:
+        raise SnapshotError("published page does not match the snapshot")
+
+
 # ---------------------------------------------------------------------------
 # Subcommand: list-snapshots
 # ---------------------------------------------------------------------------
@@ -2337,11 +2680,668 @@ def cmd_list_snapshots(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def locked_add_snapshot(args: argparse.Namespace) -> int:
+    """Serialize snapshot updates, including their input read and backup."""
+    html = args.html.expanduser().resolve()
+    args.html = html
+    state_dir = Path.home() / ".local/state/gas-prices-breakdown"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(str(html).encode()).hexdigest()
+    with (state_dir / f"snapshot-{key}.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SnapshotError("another snapshot update is running") from exc
+        return cmd_add_snapshot(args)
+
+
+class AmendmentStatus(StrEnum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+
+class CollectedSnapshot(ResearchModel):
+    version: int = Field(default=1, ge=1, le=1)
+    target: date
+    collected_at: datetime
+    previous_reviewed_through: date | None = None
+    fee_allocation_policy: str = FEE_ALLOCATION_POLICY
+    known_fee_exclusions: dict[str, str] = Field(
+        default_factory=lambda: dict(UNQUANTIFIED_FEE_NOTES)
+    )
+    retail: dict[str, float]
+    period: TaxPeriod
+    in_gut: InGutRate
+    spot: dict[str, SpotQuote]
+    lcfs: LcfsQuote
+    orm: OrCfpMonth
+    pat: PatQuote
+    research: ResearchData
+    pending_items: list[str] = Field(default_factory=list)
+
+
+class DataAmendment(ResearchModel):
+    field: str = Field(pattern=r"^/")
+    reason: str = Field(min_length=20)
+    source_url: str
+    excerpt: str = Field(min_length=40, max_length=2000)
+
+
+class AmendedSnapshot(ResearchModel):
+    status: AmendmentStatus
+    explanation: str = Field(min_length=20, max_length=4000)
+    input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    data: CollectedSnapshot | None = None
+    amendments: list[DataAmendment] = Field(default_factory=list)
+
+
+class PrimaryReceipt(ResearchModel):
+    source_url: str
+    collected_for: date
+    valid_through: date
+    text: str
+    links: tuple[tuple[str, str], ...] = ()
+
+
+def save_checkpoint(path: Path, content: str) -> None:
+    """Complete a checkpoint atomically so interruption cannot truncate it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as stream:
+        temporary = Path(stream.name)
+        stream.write(content)
+    temporary.chmod(0o644)
+    temporary.replace(path)
+
+
+def checkpoint_value[CacheValue](
+    directory: Path,
+    name: str,
+    adapter: TypeAdapter[CacheValue],
+    collect: Callable[[], CacheValue],
+) -> CacheValue:
+    path = directory / f"{name}.json"
+    if path.exists():
+        return adapter.validate_json(path.read_bytes())
+    value = collect()
+    save_checkpoint(path, adapter.dump_json(value, indent=2).decode() + "\n")
+    return value
+
+
+def collect_primary(
+    url: str,
+    target: date,
+    cache: Path,
+) -> PrimaryDocument:
+    """Retain source text and links, respecting the source's cache scope."""
+    key = hashlib.sha256(url.encode()).hexdigest()
+    path = cache / "primary" / f"{key}.json"
+    if path.exists():
+        receipt = PrimaryReceipt.model_validate_json(path.read_bytes())
+        if receipt.source_url != url:
+            raise SnapshotError("primary receipt has a different source URL")
+        if receipt.collected_for <= target <= receipt.valid_through:
+            return PrimaryDocument(url, receipt.text, receipt.links)
+    raw = fetch_source_bytes(url)
+    text = _source_text(raw, url)
+    if not text.strip():
+        raise SnapshotError(f"primary source {url} has no readable text")
+    links: tuple[tuple[str, str], ...] = ()
+    if not raw.lstrip().startswith(b"%PDF"):
+        parser = _PatLinks()
+        parser.feed(raw.decode("utf-8", errors="replace"))
+        links = tuple(
+            (urllib.parse.urljoin(url, href), " ".join(label.split()))
+            for href, label in parser.links
+        )
+    # Dated immutable documents can be reused; changing publication and
+    # program pages are fetched for each new target. Source evidence remains
+    # independently checked when an agent changes a priced input.
+    immutable = "results_summary.pdf" not in url and bool(
+        re.search(r"/\d{4}[-/]\d{2}/|/ic/\d{4}/", url)
+    )
+    valid_through = date.max if immutable else target
+    receipt = PrimaryReceipt(
+        source_url=url,
+        collected_for=target,
+        valid_through=valid_through,
+        text=text,
+        links=links,
+    )
+    save_checkpoint(path, receipt.model_dump_json(indent=2) + "\n")
+    return PrimaryDocument(url, text, links)
+
+
+def collect_snapshot_inputs(
+    target: date,
+    state: Path,
+    cache: Path,
+) -> CollectedSnapshot:
+    """Checkpoint deterministic inputs before starting an agent."""
+    directory = state / "input-parts" / target.isoformat()
+    retail = checkpoint_value(
+        directory,
+        "retail",
+        TypeAdapter(dict[str, float]),
+        lambda: fetch_aaa_retail(target),
+    )
+    lcfs = checkpoint_value(
+        directory,
+        "lcfs",
+        TypeAdapter(LcfsQuote),
+        lambda: fetch_lcfs_for_target_date(target, cache),
+    )
+    orm = checkpoint_value(
+        directory,
+        "oregon-cfp",
+        TypeAdapter(OrCfpMonth),
+        lambda: fetch_or_cfp_for_target_date(target, cache),
+    )
+    period = checkpoint_value(
+        directory,
+        "eia-tax",
+        TypeAdapter(TaxPeriod),
+        lambda: fetch_tax_period_for_target_date(target, cache),
+    )
+    in_gut = checkpoint_value(
+        directory,
+        "indiana-use-tax",
+        TypeAdapter(InGutRate),
+        lambda: fetch_in_gut_for_target_date(target, cache),
+    )
+    pat = checkpoint_value(
+        directory,
+        "ohio-pat",
+        TypeAdapter(PatQuote),
+        lambda: fetch_oh_pat_for_target_date(target, cache),
+    )
+    spot: dict[str, SpotQuote] = {}
+    for series in sorted(set(EIA_SPOT_SERIES.values())):
+        quote = checkpoint_value(
+            directory,
+            f"spot-{series}",
+            TypeAdapter(SpotQuote),
+            partial(collect_spot_quote, series, target),
+        )
+        spot.update(
+            {
+                code: quote
+                for code, name in EIA_SPOT_SERIES.items()
+                if name == series
+            }
+        )
+    research = research_template(target)
+    previous_reviewed = TAX_ADJUSTMENTS_CHECKED_THROUGH
+    previous = state / "last-final.json"
+    if previous.exists():
+        prior = CollectedSnapshot.model_validate_json(previous.read_bytes())
+        previous_reviewed = prior.target
+        research = prior.research.model_copy(deep=True)
+        if tax_baseline_sha256(prior.period) != tax_baseline_sha256(period):
+            research.blocking_issues = [
+                (
+                    "The EIA baseline changed; reconcile retained corrections "
+                    "against the new amounts before publication."
+                )
+            ]
+    research.checked_from = research.checked_through = target
+    research.eia_tax_period = period.period
+    research.eia_baseline_sha256 = tax_baseline_sha256(period)
+    for review in research.state_reviews:
+        if not review.sources:
+            review.sources = [period.source_url]
+        if not review.note:
+            review.note = (
+                "Published EIA baseline and retained sourced rules. "
+                "No new independent jurisdiction audit is asserted."
+            )
+    pending = collect_maintained(
+        research,
+        target,
+        period.per_state,
+        lambda url: collect_primary(url, target, cache),
+    )
+    active = {
+        entry.state
+        for entry in research.adjustments
+        if entry.start <= target <= entry.end
+    }
+    if any(
+        window.start <= target <= window.end
+        for window in (
+            *research.in_excise_suspensions,
+            *research.in_gut_suspensions,
+        )
+    ):
+        active.add("IN")
+    for review in research.state_reviews:
+        review.outcome = (
+            ReviewOutcome.OVERRIDE
+            if review.state in active
+            else ReviewOutcome.NO_OVERRIDE
+        )
+    inputs = CollectedSnapshot(
+        target=target,
+        collected_at=datetime.now(UTC),
+        previous_reviewed_through=previous_reviewed,
+        retail=retail,
+        period=period,
+        in_gut=in_gut,
+        spot=spot,
+        lcfs=lcfs,
+        orm=orm,
+        pat=pat,
+        research=research,
+        pending_items=pending,
+    )
+    validate_collected_inputs(inputs, target)
+    return inputs
+
+
+def collect_spot_quote(series: str, target: date) -> SpotQuote:
+    return select_spot(
+        load_spot_series(series, load_eia_api_key()),
+        target,
+        series,
+    )
+
+
+def validate_collected_inputs(data: CollectedSnapshot, target: date) -> None:
+    codes = set(STATE_CODE.values())
+    if data.target != target:
+        raise SnapshotError("collected inputs have a different target date")
+    if set(data.retail) != codes or not all(
+        1 < value < 12 for value in data.retail.values()
+    ):
+        raise SnapshotError("collected retail prices must cover all 51 states")
+    if set(data.period.per_state) != codes or data.period.missing:
+        raise SnapshotError("collected EIA tax table is incomplete")
+    if data.period.period > target or not 0 <= data.period.federal < 1:
+        raise SnapshotError("invalid collected tax baseline")
+    if data.in_gut.month_start != target.replace(day=1):
+        raise SnapshotError("collected Indiana rate has the wrong month")
+    if not data.pat.start <= target <= data.pat.end:
+        raise SnapshotError("collected Ohio PAT base has the wrong quarter")
+    if data.pat.published > target:
+        raise SnapshotError("collected Ohio PAT base was not yet published")
+    if data.lcfs.as_of > target or data.lcfs.usd_per_mt < 0:
+        raise SnapshotError("invalid collected LCFS input")
+    if set(data.spot) != set(EIA_SPOT_SERIES):
+        raise SnapshotError("collected wholesale benchmarks are incomplete")
+    if any(quote.usd_per_gal <= 0 for quote in data.spot.values()):
+        raise SnapshotError("collected wholesale benchmark is invalid")
+
+
+def json_leaves(value: JsonValue, prefix: str = "") -> dict[str, JsonValue]:
+    if isinstance(value, dict):
+        return {
+            path: leaf
+            for key, child in value.items()
+            for path, leaf in json_leaves(child, f"{prefix}/{key}").items()
+        }
+    if isinstance(value, list):
+        return {
+            path: leaf
+            for index, child in enumerate(value)
+            for path, leaf in json_leaves(child, f"{prefix}/{index}").items()
+        }
+    return {prefix: value}
+
+
+def validate_amended_data(
+    result: AmendedSnapshot,
+    original: CollectedSnapshot,
+    digest: str,
+    cache: Path,
+) -> CollectedSnapshot:
+    if result.input_sha256 != digest:
+        raise SnapshotError(
+            "amended data is bound to different collected inputs"
+        )
+    if result.status == AmendmentStatus.FAILURE:
+        raise SnapshotError(f"agent reported failure: {result.explanation}")
+    if result.data is None:
+        raise SnapshotError("successful amended data contains no final inputs")
+    final = result.data
+    validate_collected_inputs(final, original.target)
+    if (
+        final.collected_at != original.collected_at
+        or final.version != original.version
+    ):
+        raise SnapshotError("agent changed collection identity")
+    if final.period != original.period:
+        raise SnapshotError("amend tax rules, not the published EIA baseline")
+    if (
+        final.fee_allocation_policy != original.fee_allocation_policy
+        or final.known_fee_exclusions != original.known_fee_exclusions
+    ):
+        raise SnapshotError("agent changed the known fee-allocation policy")
+    if (
+        final.research.eia_tax_period != final.period.period
+        or final.research.eia_baseline_sha256
+        != tax_baseline_sha256(final.period)
+        or final.previous_reviewed_through
+        != original.previous_reviewed_through
+    ):
+        raise SnapshotError("agent changed input baseline identity")
+    if final.pending_items:
+        raise SnapshotError(
+            f"amended data has unresolved inputs: {final.pending_items}"
+        )
+    adapter = TypeAdapter(JsonValue)
+    before = json_leaves(adapter.validate_json(original.model_dump_json()))
+    after = json_leaves(adapter.validate_json(final.model_dump_json()))
+    changed = {
+        path
+        for path in before.keys() | after.keys()
+        if before.get(path) != after.get(path)
+    }
+    routine_changes = {
+        path
+        for path in changed
+        if not path.startswith(("/research/", "/pending_items/"))
+    }
+    for path in routine_changes:
+        if not any(
+            path == item.field or path.startswith(item.field + "/")
+            for item in result.amendments
+        ):
+            raise SnapshotError(
+                f"{path}: amendment lacks an explanation and source"
+            )
+    for amendment in result.amendments:
+        if not (
+            official_url(amendment.source_url)
+            or amendment.source_url == AAA_URL
+        ):
+            raise SnapshotError("data amendment needs a primary source")
+        document = collect_primary(
+            amendment.source_url, original.target, cache
+        )
+        if " ".join(amendment.excerpt.split()) not in " ".join(
+            document.text.split()
+        ):
+            raise SnapshotError(
+                "data amendment excerpt is absent from its source"
+            )
+    changed_states: set[str] = set()
+    for state in STATE_CODE.values():
+        old = [a for a in original.research.adjustments if a.state == state]
+        new = [a for a in final.research.adjustments if a.state == state]
+        if old != new:
+            changed_states.add(state)
+    before_rules, after_rules = original.research, final.research
+    for state, changed_rule in (
+        (
+            "IN",
+            (
+                before_rules.in_excise_suspensions
+                != after_rules.in_excise_suspensions
+                or before_rules.in_gut_suspensions
+                != after_rules.in_gut_suspensions
+                or before_rules.in_oil_inspection_fee
+                != after_rules.in_oil_inspection_fee
+                or before_rules.in_oil_inspection_source_url
+                != after_rules.in_oil_inspection_source_url
+            ),
+        ),
+        (
+            "NY",
+            before_rules.ny_sales_tax_usd_per_gal
+            != after_rules.ny_sales_tax_usd_per_gal
+            or before_rules.ny_sales_tax_source_url
+            != after_rules.ny_sales_tax_source_url,
+        ),
+        (
+            "WA",
+            before_rules.wa_ppt_rate != after_rules.wa_ppt_rate
+            or before_rules.wa_ppt_source_url != after_rules.wa_ppt_source_url
+            or before_rules.wa_auctions != after_rules.wa_auctions,
+        ),
+        ("CA", before_rules.carb_auctions != after_rules.carb_auctions),
+        (
+            "DE",
+            before_rules.de_hsca_rates != after_rules.de_hsca_rates
+            or before_rules.de_hsca_source_url
+            != after_rules.de_hsca_source_url,
+        ),
+    ):
+        if changed_rule:
+            changed_states.add(state)
+    final.research.validate_for(
+        original.target,
+        set(STATE_CODE.values()),
+        baseline_states=frozenset(set(STATE_CODE.values()) - changed_states),
+    )
+    verify_collected_evidence(
+        final.research,
+        original.research,
+        original.target,
+        cache,
+    )
+    with researched_tables(final.research):
+        latest_auction(
+            CARB_CCA_AUCTIONS, original.target, program="CARB_CCA_AUCTIONS"
+        )
+        latest_auction(
+            WA_CCA_AUCTIONS, original.target, program="WA_CCA_AUCTIONS"
+        )
+    return final
+
+
+def verify_collected_evidence(
+    data: ResearchData,
+    collected: ResearchData,
+    target: date,
+    cache: Path,
+) -> None:
+    """Retain established provenance; retrieve newly supplied evidence once."""
+    prior = [
+        item for review in collected.state_reviews for item in review.evidence
+    ]
+    for review in data.state_reviews:
+        for evidence in review.evidence:
+            if evidence in prior:
+                continue
+            document = collect_primary(evidence.source_url, target, cache)
+            excerpt = " ".join(evidence.excerpt.split())
+            if excerpt not in " ".join(document.text.split()):
+                raise SnapshotError(
+                    f"{review.state}: cited excerpt is absent from "
+                    f"{evidence.source_url}"
+                )
+
+
+def run_snapshot_pipeline(args: argparse.Namespace) -> int:
+    target = args.target or most_recent_thursday()
+    original_html = read_html(args.html)
+    snapshots = parse_snapshots(original_html)
+    if find_block_for_date(snapshots.blocks, target.isoformat()):
+        log.info("snapshot for %s already present; nothing to do", target)
+        return 0
+    baseline = find_block_for_date(snapshots.blocks, args.baseline)
+    if baseline is None:
+        raise SnapshotError(f"baseline snapshot {args.baseline} not found")
+    state = args.state_dir.expanduser().resolve()
+    cache = (args.cache_dir or state / "cache").expanduser().resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    runs = state / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    workspace = Path(
+        tempfile.mkdtemp(
+            prefix=f"{datetime.now(UTC):%Y%m%dT%H%M%SZ}-",
+            dir=runs,
+        )
+    )
+    log.info("snapshot run artifacts: %s", workspace)
+    try:
+        input_path = args.inputs or state / "inputs" / f"{target}.json"
+        if input_path.exists():
+            collected = CollectedSnapshot.model_validate_json(
+                input_path.read_bytes()
+            )
+            validate_collected_inputs(collected, target)
+        elif args.inputs is not None:
+            raise SnapshotError(
+                f"saved collected inputs do not exist: {input_path}"
+            )
+        else:
+            collected = collect_snapshot_inputs(target, state, cache)
+            save_checkpoint(
+                input_path, collected.model_dump_json(indent=2) + "\n"
+            )
+        collected_json = collected.model_dump_json(indent=2) + "\n"
+        save_checkpoint(workspace / "collected.json", collected_json)
+        digest = hashlib.sha256(collected_json.encode()).hexdigest()
+        accepted = state / "amendments" / f"{digest}.json"
+        amendment_path = workspace / "amended.json"
+        if accepted.exists():
+            save_checkpoint(amendment_path, accepted.read_text())
+            log.info(
+                "reusing completed amendment for collected inputs %s", digest
+            )
+        else:
+            response = AmendedSnapshot(
+                status=AmendmentStatus.FAILURE,
+                explanation="The agent has not completed the amendment pass.",
+                input_sha256=digest,
+                data=collected,
+            )
+            save_checkpoint(
+                amendment_path, response.model_dump_json(indent=2) + "\n"
+            )
+            save_checkpoint(
+                workspace / "schema.json",
+                json.dumps(
+                    AmendedSnapshot.model_json_schema(),
+                    indent=2,
+                )
+                + "\n",
+            )
+            skill = (
+                Path(__file__).resolve().parent
+                / "skills/update-gas-prices/SKILL.md"
+            )
+            prompt = (
+                skill.read_text() + "\n\nRun inputs:\n"
+                f"Target: {target}\n"
+                f"Collected data: {workspace / 'collected.json'}\n"
+                f"Amended result: {amendment_path}\n"
+                f"Schema: {workspace / 'schema.json'}\n"
+                f"Input SHA256: {digest}\n"
+                f"Source guide: {skill.parent / 'references/sources.md'}\n"
+                f"Primary source cache: {cache / 'primary'}\n"
+                "Utility for additional sources: "
+                f"{sys.executable} {Path(__file__).resolve()} "
+                "research-source\n"
+                f"Use --cache-dir {workspace / 'evidence'} "
+                "for additional source retrieval.\n"
+                "Write the amended result; the parent utility validates "
+                "and publishes.\n"
+            )
+            save_checkpoint(workspace / "prompt.txt", prompt)
+            code = run_agent(
+                agent_command(
+                    args.agent,
+                    args.agent_command,
+                    prompt,
+                    workspace,
+                    model=args.model,
+                ),
+                workspace,
+            )
+            log.info(
+                "agent harness exited %d; reading amended-data outcome", code
+            )
+        result = AmendedSnapshot.model_validate_json(
+            amendment_path.read_bytes()
+        )
+        save_checkpoint(
+            workspace / "agent-result.json",
+            result.model_dump_json(indent=2) + "\n",
+        )
+        final = validate_amended_data(result, collected, digest, cache)
+        save_checkpoint(
+            workspace / "final.json", final.model_dump_json(indent=2) + "\n"
+        )
+        with researched_tables(final.research):
+            sources = SnapshotSources(
+                period=final.period,
+                in_gut=final.in_gut,
+                spot=final.spot,
+                lcfs=final.lcfs,
+                orm=final.orm,
+                pat=final.pat,
+                cca=latest_auction(
+                    CARB_CCA_AUCTIONS, target, program="CARB_CCA_AUCTIONS"
+                ),
+                wa=latest_auction(
+                    WA_CCA_AUCTIONS, target, program="WA_CCA_AUCTIONS"
+                ),
+            )
+            block = build_snapshot_object(
+                target, baseline, final.retail, sources, result.explanation
+            )
+        sanity_check_snapshot(block, target)
+        snapshots.blocks = insert_in_date_order(
+            snapshots.blocks, block, str(target)
+        )
+        prepared = render_snapshots(snapshots)
+        verify_append(original_html, prepared, target)
+        save_checkpoint(workspace / "prepared.html", prepared)
+        save_checkpoint(workspace / "changes.txt", result.explanation + "\n")
+        save_checkpoint(accepted, result.model_dump_json(indent=2) + "\n")
+        if not args.dry_run:
+            publish_snapshot(args.html, original_html, prepared)
+        save_checkpoint(
+            state / "last-final.json", final.model_dump_json(indent=2) + "\n"
+        )
+        log.info(
+            "%s snapshot for %s; %s",
+            "prepared" if args.dry_run else "published",
+            target,
+            result.explanation,
+        )
+        return 0
+    except (
+        SnapshotError,
+        AgentError,
+        OSError,
+        ValidationError,
+        ValueError,
+    ) as exc:
+        save_checkpoint(
+            workspace / "failure.json",
+            json.dumps(
+                {
+                    "target": str(target),
+                    "explanation": str(exc),
+                },
+                indent=2,
+            )
+            + "\n",
+        )
+        log.error("snapshot failed: %s; artifacts: %s", exc, workspace)
+        return 1
+
+
 def cmd_add_snapshot(args: argparse.Namespace) -> int:
+    if args.research is not None:
+        return cmd_add_snapshot_from_feeds(args)
+    return run_snapshot_pipeline(args)
+
+
+def cmd_add_snapshot_from_feeds(args: argparse.Namespace) -> int:
     target = args.target or most_recent_thursday()
     log.info("target snapshot date: %s (%s)", target, target.strftime("%a"))
 
-    cache_dir = Path.home() / ".cache" / "gas-prices-breakdown"
+    cache_dir = args.cache_dir or (
+        Path.home() / ".cache" / "gas-prices-breakdown"
+    )
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     html_text = read_html(args.html)
@@ -2361,14 +3361,19 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
         log.error("baseline snapshot %s not found", args.baseline)
         return 2
 
-    # Everything local settles first -- the auction tables, the override
-    # sweep's range, and the API key on disk -- so a run that cannot
-    # produce a snapshot fails before spending a single fetch.
+    # Check maintained inputs and independently retrieve their evidence
+    # before fetching price feeds or building anything for publication.
     cca = latest_auction(
         CARB_CCA_AUCTIONS, target, program="CARB_CCA_AUCTIONS"
     )
     wa = latest_auction(WA_CCA_AUCTIONS, target, program="WA_CCA_AUCTIONS")
     assert_adjustments_cover(target)
+    if WA_PPT_RATE is None:
+        raise SnapshotError("WA petroleum products collection is unresolved")
+    if NY_SALES_TAX is None:
+        raise SnapshotError("NY motor-fuel sales tax is unresolved")
+    if RESEARCH_DATA is not None:
+        verify_research_evidence(RESEARCH_DATA, cache_dir)
     key = load_eia_api_key()
 
     log.info("fetching AAA retail (live)...")
@@ -2401,6 +3406,7 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
 
     log.info("fetching federal and state tax table...")
     period = fetch_tax_period_for_target_date(target, cache_dir)
+    assert_researched_baseline(period)
     log.info(
         "EIA tax: %s edition, %d states, federal $%.4f",
         period.period,
@@ -2412,16 +3418,26 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
     in_gut = fetch_in_gut_for_target_date(target, cache_dir)
     log.info("IN GUT: %s $%.4f/gal", in_gut.month_start, in_gut.usd_per_gal)
 
+    pat = fetch_oh_pat_for_target_date(target, cache_dir)
+    log.info("OH PAT: %s to %s $%.3f/gal", pat.start, pat.end, pat.usd_per_gal)
+
     log.info("fetching wholesale benchmarks...")
     # Two states share the New York Harbor series, so the fetch is keyed
     # by series rather than by state.
     series_months = {
         name: load_spot_series(name, key)
-        for name in sorted(set(EIA_SPOT_SERIES.values()))
+        for name in sorted(
+            {
+                series
+                for state, series in EIA_SPOT_SERIES.items()
+                if state != "WA" or WA_PPT_RATE != 0
+            }
+        )
     }
     spot = {
         code: select_spot(series_months[name], target, name)
         for code, name in EIA_SPOT_SERIES.items()
+        if name in series_months
     }
     for code, quote in sorted(spot.items()):
         log.info(
@@ -2436,6 +3452,7 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
         cca=cca,
         wa=wa,
         orm=orm,
+        pat=pat,
     )
     new_block = build_snapshot_object(target, baseline, retail, sources)
     sanity_check_snapshot(new_block, target)
@@ -2444,6 +3461,7 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
         snapshots.blocks, new_block, target.isoformat()
     )
     new_html = render_snapshots(snapshots)
+    verify_append(html_text, new_html, target)
 
     if args.dry_run:
         log.info(
@@ -2453,9 +3471,7 @@ def cmd_add_snapshot(args: argparse.Namespace) -> int:
         )
         return 0
 
-    backup = backup_html(args.html)
-    log.info("backed up to %s", backup)
-    write_with_canonical_mode(args.html, new_html)
+    publish_snapshot(args.html, html_text, new_html)
     log.info(
         "wrote %d bytes (%d snapshots in array)",
         len(new_html),
@@ -2545,6 +3561,511 @@ def cmd_extract_markdown(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+def research_template(target: date) -> ResearchData:
+    """Seed editable research, leaving every jurisdiction unresolved."""
+    return ResearchData(
+        checked_from=target,
+        checked_through=target,
+        state_reviews=[
+            StateReview(state=code) for code in sorted(STATE_CODE.values())
+        ],
+        adjustments=[
+            Adjustment(
+                state=entry.state,
+                start=entry.start,
+                end=entry.end,
+                usd_per_gal=entry.usd_per_gal,
+                authority=entry.authority,
+                source_url=entry.source_url,
+            )
+            for entry in STATE_TAX_ADJUSTMENTS
+        ],
+        in_excise_suspensions=[
+            Suspension(start=start, end=end, authority=authority)
+            for start, end, authority in IN_EXCISE_SUSPENSIONS
+        ],
+        in_gut_suspensions=[
+            Suspension(start=start, end=end, authority=authority)
+            for start, end, authority in IN_GUT_SUSPENSIONS
+        ],
+        in_oil_inspection_fee=IN_OIL_INSPECTION_FEE,
+        in_oil_inspection_source_url=IN_OIL_INSPECTION_SOURCE_URL,
+        ny_sales_tax_source_url=NY_SALES_SOURCE_URL,
+        wa_ppt_source_url=GROSS_RECEIPTS_SOURCE_URLS["WA"],
+        carb_auctions=[
+            Auction(day=day, price=price, label=label)
+            for day, price, label in CARB_CCA_AUCTIONS
+        ],
+        wa_auctions=[
+            Auction(day=day, price=price, label=label)
+            for day, price, label in WA_CCA_AUCTIONS
+        ],
+        de_hsca_rates=[
+            DatedRate(day=day, rate=rate) for day, rate in DE_HSCA_RATES
+        ],
+        auction_sources=[CARB_CCA_PROGRAM_URL, WA_CCA_PROGRAM_URL],
+        de_hsca_source_url=GROSS_RECEIPTS_SOURCE_URLS["DE"],
+    )
+
+
+def load_research(path: Path, target: date) -> ResearchData:
+    try:
+        data = ResearchData.model_validate_json(path.read_bytes())
+        data.validate_for(target, set(STATE_CODE.values()))
+    except (OSError, ValidationError, ValueError) as exc:
+        raise SnapshotError(f"research {path}: {_describe(exc)}") from exc
+    return data
+
+
+class _SourceHtml(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.ignored: str | None = None
+
+    def handle_starttag(
+        self, tag: str, _attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag in ("script", "style"):
+            self.ignored = tag
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == self.ignored:
+            self.ignored = None
+
+    def handle_data(self, data: str) -> None:
+        if self.ignored is None and data.strip():
+            self.parts.append(data.strip())
+
+
+def _source_html_text(value: str) -> str:
+    parser = _SourceHtml()
+    parser.feed(value)
+    return "\n".join(parser.parts)
+
+
+def _source_json_text(value: JsonValue) -> str:
+    if isinstance(value, dict):
+        return "\n".join(
+            f"{key}\n{_source_json_text(item)}" for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return "\n".join(_source_json_text(item) for item in value)
+    if isinstance(value, str):
+        return _source_html_text(value) if "<" in value else value
+    return "" if value is None else str(value)
+
+
+def _source_text(raw: bytes, url: str) -> str:
+    if raw.startswith(b"%PDF"):
+        try:
+            with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                text = "\n".join(
+                    page.extract_text() or "" for page in pdf.pages
+                )
+        except (PdfminerException, ValueError) as exc:
+            raise SnapshotError(
+                f"primary PDF {url}: {_describe(exc)}"
+            ) from exc
+        if not text.strip():
+            raise SnapshotError(
+                f"primary PDF {url} has no extractable text; "
+                "use a primary text notice or code-data endpoint"
+            )
+        return text
+    if raw.startswith(b"PK"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                if "xl/workbook.xml" not in archive.namelist():
+                    raise SnapshotError(
+                        f"primary source {url}: "
+                        + "use a text, PDF or XLSX document"
+                    )
+            wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+        except (ValueError, OSError, zipfile.BadZipFile) as exc:
+            raise SnapshotError(
+                f"primary workbook {url}: {_describe(exc)}"
+            ) from exc
+        lines: list[str] = []
+        for sheet in wb:
+            lines.append(sheet.title)
+            lines.extend(
+                "\t".join(str(cell) for cell in row if cell is not None)
+                for row in sheet.iter_rows(values_only=True)
+            )
+        return "\n".join(lines)
+    decoded = raw.decode("utf-8", errors="replace")
+    if decoded.lstrip().startswith(("{", "[")):
+        try:
+            value = TypeAdapter(JsonValue).validate_json(raw)
+        except ValidationError as exc:
+            raise SnapshotError(
+                f"primary JSON {url}: {_describe(exc)}"
+            ) from exc
+        return _source_json_text(value)
+    if "<html" in decoded.lower() or "<!doctype html" in decoded.lower():
+        return _source_html_text(decoded)
+    return decoded
+
+
+@dataclass(frozen=True)
+class SourceDocument:
+    source_url: str
+    text: str
+    text_path: Path
+
+
+def fetch_source_bytes(url: str) -> bytes:
+    """Retrieve a bounded primary document with TLS verification."""
+    if not (official_url(url) or url == AAA_URL):
+        raise SnapshotError(f"not a primary source URL: {url}")
+    if urllib.parse.urlsplit(url).hostname == "api.eia.gov":
+        raise SnapshotError("the EIA API is owned by the price-feed utility")
+    try:
+        response = source_requests.get(url, impersonate="chrome", timeout=30)
+    except CertificateVerifyError as certificate_error:
+        # macOS's system client can build chains the bundled client cannot.
+        # It still verifies TLS; a failure by both clients stops the run.
+        curl = "/usr/bin/curl" if sys.platform == "darwin" else "curl"
+        try:
+            result = subprocess.run(
+                [
+                    curl,
+                    "--fail",
+                    "--location",
+                    "--silent",
+                    "--show-error",
+                    "--user-agent",
+                    USER_AGENT,
+                    "--max-time",
+                    "30",
+                    "--",
+                    url,
+                ],
+                capture_output=True,
+                check=False,
+                timeout=35,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SnapshotError(
+                f"primary source {url}: curl timed out"
+            ) from exc
+        if result.returncode != 0:
+            raise SnapshotError(
+                f"primary source {url}: curl exited {result.returncode}"
+            ) from certificate_error
+        raw = result.stdout
+    except RequestException as exc:
+        raise SnapshotError(f"primary source {url}: {_describe(exc)}") from exc
+    else:
+        if response.status_code >= 400:
+            raise SnapshotError(
+                f"primary source {url}: HTTP {response.status_code}"
+            )
+        raw = response.content
+    if len(raw) > 20_000_000:
+        raise SnapshotError(
+            f"primary source {url} is too large; use a chapter"
+        )
+    return raw
+
+
+def fetch_source_document(url: str, cache_dir: Path) -> SourceDocument:
+    """Retrieve primary text independently of an agent's assertions."""
+    raw = fetch_source_bytes(url)
+    text = _source_text(raw, url)
+    if not text.strip():
+        raise SnapshotError(f"primary source {url} has no readable text")
+    directory = cache_dir / "research-sources"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{hashlib.sha256(url.encode()).hexdigest()}.txt"
+    write_with_canonical_mode(path, text)
+    return SourceDocument(url, text, path)
+
+
+def verify_research_evidence(data: ResearchData, cache_dir: Path) -> None:
+    """Reject unreachable citations and excerpts absent from primary text."""
+    evidence: list[tuple[str, SourceEvidence]] = [
+        (review.state, item)
+        for review in data.state_reviews
+        for item in review.evidence
+    ]
+    urls = sorted({item.source_url for _, item in evidence})
+
+    def retrieve(url: str) -> SourceDocument:
+        return fetch_source_document(url, cache_dir)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        documents = dict(zip(urls, pool.map(retrieve, urls), strict=True))
+    for state, item in evidence:
+        text = " ".join(documents[item.source_url].text.split())
+        excerpt = " ".join(item.excerpt.split())
+        if excerpt not in text:
+            raise SnapshotError(
+                f"{state}: cited excerpt is absent from {item.source_url}; "
+                "record an exact excerpt from research-source text"
+            )
+
+
+class SourceReceipt(TypedDict):
+    source_url: str
+    text_path: str
+    text_sha256: str
+
+
+def cmd_research_source(args: argparse.Namespace) -> int:
+    cache = args.cache_dir or Path.home() / ".cache/gas-prices-breakdown"
+    receipts: list[SourceReceipt] = []
+    for url in args.urls:
+        document = fetch_source_document(url, cache)
+        receipts.append(
+            {
+                "source_url": document.source_url,
+                "text_path": str(document.text_path),
+                "text_sha256": hashlib.sha256(
+                    document.text.encode()
+                ).hexdigest(),
+            }
+        )
+    print(json.dumps(receipts, indent=2))
+    return 0
+
+
+@contextlib.contextmanager
+def researched_tables(data: ResearchData) -> Iterator[None]:
+    """Use one run's research without changing the embedded seed tables."""
+    global TAX_ADJUSTMENTS_CHECKED_FROM, TAX_ADJUSTMENTS_CHECKED_THROUGH
+    global STATE_TAX_ADJUSTMENTS, IN_EXCISE_SUSPENSIONS, IN_GUT_SUSPENSIONS
+    global IN_OIL_INSPECTION_FEE, IN_OIL_INSPECTION_SOURCE_URL
+    global CARB_CCA_AUCTIONS, WA_CCA_AUCTIONS, DE_HSCA_RATES
+    global RESEARCH_EIA_TAX_PERIOD
+    global RESEARCH_EIA_BASELINE_SHA256
+    global WA_PPT_RATE, RESEARCH_DATA
+    global NY_SALES_TAX, NY_SALES_SOURCE_URL
+    original = (
+        NY_SALES_TAX,
+        NY_SALES_SOURCE_URL,
+        WA_PPT_RATE,
+        RESEARCH_DATA,
+        GROSS_RECEIPTS_SOURCE_URLS["WA"],
+        RESEARCH_EIA_TAX_PERIOD,
+        RESEARCH_EIA_BASELINE_SHA256,
+        TAX_ADJUSTMENTS_CHECKED_FROM,
+        TAX_ADJUSTMENTS_CHECKED_THROUGH,
+        STATE_TAX_ADJUSTMENTS,
+        IN_EXCISE_SUSPENSIONS,
+        IN_GUT_SUSPENSIONS,
+        IN_OIL_INSPECTION_FEE,
+        IN_OIL_INSPECTION_SOURCE_URL,
+        CARB_CCA_AUCTIONS,
+        WA_CCA_AUCTIONS,
+        DE_HSCA_RATES,
+        GROSS_RECEIPTS_SOURCE_URLS["DE"],
+    )
+    RESEARCH_EIA_TAX_PERIOD = data.eia_tax_period
+    NY_SALES_TAX = data.ny_sales_tax_usd_per_gal
+    if data.ny_sales_tax_source_url:
+        NY_SALES_SOURCE_URL = data.ny_sales_tax_source_url
+    WA_PPT_RATE = data.wa_ppt_rate
+    RESEARCH_DATA = data
+    if data.wa_ppt_source_url:
+        GROSS_RECEIPTS_SOURCE_URLS["WA"] = data.wa_ppt_source_url
+    RESEARCH_EIA_BASELINE_SHA256 = data.eia_baseline_sha256
+    TAX_ADJUSTMENTS_CHECKED_FROM = data.checked_from
+    TAX_ADJUSTMENTS_CHECKED_THROUGH = data.checked_through
+    STATE_TAX_ADJUSTMENTS = [
+        TaxAdjustment(
+            entry.state,
+            entry.start,
+            entry.end,
+            entry.usd_per_gal,
+            entry.authority,
+            entry.source_url,
+        )
+        for entry in data.adjustments
+    ]
+    IN_EXCISE_SUSPENSIONS = [
+        (entry.start, entry.end, entry.authority)
+        for entry in data.in_excise_suspensions
+    ]
+    IN_GUT_SUSPENSIONS = [
+        (entry.start, entry.end, entry.authority)
+        for entry in data.in_gut_suspensions
+    ]
+    IN_OIL_INSPECTION_FEE = data.in_oil_inspection_fee
+    IN_OIL_INSPECTION_SOURCE_URL = data.in_oil_inspection_source_url
+    CARB_CCA_AUCTIONS = [
+        (entry.day, entry.price, entry.label) for entry in data.carb_auctions
+    ]
+    WA_CCA_AUCTIONS = [
+        (entry.day, entry.price, entry.label) for entry in data.wa_auctions
+    ]
+    CCA_AUCTION_TABLES["CARB_CCA_AUCTIONS"] = CARB_CCA_AUCTIONS
+    CCA_AUCTION_TABLES["WA_CCA_AUCTIONS"] = WA_CCA_AUCTIONS
+    DE_HSCA_RATES = [(entry.day, entry.rate) for entry in data.de_hsca_rates]
+    GROSS_RECEIPTS_SOURCE_URLS["DE"] = data.de_hsca_source_url
+    try:
+        yield
+    finally:
+        (
+            NY_SALES_TAX,
+            NY_SALES_SOURCE_URL,
+            WA_PPT_RATE,
+            RESEARCH_DATA,
+            GROSS_RECEIPTS_SOURCE_URLS["WA"],
+            RESEARCH_EIA_TAX_PERIOD,
+            RESEARCH_EIA_BASELINE_SHA256,
+            TAX_ADJUSTMENTS_CHECKED_FROM,
+            TAX_ADJUSTMENTS_CHECKED_THROUGH,
+            STATE_TAX_ADJUSTMENTS,
+            IN_EXCISE_SUSPENSIONS,
+            IN_GUT_SUSPENSIONS,
+            IN_OIL_INSPECTION_FEE,
+            IN_OIL_INSPECTION_SOURCE_URL,
+            CARB_CCA_AUCTIONS,
+            WA_CCA_AUCTIONS,
+            DE_HSCA_RATES,
+            GROSS_RECEIPTS_SOURCE_URLS["DE"],
+        ) = original
+        CCA_AUCTION_TABLES["CARB_CCA_AUCTIONS"] = CARB_CCA_AUCTIONS
+        CCA_AUCTION_TABLES["WA_CCA_AUCTIONS"] = WA_CCA_AUCTIONS
+
+
+class TaxBaseline(TypedDict):
+    period: str
+    federal: float
+    state_totals: dict[str, float]
+    state_excise: dict[str, float]
+    state_notes: dict[str, str]
+    computed_supplements: dict[str, str]
+    unquantified_exclusions: dict[str, str]
+    fee_allocation_policy: str
+    required_evidence_topics: dict[str, list[str]]
+    source_url: str
+    sha256: str
+
+
+def tax_baseline_sha256(period: TaxPeriod) -> str:
+    """Identify the selected rates, including their publication period."""
+    encoded = json.dumps(
+        (
+            period.period.isoformat(),
+            period.federal,
+            period.per_state,
+            period.excise,
+            period.notes,
+        ),
+        sort_keys=True,
+    )
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def assert_researched_baseline(period: TaxPeriod) -> None:
+    actual = tax_baseline_sha256(period)
+    if RESEARCH_EIA_TAX_PERIOD is not None and (
+        period.period != RESEARCH_EIA_TAX_PERIOD
+        or actual != RESEARCH_EIA_BASELINE_SHA256
+    ):
+        raise SnapshotError(
+            f"EIA tax baseline mismatch: research {RESEARCH_EIA_TAX_PERIOD} "
+            f"{RESEARCH_EIA_BASELINE_SHA256}; selected {period.period} "
+            f"{actual}. Assign the period and sha256 from "
+            "research-template --tax-baseline JSON"
+        )
+
+
+def cmd_research_template(args: argparse.Namespace) -> int:
+    if args.schema:
+        print(json.dumps(ResearchData.model_json_schema(), indent=2))
+    elif args.tax_baseline:
+        cache = args.cache_dir or (
+            Path.home() / ".cache" / "gas-prices-breakdown"
+        )
+        cache.mkdir(parents=True, exist_ok=True)
+        period = fetch_tax_period_for_target_date(
+            args.target or most_recent_thursday(), cache
+        )
+        baseline: TaxBaseline = {
+            "period": period.period.isoformat(),
+            "federal": period.federal,
+            "state_totals": period.per_state,
+            "state_excise": period.excise,
+            "state_notes": period.notes,
+            "unquantified_exclusions": UNQUANTIFIED_FEE_NOTES,
+            "fee_allocation_policy": FEE_ALLOCATION_POLICY,
+            "computed_supplements": {
+                "IN": "Excise, monthly gasoline use tax and inspection fee; "
+                "the two suspensions are separate researched windows",
+                "CT": "8.1% of New York Harbor spot, capped at $3 per gallon",
+                "DE": "Annual HSCA fraction of New York Harbor spot",
+                "HI": "4% of retail; county surcharges excluded",
+                "OH": "0.65% of Ohio's published quarterly PAT tax base",
+                "NY": "Researched statewide motor-fuel sales tax per gallon; "
+                "the EIA exclusion is added separately, without MCTD",
+                "WA": "Researched PPT collection fraction of Los Angeles "
+                "RBOB spot; zero means verified noncollection",
+            },
+            "required_evidence_topics": {
+                state: [
+                    topic.value for topic in sorted(required_topics(state))
+                ]
+                for state in sorted(STATE_CODE.values())
+            },
+            "source_url": period.source_url,
+            "sha256": tax_baseline_sha256(period),
+        }
+        print(json.dumps(baseline, indent=2))
+    else:
+        target = args.target or most_recent_thursday()
+        if args.previous_research is None:
+            data = research_template(target)
+        else:
+            try:
+                previous = ResearchData.model_validate_json(
+                    args.previous_research.read_bytes()
+                )
+            except (OSError, ValueError) as exc:
+                raise SnapshotError(
+                    f"previous research: {_describe(exc)}"
+                ) from exc
+            with researched_tables(previous):
+                data = research_template(target)
+            data.adjustments = [
+                entry
+                for entry in data.adjustments
+                if not excluded_fee_source(entry.state, entry.source_url)
+            ]
+            hints = {review.state: review for review in previous.state_reviews}
+            for review in data.state_reviews:
+                hint = hints.get(review.state)
+                if hint is None:
+                    continue
+                review.sources = hint.sources.copy()
+                review.note = (
+                    f"Previous review on {previous.checked_through}: "
+                    + hint.note
+                )
+        print(data.model_dump_json(indent=2))
+    return 0
+
+
+def cmd_validate_research(args: argparse.Namespace) -> int:
+    target = args.target or most_recent_thursday()
+    data = load_research(args.research, target)
+    cache = args.cache_dir or Path.home() / ".cache/gas-prices-breakdown"
+    cache.mkdir(parents=True, exist_ok=True)
+    with researched_tables(data):
+        latest_auction(CARB_CCA_AUCTIONS, target, program="CARB_CCA_AUCTIONS")
+        latest_auction(WA_CCA_AUCTIONS, target, program="WA_CCA_AUCTIONS")
+        select_de_hsca_rate(target)
+        assert_researched_baseline(
+            fetch_tax_period_for_target_date(target, cache)
+        )
+    verify_research_evidence(data, cache)
+    log.info("research covers %s and all 51 jurisdictions", target)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -2580,11 +4101,78 @@ def main(argv: list[str] | None = None) -> int:
         help="snapshot to inherit state-tax structure from",
     )
     p_add.add_argument(
+        "--research",
+        type=Path,
+        help="validated research JSON for maintained rates and overrides",
+    )
+    p_add.add_argument(
+        "--cache-dir",
+        type=Path,
+        help="override the download cache directory",
+    )
+    p_add.add_argument(
         "--dry-run",
         action="store_true",
         help="fetch and build but do not modify the HTML",
     )
+    p_add.add_argument(
+        "--state-dir",
+        type=Path,
+        default=Path.home() / ".local/state/gas-prices-breakdown",
+        help="checkpoint and run artifact directory",
+    )
+    p_add.add_argument(
+        "--inputs",
+        type=Path,
+        help="reuse a saved collected.json input set, including in dry runs",
+    )
+    p_add.add_argument(
+        "--agent",
+        type=AgentCli,
+        choices=list(AgentCli),
+        default=os.environ.get("GAS_PRICES_AGENT", "claude"),
+    )
+    p_add.add_argument(
+        "--model",
+        help="model name passed to the selected CLI (default: CLI settings)",
+    )
+    p_add.add_argument(
+        "--agent-command",
+        default=os.environ.get("GAS_PRICES_AGENT_COMMAND"),
+        help="custom JSON argv containing {prompt}, and {model} if selected",
+    )
     p_add.set_defaults(func=cmd_add_snapshot)
+
+    p_seed = sub.add_parser(
+        "research-template", help="print seed data or JSON Schema"
+    )
+    p_seed.add_argument("--target", type=date.fromisoformat)
+    output = p_seed.add_mutually_exclusive_group()
+    output.add_argument("--schema", action="store_true")
+    output.add_argument(
+        "--tax-baseline",
+        action="store_true",
+        help="fetch the EIA tax baseline",
+    )
+    p_seed.add_argument("--cache-dir", type=Path)
+    p_seed.add_argument("--previous-research", type=Path)
+    p_seed.set_defaults(func=cmd_research_template)
+
+    p_check = sub.add_parser(
+        "validate-research",
+        help="check research, tax baseline and primary evidence",
+    )
+    p_check.add_argument("research", type=Path)
+    p_check.add_argument("--target", type=date.fromisoformat)
+    p_check.add_argument("--cache-dir", type=Path)
+    p_check.set_defaults(func=cmd_validate_research)
+
+    p_source = sub.add_parser(
+        "research-source", help="retain readable primary-source evidence"
+    )
+    p_source.add_argument("urls", nargs="+")
+    p_source.add_argument("--cache-dir", type=Path)
+    p_source.set_defaults(func=cmd_research_source)
 
     p_rm = sub.add_parser(
         "remove-snapshot", help="remove a snapshot by its date"
@@ -2625,8 +4213,16 @@ def main(argv: list[str] | None = None) -> int:
     # be restated here for the subcommand contract to be checked.
     handler: Callable[[argparse.Namespace], int] = args.func
     try:
+        if args.command == "add-snapshot" and args.research is not None:
+            data = load_research(
+                args.research, args.target or most_recent_thursday()
+            )
+            with researched_tables(data):
+                return locked_add_snapshot(args)
+        if args.command == "add-snapshot":
+            return locked_add_snapshot(args)
         return handler(args)
-    except SnapshotError as exc:
+    except (SnapshotError, OSError) as exc:
         log.error("%s", exc)
         return 1
 

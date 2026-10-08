@@ -635,7 +635,7 @@ def test_or_cfp_workbook_with_nothing_published_yet_is_reported(
 # Hand-maintained auction tables
 # ---------------------------------------------------------------------------
 #
-# These are the only inputs a human has to top up, which makes a missed
+# These are quarterly inputs, which makes a missed
 # update the likeliest way a wrong number reaches the page: the lookup
 # keeps answering with the last entry, and nothing about that looks like
 # a failure.
@@ -735,8 +735,7 @@ def test_emitted_ca_nontax_fragment_is_well_formed() -> None:
     note = re.search(r'note:"((?:[^"\\]|\\.)*)"', fragment)
     assert note is not None, "note field is not a parseable string literal"
     assert "Argus" in note.group(1)
-    assert "not exact" in note.group(1)
-    assert gpb.LCFS_LAST_CARB_WEEK.isoformat() in note.group(1)
+    assert "estimate" in note.group(1)
 
 
 # ---------------------------------------------------------------------------
@@ -941,6 +940,18 @@ def _periods(
     book = tmp_path / "fueltaxes.xlsx"
     _tax_workbook(book, sheets, federal)
     return gpb._read_tax_periods(book)
+
+
+def test_tax_notes_preserve_qualifications_without_diesel_numbers() -> None:
+    wb = openpyxl.Workbook()
+    _tax_sheet(wb, "July 2026", _flat_rates(), 0.184)
+    ws = wb["July 2026"]
+    for row in ws:
+        if row[0].value == "New York":
+            ws.cell(row[0].row, 5, 0.484)
+            ws.cell(row[0].row, 12, "Additional state sales tax is excluded.")
+    period = gpb._read_tax_sheet(wb, "July 2026", date(2026, 7, 1))
+    assert period.notes["NY"] == "Additional state sales tax is excluded."
 
 
 def test_tax_sheets_are_keyed_by_the_date_they_take_effect(
@@ -1411,10 +1422,10 @@ def test_overrides_do_not_overlap_within_a_state() -> None:
             assert earlier.end < later.start
 
 
-def test_every_override_is_a_reduction_with_an_authority() -> None:
-    """A positive figure would be a rate rise, which the table carries."""
+def test_every_adjustment_changes_the_rate_with_an_authority() -> None:
+    """Corrections can restore missing fees or subtract suspended taxes."""
     for entry in gpb.STATE_TAX_ADJUSTMENTS:
-        assert entry.usd_per_gal < 0
+        assert entry.usd_per_gal != 0
         assert entry.authority
         assert entry.source_url.startswith("https://")
         assert entry.state in gpb.STATE_CODE.values()
@@ -1466,14 +1477,14 @@ def test_a_date_outside_the_sweep_is_refused_in_both_directions() -> None:
         assert "swept only for" in str(caught.value)
 
 
-def test_indiana_checked_through_covers_every_shipped_window() -> None:
-    """A window reaching past the check would be trusted unverified."""
-    ends = [
-        end
+def test_no_indiana_suspension_starts_before_the_sweep_began() -> None:
+    """Known ends can exceed the sweep, just as other states' can."""
+    starts = [
+        start
         for windows in (gpb.IN_EXCISE_SUSPENSIONS, gpb.IN_GUT_SUSPENSIONS)
-        for _, end, _ in windows
+        for start, _, _ in windows
     ]
-    assert max(ends) <= gpb.TAX_ADJUSTMENTS_CHECKED_THROUGH
+    assert min(starts) >= gpb.TAX_ADJUSTMENTS_CHECKED_FROM
 
 
 def test_the_indiana_code_citation_covers_the_swept_range() -> None:
@@ -1492,7 +1503,7 @@ def test_the_indiana_code_citation_covers_the_swept_range() -> None:
         "can no longer name one code edition for every snapshot"
     )
     year = years.pop()
-    assert f"/laws/{year}/" in gpb.IN_OIL_INSPECTION_SOURCE_URL, (
+    assert f"/ic/{year}/" in gpb.IN_OIL_INSPECTION_SOURCE_URL, (
         f"the sweep prices {year}; move IN_OIL_INSPECTION_SOURCE_URL "
         f"to that code edition"
     )
@@ -1527,7 +1538,9 @@ def test_indiana_use_tax_suspension_leaves_the_excise_collected() -> None:
     assert got.total == 0.37
     assert got.gut == 0.0
     assert got.excise == 0.36
-    assert got.suspended == ("gasoline use tax (EO 26-09 through 26-25-1)",)
+    assert got.suspended == (
+        f"gasoline use tax ({gpb.IN_GUT_SUSPENSIONS[0][2]})",
+    )
 
 
 def test_indiana_with_both_suspended_keeps_only_the_inspection_fee() -> None:
@@ -1546,7 +1559,7 @@ def test_indiana_with_both_suspended_keeps_only_the_inspection_fee() -> None:
         (date(2026, 4, 8), False, True),
         (date(2026, 5, 5), False, True),
         (date(2026, 5, 6), True, True),
-        (date(2026, 10, 5), True, True),
+        (gpb.IN_EXCISE_SUSPENSIONS[0][1], True, True),
     ],
     ids=["day_before", "gut_starts", "gut_only", "excise_starts", "last_day"],
 )
@@ -1605,12 +1618,37 @@ def test_hawaii_is_a_share_of_the_pump_price() -> None:
     assert got.exact is True
 
 
-def test_connecticut_above_the_cap_is_the_statutory_constant() -> None:
-    """Rack sits above spot, so a spot at the cap proves the cap binds."""
+def test_washington_prices_the_researched_fraction_as_an_estimate() -> None:
+    with patch.object(gpb, "WA_PPT_RATE", 0.003):
+        got = gpb.resolve_gross_receipts("WA", DAY, 4.4, _spot(3.2))
+    assert got.usd_per_gal == 0.0096
+    assert got.exact is False
+    assert "Los Angeles RBOB" in got.basis
+
+
+def test_washington_noncollection_needs_no_benchmark() -> None:
+    with patch.object(gpb, "WA_PPT_RATE", 0.0):
+        got = gpb.resolve_gross_receipts("WA", DAY, 4.4, None)
+    assert got.usd_per_gal == 0.0 and got.exact is True
+
+
+@pytest.mark.parametrize("rate", [None, 0.003])
+def test_washington_refuses_unresolved_collection_or_a_missing_benchmark(
+    rate: float | None,
+) -> None:
+    with (
+        patch.object(gpb, "WA_PPT_RATE", rate),
+        pytest.raises(gpb.SnapshotError),
+    ):
+        gpb.resolve_gross_receipts("WA", DAY, 4.4, None)
+
+
+def test_connecticut_above_the_cap_keeps_the_benchmark_qualification() -> None:
     got = gpb.resolve_gross_receipts("CT", DAY, 4.492, _spot(3.213))
     assert got.usd_per_gal == round(gpb.CT_PGET_RATE * gpb.CT_PGET_CAP_USD, 4)
-    assert got.exact is True
+    assert got.exact is False
     assert "cap" in got.basis
+    assert "actual taxable rack price" in got.basis
 
 
 def test_connecticut_below_the_cap_is_an_estimate() -> None:
@@ -1621,28 +1659,28 @@ def test_connecticut_below_the_cap_is_an_estimate() -> None:
     assert "2026-01" in got.basis
 
 
-def test_connecticut_exactly_at_the_cap_counts_as_capped() -> None:
-    """The boundary belongs to the side where the statute decides."""
+def test_connecticut_exactly_at_the_cap_is_still_an_estimate() -> None:
     got = gpb.resolve_gross_receipts(
         "CT", DAY, 4.492, _spot(gpb.CT_PGET_CAP_USD)
     )
-    assert got.exact is True
+    assert got.usd_per_gal == round(gpb.CT_PGET_RATE * gpb.CT_PGET_CAP_USD, 4)
+    assert got.exact is False
 
 
 @pytest.mark.parametrize(
     ("state", "rate"),
-    [("DE", gpb.select_de_hsca_rate(DAY)), ("OH", gpb.OH_PAT_RATE)],
+    [("DE", gpb.select_de_hsca_rate(DAY))],
 )
 def test_wholesale_states_scale_with_the_benchmark(
     state: str, rate: float
 ) -> None:
-    """Neither has a cap, so the benchmark carries the whole figure."""
+    """Delaware's uncapped calculation uses the disclosed proxy."""
     got = gpb.resolve_gross_receipts(state, DAY, 4.4, _spot(3.2))
     assert got.usd_per_gal == round(rate * 3.2, 4)
     assert got.exact is False
 
 
-@pytest.mark.parametrize("state", ["CT", "DE", "OH"])
+@pytest.mark.parametrize("state", ["CT", "DE"])
 def test_wholesale_states_without_a_benchmark_are_refused(
     state: str,
 ) -> None:
@@ -1656,6 +1694,105 @@ def test_delaware_rate_tracks_the_year_it_was_reset_for() -> None:
     """The rate changes every January 1, so the year decides it."""
     assert gpb.select_de_hsca_rate(date(2025, 6, 1)) == 0.01120
     assert gpb.select_de_hsca_rate(date(2026, 6, 1)) == 0.011902
+
+
+def _pat_notice(day: date, price: str = "3.041") -> str:
+    start, end = gpb.pat_quarter(day)
+    published = start - timedelta(days=15)
+    return (
+        f"Publication Date: {published:%B %d, %Y}\n"
+        f"Period: {start:%m/%d/%Y} - {end:%m/%d/%Y}\n"
+        f"Unleaded Regular Gasoline ${price}\n"
+        "Diesel Fuel $9.999\n"
+    )
+
+
+@pytest.mark.parametrize("month", [1, 4, 7, 10])
+def test_pat_uses_the_prescribed_quarter_and_gasoline_price(
+    month: int,
+) -> None:
+    first = date(2026, month, 1)
+    _, last = gpb.pat_quarter(first)
+    quote = gpb.parse_pat_notice(
+        _pat_notice(first), "https://tax.ohio.gov/quarter.pdf", last
+    )
+    got = gpb.resolve_gross_receipts("OH", last, 4.4, None, quote)
+    assert got.usd_per_gal == 0.0198
+    assert got.exact is True
+    with pytest.raises(gpb.SnapshotError, match="quarter"):
+        gpb.resolve_gross_receipts(
+            "OH", last + timedelta(days=1), 4.4, _spot(10), quote
+        )
+
+
+@pytest.mark.parametrize("defect", ["period", "future", "price", "missing"])
+def test_pat_notice_cannot_supply_an_unverified_value(defect: str) -> None:
+    day = date(2026, 10, 8)
+    text = _pat_notice(day)
+    if defect == "period":
+        text = text.replace("10/01/2026", "07/01/2026")
+    elif defect == "future":
+        text = text.replace("September 16, 2026", "November 01, 2026")
+    elif defect == "price":
+        text = _pat_notice(day, "0.000")
+    else:
+        text = text.replace("Unleaded Regular Gasoline", "Propane")
+    with pytest.raises(gpb.SnapshotError, match="OH PAT"):
+        gpb.parse_pat_notice(text, "https://tax.ohio.gov/quarter.pdf", day)
+
+
+def test_pat_fetch_follows_the_period_link_and_verifies_the_notice(
+    tmp_path: Path,
+) -> None:
+    day = date(2026, 10, 8)
+    url = "https://dam.assets.ohio.gov/current.pdf"
+    html = (
+        '<a href="wrong.pdf">07/01/2026 - 09/30/2026 - '
+        "PAT Average Wholesale Prices</a>"
+        f'<a href="{url}">10/01/2026 - 12/31/2026 - '
+        "<span>PAT Average Wholesale Prices</span></a>"
+    ).encode()
+    document = gpb.SourceDocument(url, _pat_notice(day), tmp_path / "q.txt")
+    with (
+        patch.object(
+            gpb, "fetch_source_bytes", autospec=True, return_value=html
+        ) as page,
+        patch.object(
+            gpb, "fetch_source_document", autospec=True, return_value=document
+        ) as notice,
+    ):
+        quote = gpb.fetch_oh_pat_for_target_date(day, tmp_path)
+    page.assert_called_once_with(gpb.OH_PAT_URL)
+    notice.assert_called_once_with(url, tmp_path)
+    assert quote.source_url == url
+    assert quote.usd_per_gal == 3.041
+
+
+def test_ohio_does_not_fall_back_to_a_market_proxy() -> None:
+    with pytest.raises(gpb.SnapshotError, match="quarter notice"):
+        gpb.resolve_gross_receipts("OH", DAY, 4.4, _spot(3.2))
+
+
+@pytest.mark.parametrize(
+    "state", ["LA", "MA", "ME", "MS", "OR", "PA", "TX", "WI"]
+)
+def test_unquantified_fees_leave_supported_state_values(
+    state: str,
+) -> None:
+    period = _tax_period()
+    tax = gpb.compose_state_tax(
+        state,
+        DAY,
+        period,
+        4.4,
+        gpb.InGutRate(date(2026, 9, 1), 0.239, "https://in.gov/notice.pdf"),
+        {},
+    )
+    assert tax.total == period.per_state[state]
+    assert len(tax.parts) == 1
+    assert tax.parts[0].usd_per_gal == period.per_state[state]
+    assert "unquantified" in tax.parts[0].note.casefold()
+    assert "residual includes" in tax.parts[0].note
 
 
 def test_delaware_rate_picks_the_newest_regardless_of_table_order() -> None:
@@ -1798,7 +1935,7 @@ def test_spot_response_with_no_priced_months_is_reported() -> None:
 def test_missing_api_key_names_the_file_and_the_registration(
     tmp_path: Path,
 ) -> None:
-    """A run without the key fails rather than skipping four states."""
+    """A run without the key fails rather than skipping wholesale taxes."""
     with (
         patch.object(gpb, "EIA_API_KEY_PATH", tmp_path / "absent"),
         pytest.raises(gpb.SnapshotError) as caught,
@@ -2065,15 +2202,49 @@ def _add_snapshot_sources(
     retail: float = 3.5,
     period: gpb.TaxPeriod | None = None,
     gut_month: date = date(2026, 9, 1),
+    retail_error: gpb.FetchError | None = None,
 ) -> Iterator[None]:
     """Stub every fetch add-snapshot makes, so no test touches a network."""
     lcfs, _cca, _wa, orm = _sample_sources()
+
+    def source_document(url: str, cache: Path) -> gpb.SourceDocument:
+        return gpb.SourceDocument(
+            url,
+            "Test primary evidence for mocked gas-tax inputs.",
+            cache / "source.txt",
+        )
+
+    def pat_quote(day: date, _cache: Path) -> gpb.PatQuote:
+        start, end = gpb.pat_quarter(day)
+        return gpb.PatQuote(
+            start,
+            end,
+            start - timedelta(days=15),
+            3.041,
+            "https://tax.ohio.gov/test-quarter.pdf",
+        )
+
     with (
+        patch.object(
+            gpb,
+            "run_snapshot_pipeline",
+            autospec=True,
+            side_effect=gpb.cmd_add_snapshot_from_feeds,
+        ),
+        patch.object(gpb, "WA_PPT_RATE", 0.0),
+        patch.object(gpb, "NY_SALES_TAX", 0.0),
+        patch.object(
+            gpb,
+            "fetch_source_document",
+            autospec=True,
+            side_effect=source_document,
+        ),
         patch.object(
             gpb,
             "fetch_aaa_retail",
             autospec=True,
             return_value=dict.fromkeys(CODES, retail),
+            side_effect=retail_error,
         ),
         patch.object(
             gpb, "fetch_lcfs_for_target_date", autospec=True, return_value=lcfs
@@ -2097,6 +2268,12 @@ def _add_snapshot_sources(
             return_value=gpb.InGutRate(
                 gut_month, 0.239, "https://example.invalid/dn02.pdf"
             ),
+        ),
+        patch.object(
+            gpb,
+            "fetch_oh_pat_for_target_date",
+            autospec=True,
+            side_effect=pat_quote,
         ),
         patch.object(
             gpb, "load_eia_api_key", autospec=True, return_value="key"
@@ -2170,11 +2347,7 @@ def test_every_hand_entered_string_reaching_the_page_is_escaped(
 def test_a_benchmark_derived_figure_says_so_on_the_page(
     tmp_path: Path,
 ) -> None:
-    """A reader must be able to tell an estimate from the statute.
-
-    Connecticut above its cap and Delaware against a spot benchmark are
-    the two shapes, and only one of them is exact.
-    """
+    """A statutory cap does not establish the proxy's actual taxable base."""
     html = tmp_path / "page.html"
     html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
     with _backups_under(tmp_path), _add_snapshot_sources():
@@ -2185,7 +2358,7 @@ def test_a_benchmark_derived_figure_says_so_on_the_page(
     built = gpb.parse_snapshots(html.read_text()).blocks[0]
     blocks = dict(gpb.split_state_blocks(built))
     assert "Estimated." in blocks["DE"]
-    assert "Estimated." not in blocks["CT"]
+    assert "Estimated." in blocks["CT"]
 
 
 def test_add_snapshot_round_trip_splices_a_built_block_in(

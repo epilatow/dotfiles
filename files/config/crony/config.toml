@@ -71,7 +71,10 @@ uuid = "ecdad114-711e-418a-9a66-3e65882e3d61"
 
 [job.u-www-gas-prices]
 script    = "~/.local/libexec/gas-prices-breakdown/gas-prices-breakdown"
-args      = ["add-snapshot", "~/home/public_html/gas-prices-breakdown.html"]
+args      = [
+    "add-snapshot", "~/home/public_html/gas-prices-breakdown.html",
+    "--agent", "claude", "--model", "opus",
+]
 hosts     = ["squee"]
 uuid = "7f5100fa-4af2-437f-8321-82aadc0a0ac1"
 

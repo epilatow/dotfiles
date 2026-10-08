@@ -12,6 +12,7 @@ dependencies = [
     "openpyxl",
     "pdfplumber",
     "xlrd",
+    "pydantic>=2",
     "curl_cffi",
     "beautifulsoup4",
     "icalendar>=7.0",
@@ -22,11 +23,12 @@ epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = 
 
 [tool.mypy]
 python_version = "3.15"
-# `tests/test_gas_prices_breakdown.py` imports its subject through the
+# The gas-price tests import their subjects through the
 # `src/*.py` symlink, reaching it by extending sys.path at runtime. mypy
 # does not execute that, so the same directory has to be on its search
-# path for the import to resolve when the gate type-checks the test.
-mypy_path = ["src"]
+# path for the imports to resolve when the gate type-checks the tests.
+# The libexec directory also carries their shared research model.
+mypy_path = ["src", "files/local/libexec/gas-prices-breakdown"]
 
 [tool.ruff]
 target-version = "py315"
@@ -36,6 +38,14 @@ testpaths = ["_repo_shared/tests", "tests"]
 
 [tool.repo-shared.markdown]
 # No markdown exclusions are currently needed.
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "gas_prices_breakdown",
+    "gas_prices_agent",
+    "gas_prices_collectors",
+    "gas_prices_research",
+]
 
 [tool.repo-shared.code-quality]
 # The libexec entries are shebang scripts with no `.py` extension, which

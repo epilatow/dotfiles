@@ -57,3 +57,7 @@ Two settings follow from that import. `[tool.mypy] mypy_path` covers the gate,
 which type-checks the test without running its `sys.path` line, and whatever
 the script imports at module scope has to be in the project `dependencies`,
 since the test environment is not the PEP 723 one the script builds for itself.
+The gas-price tools also share a module beside their libexec entries; that
+directory is included in `mypy_path` so its imports are checked too. The
+gas-price modules are registered with Ruff as local modules for consistent
+import sorting.
