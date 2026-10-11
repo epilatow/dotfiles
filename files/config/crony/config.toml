@@ -63,6 +63,12 @@ args        = ["--apply"]
 gate        = 'test -d "${CODEX_HOME:-$HOME/.codex}/packages/standalone/releases"'
 uuid        = "bd1ea33c-c8cb-40bb-925b-a2fbdc2bba9e"
 
+[job.cleanup-uv-cache]
+command              = "uv cache prune"
+gate                 = "command -v uv"
+notify-success-ratio = "1/7"
+uuid = "ecdad114-711e-418a-9a66-3e65882e3d61"
+
 [job.u-www-gas-prices]
 script    = "~/.local/libexec/gas-prices-breakdown/gas-prices-breakdown"
 args      = ["add-snapshot", "~/home/public_html/gas-prices-breakdown.html"]
@@ -120,7 +126,7 @@ env.REPO    = "$HOME/src/github.com/epilatow/utils"
 hosts       = ["squee"]
 uuid = "70f668b3-e0d5-41d7-b40c-307756703a65"
 
-[job.u-misc-tz]
+[job.darwin-fix-tz]
 command   = "darwin-tz-watchdog"
 platforms = ["darwin"]
 uuid = "ca506c3d-0026-4705-a09a-16ecf7881f6c"
@@ -149,13 +155,13 @@ jobs     = ["u-www-cocktails", "u-www-recipes", "u-www-dpmr-cal", "u-www-gas-pri
 hosts    = ["squee"]
 uuid = "4977a66e-4c17-40f4-8e67-03012dce9894"
 
-[job-group.u-misc]
-jobs     = ["u-misc-tz"]
+[job-group.daily-misc]
+jobs = ["darwin-fix-tz", "cleanup-codex-cli", "cleanup-uv-cache"]
 uuid = "82d72cf7-de37-4de3-aaee-eb1ea63b3c56"
 
 [job-group.daily]
 schedule = "*-*-* 02:30"
-jobs     = ["u-rs", "u-www", "u-misc", "cleanup-codex-cli"]
+jobs     = ["u-rs", "u-www", "daily-misc"]
 uuid = "94593230-26d3-45f5-993b-fc4b352111df"
 
 # ----------------------------------------------------------------------------
