@@ -715,13 +715,13 @@ def test_the_launcher_aliases_run_commands_the_helper_accepts(
     } <= accepted_start_commands()
 
 
-def test_helper_is_python_314_uv_script() -> None:
+def test_helper_is_python_315_uv_script() -> None:
     lines = HELPER.read_text().splitlines()
 
     assert lines[:5] == [
         "#!/usr/bin/env -S uv run --script",
         "# /// script",
-        '# requires-python = ">=3.14"',
+        '# requires-python = ">=3.15,<3.16"',
         "# dependencies = []",
         "# ///",
     ]

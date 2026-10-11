@@ -82,6 +82,18 @@ slip-replacements list. Replies in the chat itself are display-only and
 ephemeral, so non-ASCII is fine there; the rule only applies to anything
 written to disk or sent to GitHub.
 
+## Library and module usage
+
+Use only public/exported interfaces that the library or module supports for
+consumer use. Do not call or rely on internal interfaces or implementation
+details. An interface being accessible does not mean it is public or supported.
+
+Exceptions are rare and must be explicitly confirmed with the user before using
+an internal interface. Explain why the exception is necessary and why supported
+public interfaces cannot meet the requirement. For each approved exception, add
+a code comment at the point of use identifying the internal interface and
+explaining why relying on it is necessary.
+
 ## Python installs
 
 Never `pip install` anything -- not system-wide, not per-user
