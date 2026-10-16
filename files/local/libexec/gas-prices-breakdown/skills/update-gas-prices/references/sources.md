@@ -29,7 +29,8 @@ supplements. Apply the [fee-allocation audit](fee-allocation.md): include fees
 when sourced information supports their per-gallon value; omit and disclose
 only those needing unavailable allocation inputs. A fee's name or annual
 billing schedule alone does not determine eligibility. A missing source for an
-included rate remains unresolved and blocks generation.
+included rate remains unresolved and blocks generation. Indiana's gasoline use
+tax is the one exception; the skill describes how the utility publishes it.
 
 A blocked page cannot establish a rate or change. Use another primary endpoint
 for required evidence. A forecast or study projection does not establish an

@@ -19,6 +19,7 @@ sys.path.insert(
 
 from test_gas_prices_breakdown import (
     CODES,
+    _add_snapshot_sources,
     _backups_under,
     _page,
     _sample_sources,
@@ -29,6 +30,7 @@ from test_gas_prices_job import TARGET, completed_research
 
 import gas_prices_breakdown as gpb
 import gas_prices_collectors as collectors
+from gas_prices_research import ReviewOutcome
 
 
 def collected() -> gpb.CollectedSnapshot:
@@ -331,6 +333,154 @@ def test_amendment_receipt_survives_a_source_disappearing_on_retry(
                 == final
             )
     fetch.assert_called_once_with(url)
+
+
+def test_collection_excludes_an_unusable_in_gut_notice(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One state's component must not withhold the whole snapshot.
+
+    The exclusion is not checkpointed, so a collection retried before
+    its inputs are saved asks the notice again rather than keeping the
+    failure.
+    """
+    state = tmp_path / "state"
+    with (
+        _add_snapshot_sources(gut_error=gpb.FetchError("notice offline")),
+        patch.object(
+            gpb, "collect_primary", autospec=True, side_effect=receipt
+        ),
+    ):
+        got = gpb.collect_snapshot_inputs(TARGET, state, tmp_path / "cache")
+    assert got.in_gut is None
+    assert "IN GUT: no usable rate" in caplog.text
+    parts = state / "input-parts" / str(TARGET)
+    assert (parts / "retail.json").exists()
+    assert not (parts / "indiana-use-tax.json").exists()
+
+
+@pytest.mark.parametrize(
+    "month",
+    [date(2026, 9, 1), date(2026, 8, 1), None],
+    ids=["target_month", "earlier_month", "unavailable"],
+)
+def test_collected_in_gut_validates_when_usable_or_absent(
+    month: date | None,
+) -> None:
+    rate = None if month is None else gpb.InGutRate(month, 0.239, "https://x/")
+    gpb.validate_collected_inputs(
+        collected().model_copy(update={"in_gut": rate}), TARGET
+    )
+
+
+def test_collected_in_gut_past_its_freshness_limit_is_refused() -> None:
+    month = date(2026, 6, 1)
+    assert (TARGET - month).days > gpb.IN_GUT_STALE_DAYS
+    stale = collected().model_copy(
+        update={"in_gut": gpb.InGutRate(month, 0.265, "https://x/")}
+    )
+    with pytest.raises(gpb.SnapshotError, match="over the"):
+        gpb.validate_collected_inputs(stale, TARGET)
+
+
+def _publish_indiana(tmp_path: Path, data: gpb.CollectedSnapshot) -> str:
+    """Publish `data` through the agent pipeline; return Indiana's row."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
+    inputs = tmp_path / "inputs.json"
+    inputs.write_text(data.model_dump_json(indent=2) + "\n")
+
+    def amend(_command: list[str], workspace: Path) -> int:
+        path = workspace / "amended.json"
+        result = gpb.AmendedSnapshot.model_validate_json(path.read_bytes())
+        result.status = gpb.AmendmentStatus.SUCCESS
+        result.explanation = "Known sourced inputs need no further amendments."
+        path.write_text(result.model_dump_json(indent=2) + "\n")
+        return 0
+
+    with (
+        _backups_under(tmp_path),
+        patch.object(gpb, "run_agent", autospec=True, side_effect=amend),
+        patch.object(
+            gpb, "collect_primary", autospec=True, side_effect=receipt
+        ),
+    ):
+        assert (
+            gpb.main(
+                [
+                    "add-snapshot",
+                    str(html),
+                    "--target",
+                    str(TARGET),
+                    "--inputs",
+                    str(inputs),
+                    "--state-dir",
+                    str(tmp_path / "state"),
+                ]
+            )
+            == 0
+        )
+    added = gpb.find_block_for_date(
+        gpb.parse_snapshots(html.read_text()).blocks, str(TARGET)
+    )
+    assert added is not None
+    return next(c for code, c in gpb.split_state_blocks(added) if code == "IN")
+
+
+@pytest.mark.parametrize(
+    "rate",
+    [
+        gpb.InGutRate(date(2026, 8, 1), 0.219, gpb.IN_GUT_NOTICE_URL),
+        None,
+    ],
+    ids=["earlier_month", "unavailable"],
+)
+def test_trailing_or_missing_in_gut_rate_still_publishes(
+    tmp_path: Path,
+    rate: gpb.InGutRate | None,
+) -> None:
+    """Indiana's notice trailing the target must not withhold the page.
+
+    TARGET falls inside both Indiana suspensions, so whatever the notice
+    offered, only the inspection fee is collected.
+    """
+    indiana = _publish_indiana(
+        tmp_path, collected().model_copy(update={"in_gut": rate})
+    )
+    assert f"fixed:{{ total:{gpb.IN_OIL_INSPECTION_FEE:.4f}," in indiana
+    assert 'n:"Gasoline use tax", v:0.0000' in indiana
+
+
+@pytest.mark.parametrize(
+    ("rate", "disclosure"),
+    [
+        (
+            gpb.InGutRate(date(2026, 8, 1), 0.219, gpb.IN_GUT_NOTICE_URL),
+            "Estimated: no Sep 2026 rate could be read",
+        ),
+        (None, gpb.IN_GUT_EXCLUSION_NOTE),
+    ],
+    ids=["earlier_month", "unavailable"],
+)
+def test_unsuspended_indiana_estimate_or_exclusion_publishes(
+    tmp_path: Path,
+    rate: gpb.InGutRate | None,
+    disclosure: str,
+) -> None:
+    """Outside a suspension the page says how the use tax was priced."""
+    data = collected().model_copy(update={"in_gut": rate}, deep=True)
+    data.research.in_excise_suspensions = []
+    data.research.in_gut_suspensions = []
+    for review in data.research.state_reviews:
+        if review.state == "IN":
+            review.outcome = ReviewOutcome.NO_OVERRIDE
+    indiana = _publish_indiana(tmp_path, data)
+    excise = data.period.excise["IN"]
+    gut = 0.0 if rate is None else rate.usd_per_gal
+    total = round(excise + gpb.IN_OIL_INSPECTION_FEE + gut, 4)
+    assert f"fixed:{{ total:{total:.4f}," in indiana
+    assert disclosure in indiana
 
 
 def test_already_published_snapshot_skips_collection_and_agent(

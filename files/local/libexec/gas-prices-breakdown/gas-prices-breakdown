@@ -39,12 +39,18 @@ Data sources:
   California LCFS credit assessment (see LCFS_MONITOR_URL for why it is
   not CARB's own series), Oregon DEQ CFP credit-transfer xlsx. Each
   carries a freshness bound; a run fails rather than publish a figure
-  too old to describe the date being snapshotted.
+  too old to describe the date being snapshotted. Indiana's use tax is
+  the exception: a notice that cannot be read is replaced by the last
+  copy that could be, a notice that has not reached the target's month
+  prices it from the latest published month as a labelled estimate, and
+  with no usable rate at all the tax is left out of Indiana's total with
+  a disclosure.
 
   Numeric collectors retrieve published maintained rates and certified
   CARB/Washington auction results. Retained tables supply dated context.
-  Unknown source formats become explicit amendment requests; required
-  inputs cannot remain unresolved in a successful result.
+  Source formats these collectors do not know become explicit amendment
+  requests; required inputs cannot remain unresolved in a successful
+  result.
 
   Researched and checked by date rather than by age: the tax and fee
   corrections (STATE_TAX_ADJUSTMENTS, plus
@@ -68,8 +74,9 @@ Exit status:
      describe it, or, for a --target backfill, not reaching back that
      far. Each fetch is retried (see HTTP_ATTEMPTS) before the run gives
      up, and the failure is reported as error lines rather than a
-     traceback. Invalid research, an overlapping update, and file I/O
-     failures also return 1.
+     traceback. Indiana's use-tax notice is the exception described
+     under Data sources. Invalid research, an overlapping update, and
+     file I/O failures also return 1.
   2  Bad invocation, or a snapshot the arguments name that the file
      does not contain.
 
@@ -310,10 +317,15 @@ EIA_TAX_STALE_DAYS = 275
 # computing and remitting the tax. Only the statutory rate -- a figure
 # the state publishes in its own right -- is read here.
 IN_GUT_NOTICE_URL = "https://www.in.gov/dor/files/reference/dn02.pdf"
-# A month's rate is published at the start of the month it covers, so
-# the rate in force runs at most a month behind the snapshot. The limit
-# allows one missed edition before the run stops.
+# A month's rate is published shortly before the month it covers, and
+# an edition can be late or withdrawn, so the newest rate on the notice
+# can trail the snapshot's month. The limit bounds how far behind that
+# rate may be and still describe the snapshot.
 IN_GUT_STALE_DAYS = 70
+IN_GUT_EXCLUSION_NOTE = (
+    "Gasoline use tax is unquantified and excluded: no current rate could "
+    f"be read from the department's notice. Source: {IN_GUT_NOTICE_URL}"
+)
 
 # Indiana's flat per-gallon oil inspection fee under IC 16-44-2-18. It
 # is what remains collectable while the excise and use tax are
@@ -1100,19 +1112,57 @@ class InGutRate:
 
 
 def load_in_gut_rates(cache_dir: Path) -> dict[date, float]:
-    """Download Indiana's notice and read its monthly rate history."""
-    pdf_path = cache_dir / "indiana-gut.pdf"
-    pdf_path.write_bytes(_http_bytes(IN_GUT_NOTICE_URL))
-    return _read_in_gut_rates(pdf_path)
+    """Download Indiana's notice and read its monthly rate history.
+
+    The notice as published is authoritative whenever it reads, so a
+    month the department withdraws is not used. The last notice that
+    read cleanly is kept and stands in only when the download fails or
+    no longer reads; `check_in_gut_in_force` bounds how far behind it
+    may be.
+    """
+    stored = cache_dir / "indiana-gut.pdf"
+    fresh = cache_dir / "indiana-gut.new.pdf"
+    try:
+        fresh.write_bytes(_http_bytes(IN_GUT_NOTICE_URL))
+        rates = _read_in_gut_rates(fresh)
+    except SnapshotError as exc:
+        fresh.unlink(missing_ok=True)
+        if not stored.exists():
+            raise
+        log.warning("IN GUT: reading the last stored notice instead: %s", exc)
+        return _read_in_gut_rates(stored)
+    fresh.replace(stored)
+    return rates
+
+
+def check_in_gut_in_force(month_start: date, target: date) -> None:
+    """Refuse a use-tax period that cannot price `target`.
+
+    The period must have started by `target` and sit within
+    `IN_GUT_STALE_DAYS` of it -- a notice the department has stopped
+    replacing keeps answering with its last period. A period may start
+    mid-month, as one following a suspension can.
+    """
+    if month_start > target:
+        raise SnapshotError(
+            f"IN GUT: the period starting {month_start} is not yet in "
+            f"force on {target}"
+        )
+    age = (target - month_start).days
+    if age > IN_GUT_STALE_DAYS:
+        raise SnapshotError(
+            f"IN GUT: newest rate in force ({month_start}) is {age} days "
+            f"before {target}, over the {IN_GUT_STALE_DAYS}-day limit; "
+            f"the department has stopped replacing the notice"
+        )
 
 
 def select_in_gut(rates: dict[date, float], target: date) -> InGutRate:
-    """Return the Indiana gasoline use tax in force on `target`.
+    """Return the newest Indiana gasoline use tax in force on `target`.
 
     Raises `SnapshotError` when the notice does not reach back to
-    `target`, and when the newest rate it does carry is too far behind
-    to describe it -- a notice the department has stopped replacing
-    keeps answering with its last month.
+    `target`, and when the newest rate it does carry fails
+    `check_in_gut_in_force`.
     """
     usable = [m for m in rates if m <= target]
     if not usable:
@@ -1121,13 +1171,7 @@ def select_in_gut(rates: dict[date, float], target: date) -> InGutRate:
             + f"{min(rates)}"
         )
     month_start = max(usable)
-    age = (target - month_start).days
-    if age > IN_GUT_STALE_DAYS:
-        raise SnapshotError(
-            f"IN GUT: newest rate in force ({month_start}) is {age} days "
-            f"before {target}, over the {IN_GUT_STALE_DAYS}-day limit; "
-            f"the department has stopped replacing the notice"
-        )
+    check_in_gut_in_force(month_start, target)
     return InGutRate(
         month_start=month_start,
         usd_per_gal=rates[month_start],
@@ -1138,6 +1182,22 @@ def select_in_gut(rates: dict[date, float], target: date) -> InGutRate:
 def fetch_in_gut_for_target_date(target: date, cache_dir: Path) -> InGutRate:
     """Download Indiana's notice and pick the month for `target`."""
     return select_in_gut(load_in_gut_rates(cache_dir), target)
+
+
+def collect_in_gut(
+    target: date, collect: Callable[[], InGutRate]
+) -> InGutRate | None:
+    """Return the use-tax rate pricing `target`, or None to exclude it.
+
+    The tax is one component of one state, so when `collect` can supply
+    no rate usable for `target` that component is left out of Indiana's
+    total rather than withholding the whole snapshot.
+    """
+    try:
+        return collect()
+    except SnapshotError as exc:
+        log.warning("IN GUT: no usable rate for %s: %s", target, exc)
+        return None
 
 
 _IN_GUT_PERIOD_RE = re.compile(r"^([A-Z][a-z]+) (\d{1,2}), (\d{4})$")
@@ -1188,20 +1248,31 @@ def _read_in_gut_rates(path: Path) -> dict[date, float]:
     return out
 
 
+class UseTaxBasis(StrEnum):
+    """How Indiana's use-tax figure for one date was established."""
+
+    PUBLISHED = "published"
+    ESTIMATED = "estimated"
+    SUSPENDED = "suspended"
+    EXCLUDED = "excluded"
+
+
 @dataclass(frozen=True)
 class IndianaTax:
     """Indiana's per-gallon state tax, resolved for one date.
 
-    `total` is what the state actually collects on the date, which is
-    what the page reports. The components are kept so the snapshot can
-    say which of them a suspension switched off rather than just
-    showing a number that dropped.
+    `total` is what the state collects on the date, which is what the
+    page reports; an `ESTIMATED` use tax makes it an estimate, and an
+    `EXCLUDED` one is left out of it. The components are kept so the
+    snapshot can say which of them a suspension switched off rather
+    than just showing a number that dropped.
     """
 
     total: float
     excise: float
     inspection_fee: float
     gut: float
+    gut_basis: UseTaxBasis
     suspended: tuple[str, ...]
 
 
@@ -1245,10 +1316,30 @@ def adjustment_on(state: str, day: date) -> TaxAdjustment | None:
     return None
 
 
+def use_tax_basis(gut: InGutRate | None, day: date) -> UseTaxBasis:
+    """Classify how Indiana's use tax on `day` can be priced.
+
+    A suspension makes the figure exactly zero whatever the rate. Past
+    that, a month earlier than `day`'s own is an estimate, and no rate
+    at all is an exclusion. `gut` is taken to be in force on `day`;
+    `check_in_gut_in_force` is what establishes that.
+    """
+    if _suspended_on(IN_GUT_SUSPENSIONS, day):
+        return UseTaxBasis.SUSPENDED
+    if gut is None:
+        return UseTaxBasis.EXCLUDED
+    if gut.month_start < day.replace(day=1):
+        return UseTaxBasis.ESTIMATED
+    return UseTaxBasis.PUBLISHED
+
+
 def resolve_indiana_tax(
-    day: date, eia_excise: float, gut: InGutRate
+    day: date, eia_excise: float, gut: InGutRate | None
 ) -> IndianaTax:
     """Compose Indiana's state tax for `day` from its three components.
+
+    A use tax with no usable rate is left out of the total; see
+    `use_tax_basis`.
 
     Indiana is the one state the published tables cannot describe as a
     single figure: its use tax is reset monthly rather than twice a
@@ -1260,8 +1351,14 @@ def resolve_indiana_tax(
     """
     excise_by = _suspended_on(IN_EXCISE_SUSPENSIONS, day)
     gut_by = _suspended_on(IN_GUT_SUSPENSIONS, day)
+    basis = use_tax_basis(gut, day)
     excise = 0.0 if excise_by else eia_excise
-    gut_amount = 0.0 if gut_by else gut.usd_per_gal
+    gut_amount = (
+        gut.usd_per_gal
+        if gut is not None
+        and basis in (UseTaxBasis.PUBLISHED, UseTaxBasis.ESTIMATED)
+        else 0.0
+    )
     suspended: list[str] = []
     if excise_by:
         suspended.append(f"gasoline excise ({excise_by})")
@@ -1272,6 +1369,7 @@ def resolve_indiana_tax(
         excise=excise,
         inspection_fee=IN_OIL_INSPECTION_FEE,
         gut=gut_amount,
+        gut_basis=basis,
         suspended=tuple(suspended),
     )
 
@@ -2107,13 +2205,15 @@ def _and_list(items: Sequence[str]) -> str:
     return f"{', '.join(items[:-1])} and {items[-1]}"
 
 
-def state_tax_notes(period: TaxPeriod, in_gut: InGutRate, day: date) -> str:
+def state_tax_notes(
+    period: TaxPeriod, in_gut: InGutRate | None, day: date
+) -> str:
     """Summarise where a snapshot's state-tax column came from.
 
-    The two clauses that vary by date -- the override list and
-    Indiana's own suspension clause -- are derived for `day` rather
-    than written out, so neither can report a suspension that had
-    lapsed or miss one that had started. Indiana's two taxes are
+    The clauses that vary by date -- the override list, Indiana's own
+    suspension clause and how its use tax was priced -- are derived for
+    `day` rather than written out, so none can report a suspension that
+    had lapsed or miss one that had started. Indiana's two taxes are
     suspended on their own dates, so a backfill into early 2026 falls
     on neither and a date between the two windows falls on one.
     """
@@ -2134,11 +2234,28 @@ def state_tax_notes(period: TaxPeriod, in_gut: InGutRate, day: date) -> str:
     in_clause = (
         f", with its own {suspension_label} applied" if in_suspended else ""
     )
+    basis = use_tax_basis(in_gut, day)
+    if basis is UseTaxBasis.EXCLUDED:
+        in_parts = (
+            "excise and oil inspection fee, excluding its gasoline use tax "
+            "for want of a usable current rate"
+        )
+    elif in_gut is None or basis is UseTaxBasis.SUSPENDED:
+        in_parts = "excise, oil inspection fee and gasoline use tax"
+    else:
+        estimate = (
+            " (estimated from the latest published month)"
+            if basis is UseTaxBasis.ESTIMATED
+            else ""
+        )
+        in_parts = (
+            f"excise, oil inspection fee and {in_gut.month_start:%b %Y} "
+            f"gasoline use tax{estimate}"
+        )
     return (
         f"{STATE_TAX_NOTES_MARKER}EIA federal and state motor fuel tax "
-        f"table, {period.period} edition; IN composed from its excise, "
-        f"oil inspection fee and {in_gut.month_start:%b %Y} gasoline use "
-        f"tax{in_clause}; "
+        f"table, {period.period} edition; IN composed from its "
+        f"{in_parts}{in_clause}; "
         "NY adding the statewide motor-fuel sales tax excluded from EIA; "
         f"{override_clause}"
         f"{_and_list(GROSS_RECEIPTS_STATES)} adding the value-based "
@@ -2238,13 +2355,18 @@ class StateTax:
     as_of: str
 
 
-def unquantified_fee_note(state: str) -> str:
-    """Disclose allocation exclusions without pricing them as zero."""
+def unquantified_fee_note(state: str, extra: Sequence[str] = ()) -> str:
+    """Disclose exclusions without pricing them as zero.
+
+    `extra` carries exclusions decided for this snapshot rather than
+    recorded for the state.
+    """
     notes = (
         [UNQUANTIFIED_FEE_NOTES[state]]
         if state in UNQUANTIFIED_FEE_NOTES
         else []
     )
+    notes.extend(extra)
     if RESEARCH_DATA is not None:
         for review in RESEARCH_DATA.state_reviews:
             if review.state == state:
@@ -2266,7 +2388,7 @@ def compose_state_tax(
     day: date,
     period: TaxPeriod,
     retail: float,
-    in_gut: InGutRate,
+    in_gut: InGutRate | None,
     spot: dict[str, SpotQuote],
     pat: PatQuote | None = None,
 ) -> StateTax:
@@ -2275,43 +2397,14 @@ def compose_state_tax(
     Most states are the published table's own figure, adjusted for any
     override in force. Indiana is built from its parts instead, because
     its use tax is reset monthly and its two taxes were suspended from
-    different dates. Supported taxes on retail or wholesale value are
-    added separately when the published table excludes them.
+    different dates; a use tax without a usable rate is disclosed rather
+    than priced. Supported taxes on retail or wholesale value are added
+    separately when the published table excludes them.
     """
     assert_adjustments_cover(day)
-    exclusion_note = unquantified_fee_note(code)
     if code == "IN":
-        indiana = resolve_indiana_tax(day, _excise_of(period, "IN"), in_gut)
-        parts = [
-            TaxPart(
-                "Gasoline excise",
-                indiana.excise,
-                IN_EXCISE_SOURCE_URL,
-                exclusion_note,
-            ),
-            TaxPart(
-                "Oil inspection fee",
-                indiana.inspection_fee,
-                IN_OIL_INSPECTION_SOURCE_URL,
-                "",
-            ),
-            TaxPart(
-                f"Gasoline use tax ({in_gut.month_start:%b %Y})",
-                indiana.gut,
-                in_gut.source_url,
-                "",
-            ),
-        ]
-        note = "; ".join(indiana.suspended)
-        if note:
-            parts.append(
-                TaxPart("Suspended", 0.0, IN_SUSPENSION_NOTICE_URL, note)
-            )
-        return StateTax(
-            total=indiana.total,
-            parts=tuple(parts),
-            as_of=in_gut.month_start.isoformat(),
-        )
+        return _compose_indiana_tax(day, period, in_gut)
+    exclusion_note = unquantified_fee_note(code)
     base = period.per_state[code]
     parts = [
         TaxPart(
@@ -2382,6 +2475,71 @@ def compose_state_tax(
     )
 
 
+def _compose_indiana_tax(
+    day: date, period: TaxPeriod, in_gut: InGutRate | None
+) -> StateTax:
+    """Render Indiana's components, saying how its use tax was priced."""
+    indiana = resolve_indiana_tax(day, _excise_of(period, "IN"), in_gut)
+    excluded = indiana.gut_basis is UseTaxBasis.EXCLUDED
+    parts = [
+        TaxPart(
+            "Gasoline excise",
+            indiana.excise,
+            IN_EXCISE_SOURCE_URL,
+            unquantified_fee_note(
+                "IN", [IN_GUT_EXCLUSION_NOTE] if excluded else []
+            ),
+        ),
+        TaxPart(
+            "Oil inspection fee",
+            indiana.inspection_fee,
+            IN_OIL_INSPECTION_SOURCE_URL,
+            "",
+        ),
+    ]
+    # A month is named only where its rate prices the figure; under a
+    # suspension the figure is zero whichever month the notice reached.
+    pricing = (
+        in_gut
+        if indiana.gut_basis in (UseTaxBasis.PUBLISHED, UseTaxBasis.ESTIMATED)
+        else None
+    )
+    if pricing is not None:
+        estimate = (
+            f"Estimated: no {day:%b %Y} rate could be read from the "
+            f"department's notice, so the {pricing.month_start:%b %Y} rate "
+            f"stands in for it."
+            if indiana.gut_basis is UseTaxBasis.ESTIMATED
+            else ""
+        )
+        parts.append(
+            TaxPart(
+                f"Gasoline use tax ({pricing.month_start:%b %Y})",
+                indiana.gut,
+                pricing.source_url,
+                estimate,
+            )
+        )
+    elif not excluded:
+        parts.append(
+            TaxPart(
+                "Gasoline use tax",
+                0.0,
+                IN_GUT_NOTICE_URL if in_gut is None else in_gut.source_url,
+                "",
+            )
+        )
+    note = "; ".join(indiana.suspended)
+    if note:
+        parts.append(TaxPart("Suspended", 0.0, IN_SUSPENSION_NOTICE_URL, note))
+    as_of = pricing.month_start if pricing is not None else period.period
+    return StateTax(
+        total=indiana.total,
+        parts=tuple(parts),
+        as_of=as_of.isoformat(),
+    )
+
+
 def _excise_of(period: TaxPeriod, code: str) -> float:
     """Read one state's excise, naming the gap when the sheet left it."""
     try:
@@ -2446,7 +2604,7 @@ class SnapshotSources:
     """Everything one snapshot is built from, already dated to it."""
 
     period: TaxPeriod
-    in_gut: InGutRate
+    in_gut: InGutRate | None
     spot: dict[str, SpotQuote]
     lcfs: LcfsQuote
     cca: AuctionSettlement
@@ -2711,7 +2869,8 @@ class CollectedSnapshot(ResearchModel):
     )
     retail: dict[str, float]
     period: TaxPeriod
-    in_gut: InGutRate
+    # None when Indiana's notice offered no usable rate.
+    in_gut: InGutRate | None
     spot: dict[str, SpotQuote]
     lcfs: LcfsQuote
     orm: OrCfpMonth
@@ -2847,11 +3006,14 @@ def collect_snapshot_inputs(
         TypeAdapter(TaxPeriod),
         lambda: fetch_tax_period_for_target_date(target, cache),
     )
-    in_gut = checkpoint_value(
-        directory,
-        "indiana-use-tax",
-        TypeAdapter(InGutRate),
-        lambda: fetch_in_gut_for_target_date(target, cache),
+    in_gut = collect_in_gut(
+        target,
+        lambda: checkpoint_value(
+            directory,
+            "indiana-use-tax",
+            TypeAdapter(InGutRate),
+            lambda: fetch_in_gut_for_target_date(target, cache),
+        ),
     )
     pat = checkpoint_value(
         directory,
@@ -2962,8 +3124,8 @@ def validate_collected_inputs(data: CollectedSnapshot, target: date) -> None:
         raise SnapshotError("collected EIA tax table is incomplete")
     if data.period.period > target or not 0 <= data.period.federal < 1:
         raise SnapshotError("invalid collected tax baseline")
-    if data.in_gut.month_start != target.replace(day=1):
-        raise SnapshotError("collected Indiana rate has the wrong month")
+    if data.in_gut is not None:
+        check_in_gut_in_force(data.in_gut.month_start, target)
     if not data.pat.start <= target <= data.pat.end:
         raise SnapshotError("collected Ohio PAT base has the wrong quarter")
     if data.pat.published > target:
@@ -3415,8 +3577,13 @@ def cmd_add_snapshot_from_feeds(args: argparse.Namespace) -> int:
     )
 
     log.info("fetching Indiana gasoline use tax...")
-    in_gut = fetch_in_gut_for_target_date(target, cache_dir)
-    log.info("IN GUT: %s $%.4f/gal", in_gut.month_start, in_gut.usd_per_gal)
+    in_gut = collect_in_gut(
+        target, lambda: fetch_in_gut_for_target_date(target, cache_dir)
+    )
+    if in_gut is not None:
+        log.info(
+            "IN GUT: %s $%.4f/gal", in_gut.month_start, in_gut.usd_per_gal
+        )
 
     pat = fetch_oh_pat_for_target_date(target, cache_dir)
     log.info("OH PAT: %s to %s $%.3f/gal", pat.start, pat.end, pat.usd_per_gal)

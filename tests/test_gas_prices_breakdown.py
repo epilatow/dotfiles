@@ -1286,7 +1286,7 @@ def test_in_gut_notice_without_rate_rows_is_reported(
 def test_in_gut_damaged_notice_is_reported_not_raised(
     tmp_path: Path, name: str, body: bytes
 ) -> None:
-    """Every way the download goes wrong exits 1, never a traceback."""
+    """Every way the download goes wrong is reported, never a traceback."""
     notice = tmp_path / f"{name}.pdf"
     notice.write_bytes(body)
     with pytest.raises(gpb.SnapshotError) as caught:
@@ -1341,7 +1341,7 @@ def test_in_gut_target_before_the_notice_starts_is_reported(
     assert "starts at" in str(caught.value)
 
 
-def test_in_gut_notice_gone_quiet_fails_the_run(tmp_path: Path) -> None:
+def test_in_gut_notice_gone_quiet_is_refused(tmp_path: Path) -> None:
     """A notice nobody replaces keeps answering with its last month."""
     month = date(2026, 9, 1)
     target = month + timedelta(days=gpb.IN_GUT_STALE_DAYS + 1)
@@ -1360,6 +1360,261 @@ def test_in_gut_at_the_freshness_limit_still_answers(tmp_path: Path) -> None:
     with _in_gut_rates({month: 0.239}):
         got = gpb.fetch_in_gut_for_target_date(target, tmp_path)
     assert got.month_start == month
+
+
+def test_in_gut_period_not_yet_started_cannot_price_the_target() -> None:
+    with pytest.raises(gpb.SnapshotError, match="not yet in force"):
+        gpb.check_in_gut_in_force(date(2026, 10, 1), date(2026, 9, 17))
+
+
+def test_in_gut_period_starting_mid_month_is_in_force() -> None:
+    """A period that resumes after a suspension need not start on the 1st."""
+    gpb.check_in_gut_in_force(date(2026, 11, 5), date(2026, 11, 12))
+    gut = gpb.InGutRate(date(2026, 11, 5), 0.2, "https://x.invalid")
+    assert (
+        gpb.use_tax_basis(gut, date(2026, 11, 12)) is gpb.UseTaxBasis.PUBLISHED
+    )
+
+
+def test_in_gut_trailing_the_target_month_is_in_force() -> None:
+    """A notice behind the target's month still prices it, as an estimate."""
+    gpb.check_in_gut_in_force(date(2026, 9, 1), date(2026, 10, 15))
+
+
+def test_in_gut_unreachable_notice_reads_the_stored_copy(
+    tmp_path: Path,
+) -> None:
+    """A published month never changes, so the last good copy prices it."""
+    rates = {date(2026, 9, 1): 0.239}
+    with _in_gut_rates(rates):
+        gpb.load_in_gut_rates(tmp_path)
+    with (
+        patch.object(
+            gpb,
+            "_http_bytes",
+            autospec=True,
+            side_effect=gpb.FetchError("GET notice: offline"),
+        ),
+        patch.object(
+            gpb, "_read_in_gut_rates", autospec=True, return_value=rates
+        ) as read,
+    ):
+        got = gpb.fetch_in_gut_for_target_date(date(2026, 10, 15), tmp_path)
+    assert got.month_start == date(2026, 9, 1)
+    read.assert_called_once_with(tmp_path / "indiana-gut.pdf")
+
+
+def test_in_gut_unreadable_notice_keeps_the_stored_copy(
+    tmp_path: Path,
+) -> None:
+    """A reshaped notice must not replace the last copy that read."""
+    stored = tmp_path / "indiana-gut.pdf"
+    rates = {date(2026, 9, 1): 0.239}
+    with _in_gut_rates(rates):
+        gpb.load_in_gut_rates(tmp_path)
+    good = stored.read_bytes()
+
+    def read(path: Path) -> dict[date, float]:
+        if path == stored:
+            return rates
+        raise gpb.SnapshotError("IN GUT: notice has no rate rows")
+
+    with (
+        patch.object(
+            gpb, "_http_bytes", autospec=True, return_value=b"reshaped"
+        ),
+        patch.object(
+            gpb, "_read_in_gut_rates", autospec=True, side_effect=read
+        ),
+    ):
+        assert gpb.load_in_gut_rates(tmp_path) == rates
+    assert stored.read_bytes() == good
+    assert not (tmp_path / "indiana-gut.new.pdf").exists()
+
+
+def test_in_gut_live_notice_wins_over_a_month_it_withdrew(
+    tmp_path: Path,
+) -> None:
+    """A month the department no longer lists is not priced from storage."""
+    stored = tmp_path / "indiana-gut.pdf"
+    later = {date(2026, 9, 1): 0.239, date(2026, 10, 1): 0.238}
+    with _in_gut_rates(later):
+        gpb.load_in_gut_rates(tmp_path)
+
+    def read(path: Path) -> dict[date, float]:
+        return later if path == stored else {date(2026, 9, 1): 0.239}
+
+    with (
+        patch.object(gpb, "_http_bytes", autospec=True, return_value=b"older"),
+        patch.object(
+            gpb, "_read_in_gut_rates", autospec=True, side_effect=read
+        ),
+    ):
+        got = gpb.fetch_in_gut_for_target_date(date(2026, 10, 15), tmp_path)
+    assert (got.month_start, got.usd_per_gal) == (date(2026, 9, 1), 0.239)
+    assert stored.read_bytes() == b"older"
+
+
+def test_in_gut_unreadable_stored_copy_is_reported(tmp_path: Path) -> None:
+    """With neither copy readable there is no rate to fall back on."""
+    (tmp_path / "indiana-gut.pdf").write_bytes(b"not a pdf")
+    with (
+        patch.object(
+            gpb,
+            "_http_bytes",
+            autospec=True,
+            side_effect=gpb.FetchError("GET notice: offline"),
+        ),
+        pytest.raises(gpb.SnapshotError, match="not a readable PDF"),
+    ):
+        gpb.load_in_gut_rates(tmp_path)
+
+
+def test_in_gut_newer_edition_replaces_the_stored_copy(
+    tmp_path: Path,
+) -> None:
+    stored = tmp_path / "indiana-gut.pdf"
+    with _in_gut_rates({date(2026, 9, 1): 0.239}):
+        gpb.load_in_gut_rates(tmp_path)
+    newer = {date(2026, 9, 1): 0.239, date(2026, 10, 1): 0.238}
+    with (
+        patch.object(gpb, "_http_bytes", autospec=True, return_value=b"newer"),
+        patch.object(
+            gpb, "_read_in_gut_rates", autospec=True, return_value=newer
+        ),
+    ):
+        assert gpb.load_in_gut_rates(tmp_path) == newer
+    assert stored.read_bytes() == b"newer"
+
+
+def test_in_gut_unreachable_notice_without_a_stored_copy_is_reported(
+    tmp_path: Path,
+) -> None:
+    with (
+        patch.object(
+            gpb,
+            "_http_bytes",
+            autospec=True,
+            side_effect=gpb.FetchError("GET notice: offline"),
+        ),
+        pytest.raises(gpb.FetchError),
+    ):
+        gpb.load_in_gut_rates(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Indiana use-tax pricing
+# ---------------------------------------------------------------------------
+#
+# Outside the suspension windows, how the use tax is priced depends on
+# what the notice offered: the target month's own rate, an earlier month
+# standing in as an estimate, or nothing usable, which is disclosed.
+
+UNSUSPENDED = date(2026, 2, 19)
+
+
+def test_indiana_prices_the_target_month_as_published() -> None:
+    """The month's own rate is exact: named, unqualified and dated."""
+    gut = gpb.InGutRate(date(2026, 2, 1), 0.149, "https://x.invalid")
+    got = gpb.resolve_indiana_tax(UNSUSPENDED, 0.36, gut)
+    assert got.gut_basis is gpb.UseTaxBasis.PUBLISHED
+    assert got.gut == 0.149
+    period = _tax_period()
+    tax = gpb.compose_state_tax("IN", UNSUSPENDED, period, 3.9, gut, {})
+    (part,) = [p for p in tax.parts if p.name.startswith("Gasoline use")]
+    assert (part.name, part.usd_per_gal, part.note) == (
+        "Gasoline use tax (Feb 2026)",
+        0.149,
+        "",
+    )
+    assert tax.as_of == "2026-02-01"
+    notes = gpb.state_tax_notes(period, gut, UNSUSPENDED)
+    assert "Feb 2026 gasoline use tax;" in notes
+    assert "estimated" not in notes
+
+
+def test_indiana_prices_an_earlier_month_as_an_estimate() -> None:
+    gut = gpb.InGutRate(date(2026, 1, 1), 0.154, "https://x.invalid")
+    got = gpb.resolve_indiana_tax(UNSUSPENDED, 0.36, gut)
+    assert got.gut_basis is gpb.UseTaxBasis.ESTIMATED
+    assert got.gut == 0.154
+    assert got.total == round(0.36 + gpb.IN_OIL_INSPECTION_FEE + 0.154, 4)
+    tax = gpb.compose_state_tax("IN", UNSUSPENDED, _tax_period(), 3.9, gut, {})
+    (part,) = [p for p in tax.parts if p.name.startswith("Gasoline use")]
+    assert part.name == "Gasoline use tax (Jan 2026)"
+    assert part.usd_per_gal == 0.154
+    assert part.note.startswith("Estimated:")
+    assert "no Feb 2026 rate" in part.note
+
+
+def test_indiana_without_a_usable_rate_excludes_and_discloses() -> None:
+    """The total omits the tax rather than pricing it as zero."""
+    period = _tax_period()
+    excise = period.excise["IN"]
+    got = gpb.resolve_indiana_tax(UNSUSPENDED, excise, None)
+    assert got.gut_basis is gpb.UseTaxBasis.EXCLUDED
+    assert got.total == round(excise + gpb.IN_OIL_INSPECTION_FEE, 4)
+    tax = gpb.compose_state_tax("IN", UNSUSPENDED, period, 3.9, None, {})
+    assert tax.total == got.total
+    assert not [p for p in tax.parts if p.name.startswith("Gasoline use")]
+    excise_part = tax.parts[0]
+    assert excise_part.name == "Gasoline excise"
+    assert gpb.IN_GUT_EXCLUSION_NOTE in excise_part.note
+    assert "residual includes" in excise_part.note
+    assert tax.as_of == period.period.isoformat()
+
+
+def test_indiana_suspended_use_tax_needs_no_rate() -> None:
+    """A suspension makes the figure exactly zero, so nothing is excluded."""
+    day = date(2026, 4, 30)
+    got = gpb.resolve_indiana_tax(day, 0.36, None)
+    assert got.gut_basis is gpb.UseTaxBasis.SUSPENDED
+    assert got.gut == 0.0
+    tax = gpb.compose_state_tax("IN", day, _tax_period(), 3.9, None, {})
+    (part,) = [p for p in tax.parts if p.name.startswith("Gasoline use")]
+    assert (part.name, part.usd_per_gal, part.note) == (
+        "Gasoline use tax",
+        0.0,
+        "",
+    )
+    assert gpb.IN_GUT_EXCLUSION_NOTE not in tax.parts[0].note
+
+
+def test_indiana_suspended_estimate_is_not_labelled_an_estimate() -> None:
+    """A suspended tax is exactly zero whichever month's rate it carries."""
+    gut = gpb.InGutRate(date(2026, 9, 1), 0.239, "https://x.invalid")
+    period = _tax_period()
+    tax = gpb.compose_state_tax("IN", date(2026, 10, 8), period, 3.9, gut, {})
+    (part,) = [p for p in tax.parts if p.name.startswith("Gasoline use")]
+    assert (part.name, part.usd_per_gal, part.note) == (
+        "Gasoline use tax",
+        0.0,
+        "",
+    )
+    assert tax.as_of == period.period.isoformat()
+    notes = gpb.state_tax_notes(period, gut, date(2026, 10, 8))
+    assert "Sep 2026" not in notes
+    assert (
+        "excise, oil inspection fee and gasoline use tax, with its own "
+        "suspensions applied" in notes
+    )
+
+
+def test_notes_say_how_indianas_use_tax_was_priced() -> None:
+    period = _tax_period()
+    earlier = gpb.InGutRate(date(2026, 1, 1), 0.154, "https://x.invalid")
+    estimated = gpb.state_tax_notes(period, earlier, UNSUSPENDED)
+    assert (
+        "Jan 2026 gasoline use tax (estimated from the latest published "
+        "month)" in estimated
+    )
+    excluded = gpb.state_tax_notes(period, None, UNSUSPENDED)
+    assert "excluding its gasoline use tax" in excluded
+    suspended = gpb.state_tax_notes(period, None, date(2026, 4, 30))
+    assert (
+        "excise, oil inspection fee and gasoline use tax, with its own "
+        "suspension applied" in suspended
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2203,6 +2458,7 @@ def _add_snapshot_sources(
     period: gpb.TaxPeriod | None = None,
     gut_month: date = date(2026, 9, 1),
     retail_error: gpb.FetchError | None = None,
+    gut_error: gpb.SnapshotError | None = None,
 ) -> Iterator[None]:
     """Stub every fetch add-snapshot makes, so no test touches a network."""
     lcfs, _cca, _wa, orm = _sample_sources()
@@ -2268,6 +2524,7 @@ def _add_snapshot_sources(
             return_value=gpb.InGutRate(
                 gut_month, 0.239, "https://example.invalid/dn02.pdf"
             ),
+            side_effect=gut_error,
         ),
         patch.object(
             gpb,
@@ -2487,6 +2744,72 @@ def test_add_snapshot_applies_a_rate_override(tmp_path: Path) -> None:
     )
     assert f"fixed:{{ total:{round(0.3405 - 0.333, 4):.4f}," in georgia
     assert "HB 1199" in georgia
+
+
+def test_add_snapshot_excludes_an_unreadable_indiana_use_tax(
+    tmp_path: Path,
+) -> None:
+    """An unreadable notice leaves out one component, not the page."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
+    with (
+        _backups_under(tmp_path),
+        _add_snapshot_sources(
+            # Above Georgia's 33.3 cent holiday, which is in force too.
+            period=_tax_period(period=date(2026, 1, 1), rate=0.3405),
+            gut_error=gpb.FetchError("notice offline"),
+        ),
+    ):
+        assert (
+            gpb.main(["add-snapshot", str(html), "--target", "2026-04-02"])
+            == 0
+        )
+    built = gpb.find_block_for_date(
+        gpb.parse_snapshots(html.read_text()).blocks, "2026-04-02"
+    )
+    assert built is not None
+    indiana = next(
+        c for code, c in gpb.split_state_blocks(built) if code == "IN"
+    )
+    excise = round(0.3405 - 0.01, 4)
+    expected = round(excise + gpb.IN_OIL_INSPECTION_FEE, 4)
+    assert f"fixed:{{ total:{expected:.4f}," in indiana
+    assert gpb.IN_GUT_EXCLUSION_NOTE in indiana
+    assert "Gasoline use tax (" not in indiana
+    assert "excluding its gasoline use tax" in built
+
+
+def test_add_snapshot_estimates_from_an_earlier_indiana_month(
+    tmp_path: Path,
+) -> None:
+    """A notice behind the target's month prices it, labelled an estimate."""
+    html = tmp_path / "page.html"
+    html.write_text(_page(_snapshot_block(gpb.BASELINE_DATE, CODES)))
+    with (
+        _backups_under(tmp_path),
+        _add_snapshot_sources(
+            # Above Georgia's 33.3 cent holiday, which is in force too.
+            period=_tax_period(period=date(2026, 1, 1), rate=0.3405),
+            gut_month=date(2026, 3, 1),
+        ),
+    ):
+        assert (
+            gpb.main(["add-snapshot", str(html), "--target", "2026-04-02"])
+            == 0
+        )
+    built = gpb.find_block_for_date(
+        gpb.parse_snapshots(html.read_text()).blocks, "2026-04-02"
+    )
+    assert built is not None
+    indiana = next(
+        c for code, c in gpb.split_state_blocks(built) if code == "IN"
+    )
+    excise = round(0.3405 - 0.01, 4)
+    expected = round(excise + gpb.IN_OIL_INSPECTION_FEE + 0.239, 4)
+    assert f"fixed:{{ total:{expected:.4f}," in indiana
+    assert 'n:"Gasoline use tax (Mar 2026)", v:0.2390' in indiana
+    assert "no Apr 2026 rate could be read" in indiana
+    assert "Mar 2026 gasoline use tax (estimated" in built
 
 
 def test_an_override_larger_than_the_rate_is_reported_by_state(

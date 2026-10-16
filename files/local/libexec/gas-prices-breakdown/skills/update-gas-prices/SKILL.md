@@ -77,6 +77,11 @@ and disclose only charges needing unavailable allocation information. The
 source guide's fee-allocation audit documents known exclusions and retained
 calculable fees. These exclusions do not make supported state rows unresolved.
 
+An Indiana `in_gut` rate from a month before the target's, or a null `in_gut`,
+is published as a disclosed estimate or exclusion, or as zero while the tax is
+suspended; neither is an unresolved input. Amend it only with the department's
+published rate for the target month.
+
 Amend other collected values only with a specific primary source proving the
 correction. Record an `amendments` entry with its JSON-pointer `field`, reason,
 source URL and exact excerpt. Preserve the published EIA table; reconcile tax

@@ -8,7 +8,9 @@ annual billing schedule or use of barrels does not make it unpriceable.
 Omit and disclose a charge only when its gasoline allocation needs information
 not available in the sourced inputs. Do not assume a truck size, product mix,
 facility turnover or taxpayer's annual volume. Do not treat an inaccessible
-source for a calculable rate as an allocation exclusion.
+source for a calculable rate as an allocation exclusion. Indiana's gasoline use
+tax is the one exception: the utility discloses it as excluded when its notice
+yields no usable rate, as the skill describes.
 
 ## Allocation audit
 
