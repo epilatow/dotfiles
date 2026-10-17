@@ -57,6 +57,13 @@ command     = "fnm exec --using default -- npm update -g"
 gate        = "command -v fnm"
 uuid        = "5da77278-c34d-4167-ab27-b53af33d2a48"
 
+[job.u-bins-uv]
+command     = "mkdir -p $TMPDIR && uv self update && uv tool upgrade --all"
+gate        = "command -v uv"
+env.TMPDIR  = "$HOME/.local/tmp"
+platforms   = ["linux"]
+uuid        = "de84320f-63a4-4b4e-98d5-51bbc708f5bf"
+
 [job.cleanup-codex-cli]
 script      = "~/.local/libexec/cleanup-codex-cli/cleanup-codex-cli"
 args        = ["--apply"]
@@ -141,7 +148,7 @@ uuid = "ca506c3d-0026-4705-a09a-16ecf7881f6c"
 # schedule but no command/script of its own.
 
 [job-group.u-bins]
-jobs = ["u-bins-brew", "u-bins-npm"]
+jobs = ["u-bins-brew", "u-bins-npm", "u-bins-uv"]
 uuid = "ee2e73e4-f89d-4ebf-af65-6631b32b2365"
 
 [job-group.weekly]
