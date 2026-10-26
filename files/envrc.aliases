@@ -10,8 +10,14 @@ alias us="su"
 
 # misc aliases
 alias lcreset="unset LC_FIXED; set_locale"
-alias tclaude="tmux new claude"
+alias ls="ls -F"
+
+# agent aliases
+CLAUDE_ENV="DISABLE_AUTOUPDATER=1 FORCE_AUTOUPDATE_PLUGINS=1"
+alias clauded="$CLAUDE_ENV claude --dangerously-skip-permissions"
+alias tclaude="tmux new $(for i in $CLAUDE_ENV; do echo -e $i; done) claude"
 alias tclauded="tclaude --dangerously-skip-permissions"
+alias codexd="codex --dangerously-bypass-approvals-and-sandbox"
 tcodex()
 {
 	tmux new \
@@ -21,6 +27,7 @@ tcodexd()
 {
 	tcodex --dangerously-bypass-approvals-and-sandbox "$@"
 }
+alias mused="muse --yolo"
 tmuse()
 {
 	tmux new \
@@ -31,10 +38,10 @@ tmused()
 {
 	tmuse --yolo "$@"
 }
+alias opencoded="opencode --auto"
 alias topencode="tmux new opencode"
 alias topencoded="topencode --auto"
 alias tpi="tmux new pi"
-alias ls="ls -F"
 
 # wrapper aliases
 if [ -z "$NO_LABEL" -a -n "$TTY" -a -n "$TTY_DEV" -a -n "$TERM" ]; then
