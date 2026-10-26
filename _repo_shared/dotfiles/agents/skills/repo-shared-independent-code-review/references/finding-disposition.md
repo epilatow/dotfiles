@@ -7,30 +7,43 @@ review before changing the commit; do not turn findings into a serial search.
 ## Resolve findings
 
 Address each finding in the commit that owns the change and rerun the tests or
-gates affected by the fix. A P1/P2 finding cannot be unilaterally rejected.
-Evaluate it against the user's requirements and approved plan, then try to
-resolve it within those constraints. If it appears incorrect or out of scope,
-or fixing it would trade away a requirement or reverse required behavior, stop
-implementation, testing, review, and merge work and ask the user. Do the same
-if reviews conflict, an issue recurs, a fix needs new authority, or review
-cycles fail to converge. Do not leave a known actionable P1/P2 unresolved
-merely because several cycles have completed.
+gates affected by the fix. A P1/P2 finding cannot be unilaterally rejected
+unless a recorded user decision settles it. Evaluate it against the user's
+requirements and approved plan, then try to resolve it within those
+constraints. If it appears incorrect or out of scope, or fixing it would trade
+away a requirement or reverse required behavior, stop implementation, testing,
+review, and merge work and ask the user. Do the same if reviews conflict, an
+issue recurs, a fix needs new authority, or review cycles fail to converge.
+Concluding that a finding raises a scope question is itself the stop: ask
+before fixing it, not after another round. Do not leave a known actionable
+P1/P2 unresolved merely because several cycles have completed.
+
+A recorded user decision settles a finding that asks for what the user already
+declined, so it needs no new question. When the approved plan or another
+durable record of the user's instructions holds that decision, reject the
+finding by quoting the decision and naming where it is recorded, log it as
+below, and list it in the next report to the user, who may overturn it. Without
+such a record, a finding that only appears out of scope still goes to the user.
 
 A P1/P2 finding indicates a gap in the preceding analysis. Before fixing the
 named case, inspect adjacent paths, other instances, and implied edge cases;
-address the complete gap in the same amend. A local P3 finding should also be
-fixed; its severity says whether it blocks shipping, not whether the work is
-worth doing.
+address the complete gap within the approved scope in the same amend. Other
+instances outside that scope make the finding a scope question for the user or
+a recorded user decision, rather than one more instance to fix this round. A
+local P3 finding should also be fixed; its severity says whether it blocks
+shipping, not whether the work is worth doing.
 
 Append any finding deliberately not addressed to
-`<main-checkout>/tmp/<slug>-code-review-rejected.md`, with reasoning. For
-P1/P2, do so only after the user confirms the rejection. A defensible rejection
-can concern a genuinely unrelated surface, a fix that would reintroduce an
-earlier regression, or a cosmetic change that would enlarge the diff for
-negligible value. Pre-existing staleness on a touched surface, the P3 label, or
-calling an in-scope fix "defensive" is not a defensible rejection. If work
-genuinely belongs in a separate follow-up, propose its scope to the user rather
-than rejecting it on the user's behalf.
+`<main-checkout>/tmp/<slug>-code-review-rejected.md`, with reasoning. Log a
+P1/P2 rejection only after the user confirms it, or, when a recorded user
+decision settles the finding, with that decision quoted. A defensible rejection
+can concern a genuinely unrelated surface, a request a recorded user decision
+already declined, a fix that would reintroduce an earlier regression, or a
+cosmetic change that would enlarge the diff for negligible value. Pre-existing
+staleness on a touched surface, the P3 label, or calling an in-scope fix
+"defensive" is not a defensible rejection. If work genuinely belongs in a
+separate follow-up, propose its scope to the user rather than rejecting it on
+the user's behalf.
 
 ## Decide whether to re-review
 

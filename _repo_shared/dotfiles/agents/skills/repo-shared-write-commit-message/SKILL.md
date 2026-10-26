@@ -57,6 +57,11 @@ the invariant or constraint the change satisfies, and a non-obvious tradeoff
 when one matters. Do not pad a self-explanatory change merely to reach a body
 length.
 
+State the problem at the scope the change delivers. When a change deliberately
+covers only some instances of a broader problem, name the instances it covers
+and say the rest are unchanged; a reviewer judges completeness against the
+message alone.
+
 Do not include:
 
 - inventories of files, call sites, or changed symbols;
@@ -124,7 +129,8 @@ Read the proposed message against the exact diff and reject it unless all of
 these are true:
 
 - the subject matches the repository form and vocabulary;
-- every factual claim is supported and the described scope is complete;
+- every factual claim is supported, the described scope is complete, and no
+  claim reaches beyond what the change delivers;
 - the body explains why rather than narrating the patch;
 - wrapping and blank lines are valid, with trailers last;
 - no forbidden ephemeral, private, redundant, or removed-symbol reference

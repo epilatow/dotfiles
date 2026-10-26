@@ -451,8 +451,8 @@ Complete the review before acting on findings. Resolve findings in their owning
 commits and rerun affected gates. Before deciding how to handle a finding,
 whether an amendment needs re-review, or how to handle later user feedback,
 read the skill's `references/finding-disposition.md`. A disputed P1/P2 or a fix
-requiring new authority must be brought to the user; do not reject it
-unilaterally.
+requiring new authority must be brought to the user unless a recorded user
+decision already settles it; do not reject it unilaterally.
 
 ### Standing authorization
 

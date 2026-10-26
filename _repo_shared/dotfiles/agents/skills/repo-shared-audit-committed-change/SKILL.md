@@ -53,6 +53,16 @@ cohesive. If it combines separable changes, split only when each result will be
 complete, independently understandable, and testable. Keep tightly coupled
 implementation, tests, and documentation together.
 
+Check that the message claims no more than the commit delivers. Independent
+review judges completeness against the message alone, so a problem statement or
+guarantee broader than the diff invites a broader fix. When the plan or the
+user limits a change to some instances of a broader problem, the message names
+the instances it covers and says the rest are unchanged. A claim the diff only
+partly delivers is a scope-drift finding: narrow the claim, or stop and ask
+whether the broader scope is wanted. When the approved plan already requires
+the broader scope, the gap is an omitted requirement instead, and the change is
+completed rather than its claim narrowed.
+
 ## Inspect source completeness
 
 For each changed behavior or interface:
@@ -69,8 +79,11 @@ For each changed behavior or interface:
    directly changed lines.
 
 A surfacing instance is not the boundary when the same underlying problem
-exists elsewhere. Pre-existing staleness on a touched surface is not a reason
-to leave that surface incomplete.
+exists elsewhere; the approved scope is. Where the plan or the user limited the
+change to some instances, the others are out of scope, and the message says so.
+Where nothing limits it, stopping short of the other instances needs the user's
+confirmation. Pre-existing staleness on a touched surface is not a reason to
+leave that surface incomplete.
 
 ## Inspect test completeness
 
