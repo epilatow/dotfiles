@@ -15,6 +15,7 @@ notify-channels      = ["ntfy"]
 notify-attach-log    = true
 notify-attach-max-kb = 256
 keep-awake           = true
+priority             = "high"
 # timeout-sec          = 3600         # default: 1800 sec (30 min)
 # log-keep-runs        = 30
 
@@ -45,7 +46,6 @@ gate        = "command -v codex"
 daemon      = true
 uuid        = "4c392a33-485b-4a2a-abd6-4d029d151769"
 flags       = ["full-disk-access"]
-priority    = "high"
 
 [job.u-bins-brew]
 command     = "brew update && NONINTERACTIVE=1 brew upgrade"
