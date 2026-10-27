@@ -128,6 +128,20 @@ or side effects, or flag invariants the type system can't enforce.
 
 ## Testing
 
+Shared tool subprocesses and pytest sessions run with
+`NODE_DISABLE_COMPILE_CACHE=1` so disposable worktrees do not accumulate Node
+compilation caches. Consumer commands launched outside shared tools and pytest
+must apply the same policy at their own entry points.
+
+Pytest scratch defaults to the main checkout's `tmp/pytest/`, also from linked
+worktrees, so test artifacts do not accumulate in system temporary storage.
+Outside Git it uses the invocation directory's `tmp/pytest/`. Explicit
+`PYTEST_DEBUG_TEMPROOT` and `--basetemp` still apply. Keep pytest's numbered
+directories for concurrent runs; configure its normal
+`tmp_path_retention_count` and `tmp_path_retention_policy` settings for
+retained diagnostics. Defaults retain three runs; interrupted-run locks follow
+pytest's native timeout.
+
 - Add tests for new functionality. A change that adds a feature without a test
   is incomplete.
 - During development, run the repo-shared tests and focused tests for the
