@@ -61,13 +61,14 @@ Answer two distinct questions, separately:
    - Commit message: does it accurately describe what
      the diff does? Any rationalizations, omissions, or
      claims that don't match the actual change?
-   - Doc-sync: did the diff touch anything with a doc
-     footprint -- CLI surfaces, helper APIs, naming
-     rules, test layout, conventions, behaviors -- that
-     should have triggered a doc update but didn't? Read
-     `DEVELOPMENT_SHARED.md` "Doc-sync rule" for the
-     policy, then grep `*.md` for the changed symbols /
-     conventions and flag any stale references.
+   - Docs: read `DEVELOPMENT_SHARED_AGENT.md` "Update
+     relevant docs" for the policy. Did the diff leave a doc claim
+     false, or omit something a doc's reader needs? Grep
+     `*.md` for removed names and names whose meaning or
+     behavior changed, and flag stale references. Did it
+     add doc text that restates the
+     implementation or repeats a fact documented
+     elsewhere?
    - For code diffs, evaluate the broader logic the
      changed code participates in. Read the affected
      file(s) in full plus any callers / consumers

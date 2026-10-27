@@ -39,8 +39,9 @@ Comments augment the code -- they don't repeat what the code is already doing.
 Use them to provide context, explain the why, document non-obvious requirements
 or side effects, or flag invariants the type system can't enforce.
 
-- Don't number steps in comments (`# 1. Parse state`). Numbering is unnecessary
-  and adding / removing steps requires renumbering.
+- Don't number steps in comments (`# 1. Parse state`), even for a canonical
+  pipeline: the named operation is its own label, and adding / removing steps
+  requires renumbering.
 - Don't reference user-reported bugs ("Regression guard for the user-reported
   bug where ..."). Describe what the code does and the constraint it enforces;
   bug history belongs in the commit message.
@@ -61,17 +62,14 @@ or side effects, or flag invariants the type system can't enforce.
 - Line wrap at 79 chars.
 - ruff and mypy compliant. Repos enforce this differently -- see the per-repo
   Testing section for how.
-- Unused function / method / lambda parameters are flagged (ruff's `ARG` rules,
-  part of the canonical default rule set). Remove a genuinely dead parameter;
-  for one that must stay (a callback signature, an interface override), mark it
-  unused at the signature -- prefix it with `_` (e.g. `_event`), or absorb it
-  in a `**_kwargs` catch-all when the caller passes it by keyword so its name
-  must stay. Never silence the check by `del`-ing the parameter in the body to
-  appease the linter; that hides the unused-ness from the signature and reads
-  as a deliberate deletion. A pytest fixture requested only for its side effect
-  can't be underscored -- pytest resolves fixtures by exact name -- so request
-  it with `@pytest.mark.usefixtures("name")` and drop the parameter, or
-  suppress the single line with `# noqa: ARG001`.
+- Unused function / method / lambda parameters are flagged (ruff's `ARG`
+  rules). Remove a dead parameter. For one that must stay (a callback
+  signature, an interface override), mark it unused at the signature: prefix it
+  with `_`, or absorb it in `**_kwargs` when callers pass it by keyword. Never
+  `del` it in the body to appease the linter; that hides the unused-ness from
+  the signature. A pytest fixture needed only for its side effect must keep its
+  name, so request it with `@pytest.mark.usefixtures("name")` and drop the
+  parameter, or suppress the single line with `# noqa: ARG001`.
 - Strongly typed. Don't use `Any` for a value this code inspects or accesses --
   model it with a `TypedDict`, dataclass, or pydantic model (a bare
   `Dict[str, Any]` standing in for structured data is the usual offender).
@@ -128,19 +126,11 @@ or side effects, or flag invariants the type system can't enforce.
 
 ## Testing
 
-Shared tool subprocesses and pytest sessions run with
-`NODE_DISABLE_COMPILE_CACHE=1` so disposable worktrees do not accumulate Node
-compilation caches. Consumer commands launched outside shared tools and pytest
-must apply the same policy at their own entry points.
-
-Pytest scratch defaults to the main checkout's `tmp/pytest/`, also from linked
-worktrees, so test artifacts do not accumulate in system temporary storage.
-Outside Git it uses the invocation directory's `tmp/pytest/`. Explicit
-`PYTEST_DEBUG_TEMPROOT` and `--basetemp` still apply. Keep pytest's numbered
-directories for concurrent runs; configure its normal
-`tmp_path_retention_count` and `tmp_path_retention_policy` settings for
-retained diagnostics. Defaults retain three runs; interrupted-run locks follow
-pytest's native timeout.
+Tools and test harnesses that launch Node set `NODE_DISABLE_COMPILE_CACHE=1` so
+disposable worktrees do not accumulate compilation caches in the system
+temporary directory. Keep pytest's numbered temporary directories so concurrent
+runs stay apart; tune retention with its normal `tmp_path_retention_count` and
+`tmp_path_retention_policy` settings.
 
 - Add tests for new functionality. A change that adds a feature without a test
   is incomplete.
@@ -154,9 +144,9 @@ pytest's native timeout.
   after the change and review fixes are settled. Use its normal defaults;
   enable additional gated suites only when relevant or explicitly requested.
 - Reuse passing results while the tested content, commands, and conditions
-  remain applicable. After a narrow fix, rerun affected checks. A new commit
-  hash alone does not require another full run; repeat the full suite only when
-  changes or conditions invalidate its coverage.
+  remain applicable. After a narrow fix or a base change, rerun affected
+  checks. A new commit hash alone does not require another full run; repeat the
+  full suite only when changes or conditions invalidate its coverage.
 
 ### Isolated test failures
 
@@ -203,8 +193,7 @@ Two complementary tools enforce markdown style:
   `mdformat` can't see: required fence languages (MD040), broken anchor links
   (MD051), reference-link consistency (MD052 / MD053), missing alt text
   (MD045), duplicate headings (MD024), and similar. Config lives in
-  `.markdownlint.json` at the repo root. `~/.markdownlint.json` is a reasonable
-  starting point when adding markdownlint to a new repo.
+  `.markdownlint.json` at the repo root.
 
 The two tools agree on every mechanical rule by design. If they ever disagree,
 the formatter wins (it's mechanical) and `.markdownlint.json` gets adjusted to
@@ -279,40 +268,13 @@ The test: if a comment or a doc paragraph describes behavior that lives in
 replace it with the contract the consumer can rely on instead of the mechanism
 the callee uses to deliver it.
 
-## Doc-sync rule
-
-**Documentation is part of the change, not a follow-up.** When code changes,
-every doc that describes that code changes in the same commit. No exceptions,
-no "I'll do the docs in a follow-up" -- doc and code commit together so
-reviewers see both at once.
-
-Before committing a code change, walk through every markdown file the change
-could touch and verify it still matches reality. Specifically:
-
-- `DEVELOPMENT.md` and `DEVELOPMENT_SHARED.md` -- update when dev-process
-  tooling changes (new test conventions, new lint rules, renamed or removed CLI
-  flags on a tool, new required steps in the develop / commit / test cycle).
-- `DEVELOPMENT_AGENT.md` and `DEVELOPMENT_SHARED_AGENT.md` -- update when
-  agent-specific workflow changes (review protocol, file markers, new
-  agent-only conventions).
-- Per-component / per-tool docs (where a component carries its own README or
-  `--help` text) -- update when its CLI surface, options, or behavior changes.
-
-Stale docs waste every reader's time -- users follow steps that no longer work,
-devs chase behaviors the code stopped doing. **Every code change is a potential
-doc change.** Before finalizing the commit message, grep the repo for any
-symbol, flag, convention, or behavior the diff touched and update every doc
-that mentions it.
-
 ## Commit messages
 
 - Use `- component: Summary of change.` format. Match what's already in
   `git log`; the existing repo style is the source of truth.
-- Wrap the message body at about 72 columns. `git log` indents the body by four
-  spaces when it displays it, so a wider body overruns 80 columns in the log;
-  the subject stays short and on one line. Trailers are exempt: a trailer is
-  one unbreakable token-value pair, and folding it would break the parsers that
-  read it, so a long one is allowed to overrun.
+- Keep the subject short and on one line. Wrap the body at about 72 columns:
+  `git log` indents it four spaces, so a wider body overruns 80 columns. Never
+  wrap a trailer; each stays on one line however long.
 
 **Explain the why, not the what.** The diff already shows what changed. The
 commit message should give a future reader the context they can't derive from
@@ -323,33 +285,20 @@ you're almost certainly over-explaining.
 
 Specifically, do NOT include:
 
-- Lists of every file or call site touched. The diff enumerates them; if the
-  scope is "every site of pattern X", say so once. This applies to any prefix
-  variant -- `Touched:`, `Files changed:`, `Affected:`, `Sites:`, etc. -- which
-  is just the same list with a label.
-- Test inputs, fixture values, or the specific bad-shape cases a regression
-  test exercises. The test code is the source of truth.
-- Sub-decisions that are obvious from the code (which field type was used,
-  which helper the code now calls, how a loop is structured).
-- Restatements of points already in an earlier paragraph of the same message.
-- References to symbols, tests, functions, or files that the same diff
-  *removes* or replaces. A subject like "Replaces the per-utility
-  `_FooHelper.bar` with a generic base" is a trap: future readers grep for the
-  named symbol and find nothing because the same commit deleted it. State the
-  new artifact on its own terms; the diff already shows the deletion.
-- Pointers to ephemeral scratch -- "the followup notes ...", "the
-  tmp/<slug>-... scope", "as discussed in the earlier review", "the plan put X
-  in Y". `tmp/` files, code-review threads, and review inputs are working state
-  that does not survive in `git log`. If a constraint matters, restate it
-  inline; if it's just a paper trail, drop it.
-- Transient, machine-local, or private handles -- API keys, machine hostnames,
-  local filesystem paths, URLs into a private tracker or chat. A commit message
-  is a permanent record, world-readable on a public repo, while those handles
-  mean nothing to a later reader who cannot resolve them anyway. The test is
-  whether a stranger reading the commit years from now can still follow it, so
-  durable public references stay fine: an issue reference against this repo's
-  tracker (`Fixes #1234`), a link to a public upstream bug, and the authorship
-  trailers (`Co-Authored-By:`, `Signed-off-by:`, `Reported-by:`) that credit a
-  commit's contributors.
+- Lists of the files or call sites touched, under any label (`Touched:`,
+  `Files changed:`, ...). If the scope is "every site of pattern X", say so
+  once.
+- Test inputs, fixture values, or the bad-shape cases a regression test
+  exercises; the test is the source of truth.
+- Sub-decisions obvious from the code, or restatements of an earlier paragraph.
+- Symbols, tests, or files the same diff removes or replaces. A reader who
+  greps for them finds nothing; describe the new artifact on its own terms.
+- Pointers to ephemeral scratch -- `tmp/` files, review threads, "the plan".
+  They do not survive in `git log`; if a constraint matters, restate it.
+- Transient, machine-local, or private handles -- API keys, hostnames, local
+  paths, private tracker or chat URLs. A commit message is a permanent record,
+  world-readable on a public repo, and a stranger must be able to follow it
+  years from now. Issue references against this repo's tracker (`Fixes #1234`),
+  public upstream bug links, and authorship trailers stay.
 
 [dclint]: https://github.com/zavoloklom/docker-compose-linter

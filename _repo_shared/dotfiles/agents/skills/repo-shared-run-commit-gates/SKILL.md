@@ -13,23 +13,14 @@ select or walk a commit stack.
 
 ## Choose the gate stage
 
-- **Development / pre-review:** run the repo-shared tests and focused checks
-  selected from the changed code, callers, and shared dependencies. Include
-  applicable formatting, lint, type, platform, and end-to-end checks. Do not
-  run the full suite or unrelated utilities' tests during each iteration.
-- **Landing:** after the change and review fixes are settled, run the normal
-  full suite once before landing. Keep default GUI and integration gating; opt
-  into additional suites only when relevant or explicitly requested.
-
-Record the selected stage, commands, and scope rationale. Retain applicable
-passing results; after narrow amendments rerun affected checks, not the whole
-suite solely because the commit hash changed.
+Choose the development / pre-review stage (shared and focused checks) or the
+landing stage (the full suite on the settled candidate) as the Testing policy
+directs. Record the stage, commands, and scope rationale.
 
 ## Identify the exact candidate
 
 1. Read the repository instructions and discover its authoritative format,
-   lint, type-check, shared, focused, and full-suite commands. Development
-   scope must cover the change; landing still requires the normal full run.
+   lint, type-check, shared, focused, and full-suite commands.
 2. From the implementation worktree, record the attached source branch and
    resolve the selected candidate to its full commit object ID. The candidate
    may be `HEAD` or another explicitly selected commit, but do not accept an
@@ -103,21 +94,8 @@ passing gate.
 
 ## Handle an isolated failure
 
-Do not restart the full suite for a single failed test. After the run finishes,
-rerun only that test on the same candidate with equivalent settings and
-conditions. Apply DEVELOPMENT_SHARED.md's "Isolated test failures" policy.
-
-A passing rerun requires causal analysis, not automatic acceptance. Inspect
-changed paths and transitive effects, fixtures, dependencies, environment,
-timing, and differences between the original run and rerun. If all other
-required checks completed successfully and no plausible introduced regression
-remains, flag and document the flake and mark the gate green. Preserve the
-original command's non-zero exit status and the rerun evidence. Do not require
-another full run merely to obtain a zero exit status.
-
-If the failure persists or a plausible regression remains, keep the gate
-non-green and root cause it. Fix and retest the affected scope; repeat the full
-suite only when the cause or fix invalidates broader coverage.
+After the run finishes, apply DEVELOPMENT_SHARED.md's "Isolated test failures"
+policy.
 
 ## Clean up safely
 

@@ -51,7 +51,7 @@ Decide per fix, not per finding severity, commit, or stack. Re-review the
 amended commit when the fix changes behavior enough that the completed review
 no longer covers it: a reworked or added code path, a changed caller/user
 contract, or a substantial diff. Use a fresh full zero-context review through
-this skill; the reviewer does not rerun the implementer's full suite.
+this skill.
 
 Otherwise, amend and rerun the affected tests or gates without another review,
 even for a P1/P2. Examples include commit-message, documentation, docstring,

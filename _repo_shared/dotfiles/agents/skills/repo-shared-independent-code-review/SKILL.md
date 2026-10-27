@@ -13,15 +13,6 @@ the reviewer. Repository instructions decide when this gate is mandatory and
 whether spawning is authorized; this skill supplies the task-specific
 procedure.
 
-When locating this procedure, prefer
-`.agents/skills/repo-shared-independent-code-review/SKILL.md` in the current
-repository. If it is absent and repository policy does not require the
-repository-local entrypoint, use
-`~/.agents/skills/repo-shared-independent-code-review/SKILL.md`. When policy
-requires the repository-local entrypoint, its absence blocks that review gate.
-Discovery by name alone does not establish which copy won a client-specific
-precedence decision.
-
 ## Select the reviewer
 
 Use the currently active agent's built-in child-agent handler when available.
@@ -30,19 +21,11 @@ active environment has no built-in handler, spawn that same agent's CLI
 directly using its documented noninteractive/subagent mode. Do not switch to
 another CLI unless the user explicitly asks.
 
-The child must start without inherited parent conversation, summaries, plans,
-or review notes. Provide only the frozen review prompt with the full target
-commit ID and clean review-worktree path substituted. The child loads
-repository instructions from that worktree. Do not add a description of the
-change or point it to other worktrees or review artifacts. If the child cannot
-be observed and safely ended, report the mandatory gate as blocked.
-
 Require all of the following before spawning:
 
 - the candidate is a commit, not uncommitted work;
-- the implementer-owned repo-shared and focused checks are green on that exact
-  commit under DEVELOPMENT_SHARED.md's Testing policy; the final full suite
-  belongs to the landing stage, not each pre-review iteration;
+- the implementer-owned shared and focused checks are green on that exact
+  commit;
 - the candidate and tested commit resolve to the same full commit object ID;
 - the source checkout is attached to a branch; and
 - the current agent can create and later remove its own temporary branch and
@@ -82,17 +65,11 @@ purpose label beyond the mechanically derived source-branch component.
 
 Read the [frozen review prompt](references/review-prompt.md). Send the fenced
 `text` block exactly, replacing only `<SHA>` with the full object ID and
-`<REPO>` with the absolute worktree path. Pass no additional message or
-inherited authored context.
-
-Use the active environment's normal child-agent supervision. Do not impose a
-fixed-duration timeout; distinguish completion, continued work, abnormal exit,
-and a stuck run using the repository's supervision rules. Silence alone is not
-a reason to cancel.
+`<REPO>` with the absolute worktree path, and send nothing else. Supervise the
+reviewer under "Supervising a subagent" in `DEVELOPMENT_SHARED_AGENT.md`.
 
 The reviewer is read-only with respect to tracked files. It may inspect the
-whole tracked repository and run focused tests to substantiate a suspected
-finding, but it does not repeat the implementer's full suite.
+whole tracked repository and run focused tests.
 
 ## Capture and cleanup
 
@@ -117,5 +94,4 @@ create.
 
 After the reviewer returns, read and follow
 [finding disposition and re-review](references/finding-disposition.md) before
-acting on findings or later user feedback. A blocked or incomplete review does
-not permit completion, handoff, merge, or push.
+acting on findings or later user feedback.

@@ -38,23 +38,18 @@ apply.
   authored-context audit, run repo-shared and focused checks relevant to the
   committed change, following [Testing](DEVELOPMENT_SHARED.md#testing). Use the
   repository-local `.agents/skills/repo-shared-run-commit-gates/SKILL.md` for
-  that exact commit. Review does not require an early full-suite run. Do not
-  give a reviewer a commit with red applicable gates.
+  that exact commit. Do not give a reviewer a commit with red applicable gates.
 - **Gate each new commit, not just the tip.** Run shared and focused checks on
-  every new commit in a stack with no later commits present; the final full
-  suite covers the settled tip before landing. For a previously green rewrite,
-  follow the rewrite skill's affected-commit and final-tip rule.
+  every new commit in a stack with no later commits present. For a rewrite,
+  follow the rewrite skill.
 - **An independent code review precedes handoff.** Once the gates are green,
   the implementing agent spawns the reviewer itself, unasked. An unreviewed
   branch is not ready to hand off as finished. See [Code review](#code-review).
 - **A green landing gate precedes every merge.** Run the full suite on the
-  settled candidate before landing. Reuse applicable passing results and rerun
-  affected checks after narrow fixes or base changes. Apply the isolated-test
-  failure policy in [Testing](DEVELOPMENT_SHARED.md#isolated-test-failures); a
-  qualifying non-regression flake is green without another full run. Record
-  which commits the evidence covers. Merge approval waives no gate. SHA changes
-  alone do not require re-review; follow the independent-review skill's
-  finding-disposition rules. Never merge first and test afterward.
+  settled candidate before landing, following
+  [Testing](DEVELOPMENT_SHARED.md#testing), and record which commits the
+  evidence covers. Merge approval waives no gate. Never merge first and test
+  afterward.
 - **Status reports follow the skill.** When the user asks for a development
   status report (short requests like "Status?" or "Status update?" count when
   development work is active), follow the repository-local
@@ -208,14 +203,28 @@ self-detaching tool launched without `setsid` and without capturing its
 PID-bearing output -- stop and ask the user rather than fall back to a
 resource-match query.
 
-## Doc-sync is non-negotiable
+## Update relevant docs
 
-The Doc-sync rule in `DEVELOPMENT_SHARED.md` is mandatory for every
-agent-authored commit. **Every code change is a potential doc change.** Before
-finalizing the commit message, grep the repo for any symbol, flag, convention,
-or behavior the diff touched -- CLI surfaces, helper APIs, naming rules, test
-layout, anything -- and update every doc that mentions it. If a doc references
-stale state, it's part of the bug, not separate from it.
+A change that affects what a doc tells its reader updates that doc in the same
+commit. Docs are part of the change, not a follow-up.
+
+A change has documentation impact when it:
+
+- makes an existing doc claim false -- a renamed or removed command, flag,
+  knob, path, or required step; or
+- adds a command, flag, knob, convention, or required step that a doc's reader
+  needs and cannot get from `--help` or an error message.
+
+An implementation detail is not documentation impact. Code changing is not a
+reason to add doc text. Document each fact once, in the doc whose reader needs
+it, and link to it elsewhere rather than restating it (see
+[Keep implementation details at the implementation](DEVELOPMENT_SHARED.md#keep-implementation-details-at-the-implementation)).
+`DEVELOPMENT_SHARED.md` and `DEVELOPMENT_SHARED_AGENT.md` hold cross-repo
+conventions, not the behavior of one repo's tools. Deleting doc text the change
+made obsolete is part of the update.
+
+To find the impact, grep the docs for each name the diff removes or whose
+meaning or behavior it changes, and fix what is now wrong.
 
 ## Finish the work everywhere it applies
 
@@ -286,11 +295,10 @@ cycle runs in a `git worktree add` under `$REPO/.wt/`, nested under the repo's
 own checkout. For an agent-created branch-backed worktree, the relative path
 under `.wt/` must exactly match the branch name: branch `<branch>` uses
 `$REPO/.wt/<branch>`. Do not invent a separate worktree-purpose name. The
-temporary gate and code-review branches below use attached worktrees and
-therefore follow the branch-matching rule. Be sure that .gitignore contains
-.wt/. Once the user has approved the merge and the work has landed on `main`,
-remove the worktree and any branches you created as part of the development
-effort.
+skills' temporary gate and code-review branches follow the same rule. Be sure
+that .gitignore contains .wt/. Once the user has approved the merge and the
+work has landed on `main`, remove the worktree and any branches you created as
+part of the development effort.
 
 **Set the working directory at the start of every command or block of
 commands** -- `cd <abs-path> && <command>`, or `git -C <abs-path>` per command.
@@ -363,11 +371,6 @@ comment describes the current code, never what was there before. The
 agent-specific failure mode is repeating the commit-message rationale inside
 the source.
 
-Numbered step comments in code (`# 1. Parse input`, `# 2. Validate`, ...) are
-forbidden. Adding or removing a step forces renumbering, and the function name
-plus code structure already convey ordering. This applies even when describing
-a canonical pipeline of steps: the named operation is its own label.
-
 Concretely, never write comments like:
 
 - `# The legacy _FooBar shim is gone -- now uses helpers.foo.`
@@ -383,76 +386,51 @@ comment's content reads like a footnote on the diff, it belongs in the commit
 message, not the file; if it cannot be written without naming something that no
 longer exists, delete it.
 
-Example lists in this file (the bullets above, the "do NOT include" list under
-"Commit messages" in `DEVELOPMENT_SHARED.md`) are illustrative, not exhaustive.
-They're samples of patterns to recognise, not authoritative enumerations --
-when a similar-but-not-included entry shows up, the list doesn't need to be
-extended for the rule to apply.
+Example lists in these guides, including the "do NOT include" list under
+"Commit messages" in `DEVELOPMENT_SHARED.md`, are illustrative, not exhaustive:
+a similar pattern that is not listed still falls under the rule.
 
 ## Supervising a subagent
 
-This covers every subagent an agent spawns -- a reviewer, a research or
-implementation job, another model driven through its own CLI -- and every
-parent, interactive or not. An attended parent owes its subagents the same
-supervision: a wedged one is discovered exactly as late either way, because in
-neither case was anyone watching it.
+This covers every subagent you spawn -- a reviewer, a research or
+implementation job, another model driven through its own CLI -- whether or not
+anyone is watching the parent.
 
-Every spawned subagent needs a way to watch it and a way to end it: a
-cancellation handle where the parent holds one, or the PID and process group
-where the subagent runs as an external process. Record the handle at spawn
-time. A `running` status is not completion.
-
-Do not put a timeout on the run. How long a subagent takes is not predictable
-from its task, and a deadline picked at spawn time ends a healthy subagent
-partway through and loses everything it did. Supervise by watching instead:
-**check on the subagent at least every five minutes** and decide from what you
-see whether it has finished, is still working, has died, or is stuck. A
-completion signal fires only when the subagent completes, so one that wedges
-never emits it and the parent waits on an event that is not coming; the check
-is what catches that.
-
-Run the check off something that outlives the spawn and fires whether or not
-the parent remembers: a scheduled wake-up where the harness offers one,
-otherwise a watchdog holding the subagent's handle. A sleep chained onto the
-spawning command is neither, and an intention to check back is less. Never
-spawn a subagent through a call that blocks the parent: a blocked parent has no
-turn in which to check, and a timeout on the blocking call is the deadline this
-section rules out. A subagent that cannot be both watched and stopped does not
-get started; report that as a blocked gate.
-
-Silence is not evidence of a hang. A subagent routinely surfaces nothing
-between spawn and answer: no intermediate step, no partial output. Ending one
-on a quiet check would trade a rare wedge for the routine destruction of
-healthy work. Dead is a subagent that has exited without signalling completion.
-Stuck is evidence from the subagent itself -- output that stopped growing, a
-transcript sitting on the same tool call, a process idle across checks -- and
-it has to hold across more than one check before it counts. Where a subagent
-does report progress, a stall is worth mentioning before acting on. A run that
-offers nothing to read at all -- no output, transcript, or process to observe
--- across several checks is neither working nor stuck on the evidence: say so
-and ask the user how to proceed rather than end it or wait in silence.
-
-End a stuck subagent, and only on that evidence, through the handle recorded
-for it. Dead or ended, leave its worktree untouched for inspection and say so
-promptly -- a gate it was holding is blocked, and
-[When the review will not run](#when-the-review-will-not-run) sets the schedule
-for announcing that. A review counts only once its explicit response has been
-saved under [Skill-owned review procedure](#skill-owned-review-procedure).
+- **Hold a way to watch it and a way to end it.** Record a cancellation handle,
+  or the PID and process group of an external process, at spawn time. A
+  subagent that cannot be both watched and stopped does not get started; report
+  its gate as blocked. A `running` status is not completion.
+- **No timeouts; check at least every five minutes.** How long a subagent takes
+  is not predictable, so a deadline ends healthy work. Never spawn it through a
+  call that blocks the parent: a blocked parent has no turn in which to check.
+  A wedged one never signals completion, so drive the check from a scheduled
+  wake-up or a watchdog holding the handle, never from an intention to check
+  back.
+- **Silence is not a hang.** Stuck means evidence from the subagent itself --
+  output that stopped growing, a transcript on the same tool call, an idle
+  process -- holding across more than one check. Where a subagent reports
+  progress, mention a stall before acting on it. If nothing at all can be
+  observed across several checks, ask the user instead of ending it or waiting
+  silently.
+- **End only a stuck subagent, through its recorded handle.** Whether it died
+  or you ended it, leave its worktree for inspection and promptly report the
+  gate it held as blocked; see
+  [When the review will not run](#when-the-review-will-not-run).
+- **A noninteractive parent does not launch a child that can stop for
+  interaction** unless the parent will answer it. Otherwise, before unattended
+  work begins, configure every expected action to resolve to `allow` or `deny`,
+  with no more authority than the task needs; a prompt cannot answer a runtime
+  permission request. If neither can be guaranteed, report the gate as blocked
+  instead.
 
 ## Code review
 
-After each agent-driven develop / commit / committed-change audit / green
-shared-and-focused pre-review gate, the implementing agent runs one independent
-review of the exact audited and tested commit, including doc-only and
-lint-config commits. The target need not be `HEAD`. Review precedes user review
-and handoff. The reviewer may run focused tests but not the full suite.
-
-Complete the review before acting on findings. Resolve findings in their owning
-commits and rerun affected gates. Before deciding how to handle a finding,
-whether an amendment needs re-review, or how to handle later user feedback,
-read the skill's `references/finding-disposition.md`. A disputed P1/P2 or a fix
-requiring new authority must be brought to the user unless a recorded user
-decision already settles it; do not reject it unilaterally.
+After its audit and a green pre-review gate, every agent-authored commit gets
+one independent review of that exact commit, doc-only and lint-config commits
+included, before user review and handoff. Complete the review before acting on
+its findings. Before deciding how to handle a finding, whether an amendment
+needs re-review, or how to handle later user feedback, read the skill's
+`references/finding-disposition.md`.
 
 ### Standing authorization
 
@@ -463,17 +441,6 @@ that the review ran under this standing authorization.
 
 A live request to skip review overrides it. Say the commits are unreviewed and
 stop; further work, including merge, is the user's call.
-
-### Noninteractive subagents
-
-A noninteractive agent must not launch a child that can stop for interaction
-unless the parent will service that interaction. Configure the child so every
-expected action resolves to `allow` or `deny`, with no more authority than the
-task requires, before unattended work begins. Instructions in a prompt cannot
-answer a runtime permission request. This applies to the review subagent as
-well as development jobs, and does not move review ownership away from the
-implementing agent. If neither condition can be guaranteed, do not launch the
-child; report its gate as blocked.
 
 ### When the review will not run
 
@@ -487,22 +454,16 @@ Do not substitute the implementing session's committed-change audit. While
 blocked, the work is unreviewed and not ready for completion, handoff, merge,
 or push. Lead with that status when reporting the branch.
 
-### Zero-context review
-
-The reviewer receives no inherited implementing conversation, plans, prior
-reviews, or explanations of intent. Supply only the skill's frozen prompt, with
-the full target commit ID and clean review-worktree path; repository
-instructions loaded from that worktree are allowed.
-
 ### Skill-owned review procedure
 
 Before implementation begins on work requiring this gate, read and follow the
 exact repository-local
 `.agents/skills/repo-shared-independent-code-review/SKILL.md`. Discovery by
 name alone does not prove the repository copy was loaded. The skill owns
-isolation, same-agent reviewer selection, supervision, report capture, cleanup,
-and post-review finding disposition. If the exact skill is missing or a safe
-child cannot run, apply
+isolation, same-agent reviewer selection, report capture, cleanup, and
+post-review finding disposition; supervision follows
+[Supervising a subagent](#supervising-a-subagent). If the exact skill is
+missing or a safe child cannot run, apply
 [When the review will not run](#when-the-review-will-not-run).
 
 [delete from a list, never from a pattern]: #delete-from-a-list-never-from-a-pattern

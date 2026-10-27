@@ -139,19 +139,14 @@ After the replay:
 3. Inspect the rewritten log and every rewritten commit. Confirm commit
    messages, attribution trailers, scope, and parent order.
 4. Reconfirm the feature branch name and a clean working tree.
-5. Assuming every backup commit had passed its applicable gates, run the gates
-   relevant to each changed, amended, or conflict-resolved commit as it is
-   reconstructed, before replaying its descendants. Run the relevant gates on
-   the completed tip, unless its tree and gate commands match an already-green
-   exact candidate. These are shared and focused development checks; apply
-   DEVELOPMENT_SHARED.md's Testing policy for the final landing full run and
-   isolated failures. Markdown-only changes need the Markdown/formatting gates;
-   changes to repo code or tests need their applicable repo gates. Do not rerun
-   gates for unchanged commits merely because their object IDs changed. If an
-   isolated failure passes on rerun, analyze whether this change could have
-   caused it before accepting a flake. Do not start a full-suite or historical
-   binary-chop loop for a documented non-regression flake. Investigate history
-   only when evidence makes it relevant to root-causing an actual regression.
+5. Assuming every backup commit had passed its applicable gates, run the shared
+   and focused checks for each changed, amended, or conflict-resolved commit as
+   it is reconstructed, before replaying its descendants. Run them on the
+   completed tip unless its tree and gate commands match an already-green exact
+   candidate. Unchanged commits need no rerun merely because their object IDs
+   changed. Do not start a full-suite or historical bisect over a documented
+   non-regression flake; investigate history only when evidence ties it to an
+   actual regression.
 6. Apply the repository's independent-review rules.
 
 Keep the backup branch until the user has accepted the rewritten stack or the

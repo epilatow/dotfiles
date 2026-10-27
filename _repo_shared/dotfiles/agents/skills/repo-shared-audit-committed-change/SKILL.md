@@ -1,9 +1,9 @@
 ---
 name: repo-shared-audit-committed-change
 description: >-
-  Audit one exact committed change in the implementing session for source,
-  test, and documentation completeness before its test gates. This read-only
-  completeness audit never performs or satisfies independent code review.
+  Audit one exact committed change in the implementing session for source and
+  test completeness and documentation impact before its test gates. This
+  read-only audit never performs or satisfies independent code review.
 ---
 
 # Audit a Committed Change
@@ -96,12 +96,14 @@ scenario and the behavior it leaves unproved.
 This inspection does not satisfy any test gate. Do not run a focused or full
 suite from this skill.
 
-## Inspect documentation completeness
+## Inspect documentation impact
 
-Apply the repository's always-loaded doc-sync rule. Search Markdown, help text,
-docstrings, comments, examples, and configuration guidance for each changed
-API, flag, path, name, convention, or behavior. Verify every claim matches the
-implementation and that no affected reference still describes the prior state.
+Apply the repository's always-loaded update-relevant-docs rule. Search
+Markdown, help text, docstrings, comments, examples, and configuration guidance
+for each changed or removed API, flag, path, name, convention, or behavior.
+Verify that no claim is now false and that anything a doc's reader needs is
+documented once, where that reader looks. Flag added doc text that restates the
+implementation or repeats a fact documented elsewhere.
 
 ## Report the audit
 
@@ -111,7 +113,7 @@ Complete every check before reporting; do not stop at the first gap. Return:
 - the request and plan used as scope sources;
 - source-completeness findings;
 - test-completeness findings;
-- documentation-completeness findings;
+- documentation-impact findings;
 - scope-drift findings; and
 - an explicit statement that independent review remains outstanding.
 
@@ -122,7 +124,4 @@ independent review. Do not write a persistent review report.
 If findings exist, leave this skill, fix them through the normal implementation
 workflow, amend or rebuild the owning commit, and rerun this entire audit
 against the replacement exact commit before starting post-change tests. A clean
-result satisfies only the implementer's completeness-audit step. After the
-green implementer-owned shared-and-focused gate, independent review must target
-that same exact commit. An unavailable independent review still blocks handoff
-under the repository instructions.
+result satisfies only the implementer's completeness-audit step.
