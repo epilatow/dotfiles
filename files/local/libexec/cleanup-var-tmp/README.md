@@ -12,8 +12,8 @@ Preview eligible entries and check traversal time:
 ```
 
 Pass `--apply` to delete eligible caches. `--tmpdir PATH` selects a different
-temporary directory. Requires Python 3.15, uv, lsof, and find. The job is
-enabled on macOS through the existing `daily-misc` group.
+temporary directory. Requires Python 3.15, uv, and lsof. The job is enabled on
+macOS through the existing `daily-misc` group.
 
 Files reported in use, live pytest PID locks, uncertain locks, symlinks, and
 entries belonging to another user are preserved. Changed candidates are
@@ -21,7 +21,8 @@ skipped. Activity checks are snapshots: a process can open a cache after the
 check. Cleanup does not terminate any process. Recent repository-local pytest
 diagnostics outside `$TMPDIR` are unaffected.
 
-After cleanup, a complete traversal of `$TMPDIR` must finish within 60 seconds.
-Exceeding that limit stops the traversal and fails the job, including during a
-preview. Files disappearing during traversal are tolerated; other cleanup or
-traversal errors fail the job.
+After cleanup, traversal of accessible entries in `$TMPDIR` must finish within
+60 seconds. Exceeding that limit stops the traversal and fails the job,
+including during a preview. Inaccessible descendants are skipped and counted in
+the output. Files disappearing during traversal are tolerated. An unreadable
+root, other traversal errors, and cleanup errors fail the job.

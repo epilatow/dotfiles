@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import getpass
 import os
@@ -262,13 +263,54 @@ def prune(root: Path, *, apply: bool) -> None:
         print(f"{kind}: {action.lower()} {removed}; kept {kept}.", flush=True)
 
 
+def walk(root: Path) -> int:
+    """Traverse accessible entries without following directory symlinks."""
+    skipped = 0
+
+    def handle_error(error: OSError, path: Path) -> None:
+        nonlocal skipped
+        if path == root:
+            raise error
+        if error.errno in (errno.EACCES, errno.EPERM):
+            skipped += 1
+        elif error.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            raise error
+
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            descriptor = os.open(
+                directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
+            try:
+                with os.scandir(descriptor) as entries:
+                    for entry in entries:
+                        path = directory / entry.name
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                pending.append(path)
+                        except OSError as error:
+                            handle_error(error, path)
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            handle_error(error, directory)
+    return skipped
+
+
 def verify_walk(root: Path, *, timeout: float = WALK_LIMIT_SECONDS) -> None:
     started = time.monotonic()
     try:
         result = subprocess.run(
-            ["find", "-P", str(root), "-ignore_readdir_race", "-print"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--walk-only",
+                "--tmpdir",
+                str(root),
+            ],
+            capture_output=True,
             text=True,
             check=False,
             timeout=timeout,
@@ -279,6 +321,7 @@ def verify_walk(root: Path, *, timeout: float = WALK_LIMIT_SECONDS) -> None:
             f"TMPDIR traversal exceeded {timeout:g} seconds; too much junk"
         ) from None
     elapsed = time.monotonic() - started
+    print(result.stdout, end="", flush=True)
     print(f"TMPDIR traversal: {elapsed:.3f}s.", flush=True)
     if result.returncode != 0:
         raise RuntimeError(f"TMPDIR traversal failed: {result.stderr.strip()}")
@@ -292,12 +335,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tmpdir", type=Path, help="Override TMPDIR")
     parser.add_argument("--apply", action="store_true", help="Delete caches")
+    parser.add_argument(
+        "--walk-only", action="store_true", help=argparse.SUPPRESS
+    )
     args = parser.parse_args(argv)
     try:
         chosen = args.tmpdir or os.environ.get("TMPDIR")
         if not chosen:
             raise RuntimeError("TMPDIR is not set; use --tmpdir PATH")
         root = Path(chosen).expanduser().absolute()
+        if args.walk_only:
+            skipped = walk(root)
+            noun = "path" if skipped == 1 else "paths"
+            print(f"TMPDIR traversal: skipped {skipped} inaccessible {noun}.")
+            return 0
         if owned_directory(root) is None:
             raise RuntimeError("TMPDIR must be an owned real directory")
         descriptor = os.open(

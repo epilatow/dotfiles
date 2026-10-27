@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import getpass
 import os
@@ -283,10 +284,9 @@ def test_real_open_cache_is_preserved_until_closed(tmp_path: Path) -> None:
 def test_walk_has_a_real_hard_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    find = tmp_path / "find"
-    find.write_text("#!/bin/sh\nexec /bin/sleep 10\n")
-    find.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tmp_path))
+    worker = tmp_path / "slow_walk.py"
+    worker.write_text("import time\ntime.sleep(10)\n")
+    monkeypatch.setattr(cleanup, "__file__", str(worker))
     with pytest.raises(RuntimeError, match="traversal exceeded"):
         cleanup.verify_walk(tmp_path, timeout=0.05)
 
@@ -297,7 +297,7 @@ def test_late_successful_walk_still_fails(tmp_path: Path) -> None:
             subprocess,
             "run",
             autospec=True,
-            return_value=subprocess.CompletedProcess([], 0, None, ""),
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
         ) as run,
         patch.object(time, "monotonic", autospec=True, side_effect=[0, 61]),
         pytest.raises(RuntimeError, match="exceeded 60 seconds"),
@@ -305,12 +305,87 @@ def test_late_successful_walk_still_fails(tmp_path: Path) -> None:
         cleanup.verify_walk(tmp_path)
     assert run.call_args.kwargs["timeout"] == 60
     assert run.call_args.args[0] == [
-        "find",
-        "-P",
+        sys.executable,
+        str(Path(cleanup.__file__).resolve()),
+        "--walk-only",
+        "--tmpdir",
         str(tmp_path),
-        "-ignore_readdir_race",
-        "-print",
     ]
+
+
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EPERM])
+def test_walk_counts_inaccessible_descendants_and_visits_accessible_ones(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], error_number: int
+) -> None:
+    denied = tmp_path / "denied"
+    denied.mkdir()
+    accessible = tmp_path / "accessible" / "nested"
+    accessible.mkdir(parents=True)
+    original = os.open
+    visited: set[Path] = set()
+
+    def open_directory(path: Path, flags: int) -> int:
+        visited.add(path)
+        if path == denied:
+            raise PermissionError(error_number, "denied", path)
+        return original(path, flags)
+
+    with patch.object(os, "open", autospec=True, side_effect=open_directory):
+        assert cleanup.main(["--walk-only", "--tmpdir", str(tmp_path)]) == 0
+    assert visited == {tmp_path, denied, accessible.parent, accessible}
+    assert "skipped 1 inaccessible path." in capsys.readouterr().out
+    assert not (tmp_path / ".cleanup-var-tmp.lock").exists()
+
+
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EPERM])
+def test_walk_fails_on_an_inaccessible_root(
+    tmp_path: Path, error_number: int
+) -> None:
+    with patch.object(
+        os,
+        "open",
+        autospec=True,
+        side_effect=PermissionError(error_number, "denied", tmp_path),
+    ):
+        assert cleanup.main(["--walk-only", "--tmpdir", str(tmp_path)]) == 1
+
+
+def test_walk_fails_on_unexpected_descendant_errors(tmp_path: Path) -> None:
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    original = os.open
+
+    def open_directory(path: Path, flags: int) -> int:
+        if path == broken:
+            raise OSError(errno.EIO, "I/O error", path)
+        return original(path, flags)
+
+    with (
+        patch.object(os, "open", autospec=True, side_effect=open_directory),
+        pytest.raises(OSError, match="I/O error"),
+    ):
+        cleanup.walk(tmp_path)
+
+
+@pytest.mark.parametrize("replacement", ["missing", "file", "symlink"])
+def test_walk_tolerates_descendants_replaced_after_discovery(
+    tmp_path: Path, replacement: str
+) -> None:
+    child = tmp_path / "child"
+    child.mkdir()
+    original = os.open
+
+    def open_directory(path: Path, flags: int) -> int:
+        if path == child:
+            child.rmdir()
+            if replacement == "file":
+                child.write_text("replacement")
+            elif replacement == "symlink":
+                child.symlink_to(tmp_path, target_is_directory=True)
+        return original(path, flags)
+
+    with patch.object(os, "open", autospec=True, side_effect=open_directory):
+        assert cleanup.walk(tmp_path) == 0
 
 
 def test_real_walk_does_not_follow_directory_symlinks(tmp_path: Path) -> None:
