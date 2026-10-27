@@ -77,6 +77,12 @@ gate                 = "command -v uv"
 notify-success-ratio = "1/7"
 uuid = "ecdad114-711e-418a-9a66-3e65882e3d61"
 
+[job.cleanup-var-tmp]
+script      = "~/.local/libexec/cleanup-var-tmp/cleanup-var-tmp"
+args        = ["--apply"]
+platforms   = ["darwin"]
+uuid        = "45e02730-cab0-4a4d-8ba8-d0b7394e3df5"
+
 [job.u-www-gas-prices]
 script    = "~/.local/libexec/gas-prices-breakdown/gas-prices-breakdown"
 args      = [
@@ -167,7 +173,7 @@ hosts    = ["squee"]
 uuid = "4977a66e-4c17-40f4-8e67-03012dce9894"
 
 [job-group.daily-misc]
-jobs = ["darwin-fix-tz", "cleanup-codex-cli", "cleanup-uv-cache"]
+jobs = ["darwin-fix-tz", "cleanup-codex-cli", "cleanup-uv-cache", "cleanup-var-tmp"]
 uuid = "82d72cf7-de37-4de3-aaee-eb1ea63b3c56"
 
 [job-group.daily]

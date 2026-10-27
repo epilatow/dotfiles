@@ -1,0 +1,325 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.15,<3.16"
+# dependencies = []
+# ///
+"""Remove unused temporary caches and check TMPDIR traversal time."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import getpass
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
+
+WALK_LIMIT_SECONDS = 60
+NODE_BUCKET = re.compile(r"v\d+\.\d+\.\d+-[a-zA-Z0-9_]+-[0-9a-f]+-(\d+)")
+NODE_FILE = re.compile(r"[0-9a-f]{8}")
+PYTEST_RUN = re.compile(r"pytest-\d+")
+
+
+class CacheKind(StrEnum):
+    NODE = "Node compilation files"
+    PYTEST = "pytest runs"
+
+
+@dataclass(frozen=True)
+class Entry:
+    path: Path
+    device: int
+    inode: int
+    mode: int
+    owner: int
+    size: int
+    modified: int
+    changed: int
+
+    @classmethod
+    def read(cls, path: Path) -> Entry:
+        info = path.lstat()
+        return cls(
+            path,
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_uid,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+
+    def unchanged(self, *, directory: bool = False) -> bool:
+        try:
+            fresh = Entry.read(self.path)
+        except FileNotFoundError:
+            return False
+        if directory:
+            return (self.device, self.inode, self.mode, self.owner) == (
+                fresh.device,
+                fresh.inode,
+                fresh.mode,
+                fresh.owner,
+            )
+        return self == fresh
+
+
+@dataclass(frozen=True)
+class Candidate:
+    kind: CacheKind
+    entry: Entry
+    parents: tuple[Entry, ...]
+
+    def unchanged(self) -> bool:
+        return self.entry.unchanged() and all(
+            parent.unchanged(directory=True) for parent in self.parents
+        )
+
+
+def owned_directory(path: Path) -> Entry | None:
+    try:
+        entry = Entry.read(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISDIR(entry.mode) and entry.owner == os.getuid():
+        return entry
+    return None
+
+
+def inventory(root: Path) -> list[Candidate]:
+    """Select recognized, owned entries without following cache symlinks."""
+    base = owned_directory(root)
+    if base is None:
+        raise RuntimeError(f"TMPDIR must be an owned real directory: {root}")
+    candidates: list[Candidate] = []
+    node = owned_directory(root / "node-compile-cache")
+    if node is not None:
+        for bucket_path in sorted(node.path.iterdir()):
+            match = NODE_BUCKET.fullmatch(bucket_path.name)
+            if match is None or int(match[1]) != os.getuid():
+                continue
+            bucket = owned_directory(bucket_path)
+            if bucket is None:
+                continue
+            for path in bucket.path.iterdir():
+                if NODE_FILE.fullmatch(path.name) is None:
+                    continue
+                try:
+                    entry = Entry.read(path)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(entry.mode) and entry.owner == os.getuid():
+                    candidates.append(
+                        Candidate(CacheKind.NODE, entry, (base, node, bucket))
+                    )
+    pytest = owned_directory(root / f"pytest-of-{getpass.getuser()}")
+    if pytest is not None:
+        for path in sorted(pytest.path.iterdir()):
+            if PYTEST_RUN.fullmatch(path.name) is None:
+                continue
+            run = owned_directory(path)
+            if run is not None:
+                candidates.append(
+                    Candidate(CacheKind.PYTEST, run, (base, pytest))
+                )
+    return candidates
+
+
+def active_paths(root: Path) -> set[Path]:
+    """Read one user-wide activity snapshot, avoiding recursive lsof scans."""
+    result = subprocess.run(
+        ["lsof", "-nP", "-a", "-u", str(os.getuid()), "-F0pn"],
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode not in (0, 1) or result.stderr:
+        raise RuntimeError(
+            f"Cannot inspect cache activity: {os.fsdecode(result.stderr)}"
+        )
+    canonical = root.resolve()
+    active: set[Path] = set()
+    for field in result.stdout.split(b"\0"):
+        field = field.removeprefix(b"\n")
+        if not field or (field[:1] == b"p" and field[1:].isdigit()):
+            continue
+        if field.startswith(b"f") and len(field) > 1:
+            continue
+        if not field.startswith(b"n"):
+            raise RuntimeError("Unexpected lsof output; refusing cleanup")
+        path = Path(os.fsdecode(field[1:]))
+        if path.is_absolute():
+            path = path.resolve()
+            if path.is_relative_to(canonical):
+                active.add(path)
+    return active
+
+
+def pytest_lock(path: Path) -> tuple[bool, Entry | None]:
+    """Missing and dead-PID locks are eligible; uncertain locks are kept."""
+    try:
+        entry = Entry.read(path)
+    except FileNotFoundError:
+        return True, None
+    if not stat.S_ISREG(entry.mode) or entry.owner != os.getuid():
+        return False, entry
+    try:
+        text = path.read_text(encoding="ascii").strip()
+    except FileNotFoundError, UnicodeError:
+        return False, entry
+    if (
+        len(text) > 10
+        or not text.isdecimal()
+        or not 0 < int(text) <= 2**31 - 1
+    ):
+        return False, entry
+    try:
+        os.kill(int(text), 0)
+    except ProcessLookupError:
+        return entry.unchanged(), entry
+    except PermissionError:
+        pass
+    return False, entry
+
+
+@contextmanager
+def claim_pytest(path: Path) -> Iterator[bool]:
+    """Claim the native lock so another pytest cleaner preserves this run."""
+    available, previous = pytest_lock(path)
+    if not available:
+        yield False
+        return
+    if previous is not None:
+        if not previous.unchanged():
+            yield False
+            return
+        previous.path.unlink()
+    try:
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
+    except FileExistsError:
+        yield False
+        return
+    with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+        stream.write(str(os.getpid()))
+    own = Entry.read(path)
+    try:
+        yield True
+    finally:
+        if own.unchanged():
+            path.unlink()
+
+
+def prune(root: Path, *, apply: bool) -> None:
+    candidates = inventory(root)
+    for kind in CacheKind:
+        selected = [item for item in candidates if item.kind == kind]
+        if not selected:
+            continue
+        # Refresh per cache type, not per file: compilation caches can contain
+        # hundreds of thousands of entries. Live pytest locks are also checked
+        # immediately before claiming each run.
+        protected: set[Path] = set()
+        for path in active_paths(root):
+            protected.update((path, *path.parents))
+        removed = kept = 0
+        for candidate in selected:
+            path = candidate.entry.path
+            if not candidate.unchanged() or path in protected:
+                kept += 1
+                continue
+            if kind == CacheKind.PYTEST:
+                available, _lock = pytest_lock(path / ".lock")
+                if not available:
+                    kept += 1
+                    continue
+            if not apply:
+                removed += 1
+                continue
+            if kind == CacheKind.NODE:
+                path.unlink(missing_ok=True)
+            else:
+                with claim_pytest(path / ".lock") as claimed:
+                    if not claimed or not candidate.entry.unchanged(
+                        directory=True
+                    ):
+                        kept += 1
+                        continue
+                    shutil.rmtree(path)
+            removed += 1
+        action = "Removed" if apply else "Eligible"
+        print(f"{kind}: {action.lower()} {removed}; kept {kept}.", flush=True)
+
+
+def verify_walk(root: Path, *, timeout: float = WALK_LIMIT_SECONDS) -> None:
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            ["find", "-P", str(root), "-ignore_readdir_race", "-print"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=timeout,
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"TMPDIR traversal exceeded {timeout:g} seconds; too much junk"
+        ) from None
+    elapsed = time.monotonic() - started
+    print(f"TMPDIR traversal: {elapsed:.3f}s.", flush=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"TMPDIR traversal failed: {result.stderr.strip()}")
+    if elapsed > timeout:
+        raise RuntimeError(
+            f"TMPDIR traversal exceeded {timeout:g} seconds; too much junk"
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tmpdir", type=Path, help="Override TMPDIR")
+    parser.add_argument("--apply", action="store_true", help="Delete caches")
+    args = parser.parse_args(argv)
+    try:
+        chosen = args.tmpdir or os.environ.get("TMPDIR")
+        if not chosen:
+            raise RuntimeError("TMPDIR is not set; use --tmpdir PATH")
+        root = Path(chosen).expanduser().absolute()
+        if owned_directory(root) is None:
+            raise RuntimeError("TMPDIR must be an owned real directory")
+        descriptor = os.open(
+            root / ".cleanup-var-tmp.lock",
+            os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+            0o600,
+        )
+        with os.fdopen(descriptor, "r+b") as lock:
+            if os.fstat(lock.fileno()).st_uid != os.getuid():
+                raise RuntimeError("Cleanup lock has a different owner")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print("Cleanup already running; deferring.")
+                return 0
+            prune(root.resolve(), apply=args.apply)
+            verify_walk(root)
+        return 0
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        print(f"cleanup-var-tmp: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
