@@ -26,6 +26,9 @@ uv run pytest
 
 Repository-local tests live under `tests/`.
 
+Do not test `envrc` files or make tests depend on them, including by sourcing
+them. Shell configuration is outside the test suite's scope.
+
 Live tmux integration tests use the real `tmux` executable from `PATH` and
 temporary agent stubs; installed agent CLIs are not required. The live Muse
 launch test verifies its stub started before checking session naming. The live

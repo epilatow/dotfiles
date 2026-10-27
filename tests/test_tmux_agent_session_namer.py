@@ -80,7 +80,6 @@ REFUSED_SLOT_COMMANDS = [
 AGENT_STUB_COMMAND = "sleep"
 PANE_COMMAND_TIMEOUT_SEC = 10.0
 CODEX_HOOKS = REPO_ROOT / "files" / "codex" / "hooks.json"
-ENVRC_ALIASES = REPO_ROOT / "files" / "envrc.aliases"
 
 
 @pytest.fixture
@@ -485,9 +484,17 @@ esac
     path.chmod(0o755)
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("resume", "thread id", "", "--foo=a b"),
+        ("--dangerously-bypass-approvals-and-sandbox", "--foo"),
+    ],
+)
 def test_remote_launcher_configures_tmux_client_before_codex(
     tmp_path: Path,
     fake_tmux: tuple[Path, Path],
+    args: tuple[str, ...],
 ) -> None:
     bin_dir = fake_tmux[0]
     _write_argv_logger(bin_dir / "tmux", "tmux")
@@ -500,12 +507,12 @@ def test_remote_launcher_configures_tmux_client_before_codex(
             "PATH": f"{bin_dir}:{env['PATH']}",
             "TMUX": "/tmp/tmux,fake,0",
             "TMUX_PANE": "%0",
-            "FAKE_TMUX_START": f"{CODEX_LAUNCHER} resume",
+            "FAKE_TMUX_START": shlex.join((str(CODEX_LAUNCHER), *args)),
         },
     )
 
     result = subprocess.run(
-        [str(CODEX_LAUNCHER), "resume", "thread id", "", "--foo=a b"],
+        [str(CODEX_LAUNCHER), *args],
         check=False,
         capture_output=True,
         env=env,
@@ -519,9 +526,10 @@ def test_remote_launcher_configures_tmux_client_before_codex(
         call.startswith("tmux\tset-hook\tpane-title-changed") for call in calls
     )
     assert any(call.startswith("tmux\trename-session") for call in calls)
+    expected_args = "\t".join(args)
     assert calls[-1] == (
         "codex\t--remote\tunix://\t-c\t"
-        'tui.terminal_title=["thread-title"]\tresume\tthread id\t\t--foo=a b'
+        f'tui.terminal_title=["thread-title"]\t{expected_args}'
     )
 
 
@@ -606,113 +614,6 @@ def test_remote_launcher_propagates_setup_and_codex_status(
 
     assert result.returncode == (setup_status or 37)
     assert marker.exists() is (setup_status == 0)
-
-
-def test_envrc_tcodex_functions_preserve_arguments(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _write_argv_logger(bin_dir / "tmux", "tmux")
-    log = tmp_path / "argv.log"
-    env = os.environ.copy()
-    env.update(
-        {
-            "ARGV_LOG": str(log),
-            "HOME": str(home),
-            "PATH": f"{bin_dir}:{env['PATH']}",
-        },
-    )
-
-    result = subprocess.run(
-        [
-            "/bin/sh",
-            "-c",
-            '. "$1"; tcodex resume "thread id"; tcodexd --foo',
-            "sh",
-            str(ENVRC_ALIASES),
-        ],
-        check=False,
-        capture_output=True,
-        env=env,
-        text=True,
-    )
-
-    launcher = (
-        f"{home}/.local/libexec/tmux-agent-session-namer/tmux-codex-remote"
-    )
-    assert result.returncode == 0
-    assert log.read_text().splitlines() == [
-        f"tmux\tnew\t{launcher}\tresume\tthread id",
-        (
-            f"tmux\tnew\t{launcher}\t"
-            "--dangerously-bypass-approvals-and-sandbox\t--foo"
-        ),
-    ]
-
-
-def test_the_launcher_aliases_run_commands_the_helper_accepts(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "home"
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _write_argv_logger(bin_dir / "tmux", "tmux")
-    helper_dir = home / ".local" / "libexec" / "tmux-agent-session-namer"
-    helper_dir.mkdir(parents=True)
-    _write_argv_logger(helper_dir / "tmux-agent-session-namer", "helper")
-    log = tmp_path / "argv.log"
-    env = os.environ.copy()
-    env.update(
-        {
-            "ARGV_LOG": str(log),
-            "HOME": str(home),
-            "PATH": f"{bin_dir}:{env['PATH']}",
-        },
-    )
-
-    # tcodex, tmuse, and tmused are functions and run as written. The
-    # rest are aliases, and a non-interactive bash expands one only
-    # under expand_aliases and only on input parsed after the alias
-    # exists, hence the eval. A sh without either lands on the count
-    # assertions below rather than passing quietly. tmuse and tmused
-    # start the helper as the pane command; tcodex starts its shell
-    # launcher, and the rest run their agent directly.
-    result = subprocess.run(
-        [
-            "/bin/sh",
-            "-c",
-            (
-                'shopt -s expand_aliases 2>/dev/null; . "$1"; '
-                "eval 'tclaude; tmuse; tmused --foo; tpi; topencode'; "
-                "tcodex"
-            ),
-            "sh",
-            str(ENVRC_ALIASES),
-        ],
-        check=False,
-        capture_output=True,
-        env=env,
-        text=True,
-    )
-
-    assert result.returncode == 0
-    launched = [call.split("\t") for call in log.read_text().splitlines()]
-    tmux_calls = [argv[1:] for argv in launched if argv[0] == "tmux"]
-    helper = (
-        f"{home}/.local/libexec/tmux-agent-session-namer/"
-        "tmux-agent-session-namer"
-    )
-    assert [argv[1:] for argv in tmux_calls] == [
-        ["claude"],
-        [helper, "muse-run"],
-        [helper, "muse-run", "--yolo", "--foo"],
-        ["pi"],
-        ["opencode"],
-        [f"{helper_dir}/tmux-codex-remote"],
-    ]
-    assert {
-        os.path.basename(argv[1]) for argv in tmux_calls
-    } <= accepted_start_commands()
 
 
 def test_helper_is_python_315_uv_script() -> None:
@@ -1362,8 +1263,13 @@ def test_an_agent_started_inside_a_session_keeps_the_owners_naming(
         ("vim", False),
         ("claude-code-wrapper", False),
         ('"claude --unbalanced', False),
+        ("claude", True),
         ("claude --dangerously-skip-permissions", True),
         ('"/opt/some path/claude" --dangerously-skip-permissions', True),
+        ("pi", True),
+        ("opencode", True),
+        ("tmux-agent-session-namer muse-run", True),
+        ("tmux-agent-session-namer muse-run --yolo --foo", True),
         ("muse", False),
         ("muse --yolo", False),
         (
