@@ -127,6 +127,22 @@ In a session with no editor tool, shell edits are unavoidable: run one command
 per step, check its exit status, and verify the file content after each edit
 rather than assuming the pipeline worked.
 
+## Programs go in their own files
+
+Never embed a program in a string in a source file. When code needs a script in
+any language -- a `python -c` / `sh -c` / `node -e` body, a probe or
+`conftest.py` a test writes out and runs, a hook a tool installs -- write it as
+a standalone file in the repo and run, import, or copy that file. A program in
+a string literal escapes every gate: no linter, formatter, or type checker
+reads it, no test can exercise it on its own, and its mistakes surface only at
+runtime, in whatever happened to invoke it. When the file's runtime name would
+get it collected by the repo's own test run (`conftest.py`, `test_*.py`), store
+it under another name and copy it into place.
+
+The rule covers code that something runs. A snippet a test only feeds to a tool
+that reads it -- a linter, formatter, or type checker -- and never executes is
+test data; it may stay inline, with a comment saying so.
+
 ## One command per invocation
 
 Run one command per invocation and read its result before issuing the next.
