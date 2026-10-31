@@ -1,5 +1,9 @@
+# A trailing slash matches only a real directory, so entries a checkout
+# may relocate through a symlink omit it. /tmp limits that form to the
+# root because tmp is also an ordinary file name.
+
 # Python
-.venv/
+.venv
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -7,11 +11,11 @@ dist/
 build/
 
 # Test / lint / type-check caches
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
+.pytest_cache
+.ruff_cache
+.mypy_cache
 .coverage
-htmlcov/
+htmlcov
 
 # OS
 .DS_Store
@@ -28,8 +32,9 @@ Thumbs.db
 .claude/*
 
 # Git worktrees
-.wt/
+.wt
 
 # misc
 tmp/
+/tmp
 nohup.out

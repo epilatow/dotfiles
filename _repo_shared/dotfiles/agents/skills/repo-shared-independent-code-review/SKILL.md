@@ -49,8 +49,11 @@ The attached worktree directory mirrors the temporary branch name:
 ```
 
 Verify the branch name with `git check-ref-format --branch`. Refuse an existing
-branch or path, symlinked path component, or ownership ambiguity. Create an
-attached worktree at the exact commit with
+branch or path, tracked `.wt` (see `git -C <main-checkout> ls-files -- .wt`),
+symlinked path component below `.wt`, or ownership ambiguity. An untracked
+`.wt` may itself be a symlink to an existing directory; Git then reports the
+worktree under the link's target, so compare resolved paths. Create an attached
+worktree at the exact commit with
 `git worktree add -b <temporary-branch> <worktree-path> <full-object-id>`.
 Before spawning, verify the worktree is clean, its symbolic branch is the exact
 temporary branch, and its `HEAD` and branch ref both equal the target commit.

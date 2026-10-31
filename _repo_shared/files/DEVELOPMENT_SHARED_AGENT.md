@@ -308,13 +308,14 @@ because the command does not exit immediately.
 
 Never edit the main checkout directly. Every develop / build / test / debug
 cycle runs in a `git worktree add` under `$REPO/.wt/`, nested under the repo's
-own checkout. For an agent-created branch-backed worktree, the relative path
-under `.wt/` must exactly match the branch name: branch `<branch>` uses
-`$REPO/.wt/<branch>`. Do not invent a separate worktree-purpose name. The
-skills' temporary gate and code-review branches follow the same rule. Be sure
-that .gitignore contains .wt/. Once the user has approved the merge and the
-work has landed on `main`, remove the worktree and any branches you created as
-part of the development effort.
+own checkout. An untracked `.wt` may be a symlink to other storage. For an
+agent-created branch-backed worktree, the relative path under `.wt/` must
+exactly match the branch name: branch `<branch>` uses `$REPO/.wt/<branch>`. Do
+not invent a separate worktree-purpose name. The skills' temporary gate and
+code-review branches follow the same rule. Be sure that .gitignore contains
+`.wt`; a trailing slash would not match a symlink. Once the user has approved
+the merge and the work has landed on `main`, remove the worktree and any
+branches you created as part of the development effort.
 
 **Set the working directory at the start of every command or block of
 commands** -- `cd <abs-path> && <command>`, or `git -C <abs-path>` per command.

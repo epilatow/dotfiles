@@ -65,11 +65,14 @@ Its attached worktree must be:
 ```
 
 Verify the proposed branch with `git check-ref-format --branch`. Refuse an
-existing branch, worktree path, symlinked path component, or ownership
-ambiguity. Create the new branch at the recorded full object ID with
-`git worktree add -b`, then verify that the worktree is clean, its symbolic
-branch is the exact temporary branch, and both `HEAD` and the branch ref equal
-the exact candidate. Never move the branch during the gate.
+existing branch, worktree path, tracked `.wt` (see
+`git -C <main-checkout> ls-files -- .wt`), symlinked path component below
+`.wt`, or ownership ambiguity. An untracked `.wt` may itself be a symlink to an
+existing directory; Git then reports the worktree under the link's target, so
+compare resolved paths. Create the new branch at the recorded full object ID
+with `git worktree add -b`, then verify that the worktree is clean, its
+symbolic branch is the exact temporary branch, and both `HEAD` and the branch
+ref equal the exact candidate. Never move the branch during the gate.
 
 ## Run and supervise the full suite
 
