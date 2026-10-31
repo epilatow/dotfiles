@@ -38,7 +38,13 @@ headers                = { "Email" = "edp@drymartini.org" }
 # no schedule/interval is valid only if some [job-group.*] references
 # it (otherwise it can never fire).
 
-[job.codex-remote-control]
+[job.llama-server]
+command     = "llama-server --no-models-autoload --port 8042 --jinja -ngl 999 -c 32768"
+daemon      = true
+platforms   = ["darwin"]
+uuid        = "45553018-06f0-41c0-8265-394d6da54096"
+
+[job.codex-app-server]
 # Keep app-server in the foreground so Crony owns its lifecycle.  The stable
 # default socket is what local `codex --remote unix://` clients attach to.
 command     = "codex app-server --remote-control --listen unix://"
@@ -195,4 +201,4 @@ jobs            = ["weekly", "daily"]
 jobs            = ["weekly", "daily"]
 
 [target.host.squee]
-jobs            = ["weekly", "daily", "codex-remote-control"]
+jobs            = ["weekly", "daily", "codex-app-server", "llama-server"]
