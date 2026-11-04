@@ -38,20 +38,20 @@ headers                = { "Email" = "edp@drymartini.org" }
 # no schedule/interval is valid only if some [job-group.*] references
 # it (otherwise it can never fire).
 
-[job.llama-server]
-command     = "llama-server --no-models-autoload --port 8042 --jinja -ngl 999 -c 32768"
-daemon      = true
+[job.omlx-server]
+command     = "omlx serve"
+flags       = ["daemon", "full-disk-access"]
 platforms   = ["darwin"]
-uuid        = "45553018-06f0-41c0-8265-394d6da54096"
+uuid        = "76a48c8c-6634-45aa-9d71-9cd65f798ff0"
 
 [job.codex-app-server]
 # Keep app-server in the foreground so Crony owns its lifecycle.  The stable
 # default socket is what local `codex --remote unix://` clients attach to.
 command     = "codex app-server --remote-control --listen unix://"
 gate        = "command -v codex"
-daemon      = true
+flags       = ["daemon", "full-disk-access"]
+platforms   = ["darwin"]
 uuid        = "4c392a33-485b-4a2a-abd6-4d029d151769"
-flags       = ["full-disk-access"]
 
 [job.u-bins-brew]
 command     = "brew update -q && HOMEBREW_NO_SUDO=1 brew upgrade -qy"
@@ -201,4 +201,4 @@ jobs            = ["weekly", "daily"]
 jobs            = ["weekly", "daily"]
 
 [target.host.squee]
-jobs            = ["weekly", "daily", "codex-app-server", "llama-server"]
+jobs            = ["weekly", "daily", "codex-app-server", "omlx-server"]
