@@ -66,7 +66,8 @@ than starting another full review cycle.
 Batch each review's findings. Continue review cycles only when a round of fixes
 includes a substantive change requiring re-review. A review is complete once
 every finding is fixed or rejected with the required authority. Gate the
-settled candidate under the repository's testing rules before merge.
+settled candidate under the repository's Testing policy and the completion rule
+in `DEVELOPMENT_SHARED_AGENT.md`.
 
 ## Later user feedback
 

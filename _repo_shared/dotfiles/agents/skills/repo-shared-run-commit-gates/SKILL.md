@@ -1,8 +1,8 @@
 ---
 name: repo-shared-run-commit-gates
 description: >-
-  Run shared and focused development checks, or final full-suite landing gates,
-  against an exact committed change with observable logs and safe cleanup.
+  Run shared and focused development checks or full-suite completion gates
+  against an exact committed change, with observable logs and safe cleanup.
 ---
 
 # Run Gates on One Commit
@@ -14,8 +14,11 @@ select or walk a commit stack.
 ## Choose the gate stage
 
 Choose the development / pre-review stage (shared and focused checks) or the
-landing stage (the full suite on the settled candidate) as the Testing policy
-directs. Record the stage, commands, and scope rationale.
+completion stage (the full suite on the settled candidate). Follow "Run the
+full suite before declaring work complete" in the repository's
+`DEVELOPMENT_SHARED_AGENT.md` for timing; the Testing policy governs scope,
+result reuse, and failure handling. Record the stage, commands, and scope
+rationale.
 
 ## Identify the exact candidate
 
@@ -39,17 +42,18 @@ checks, in the clean implementation worktree. Run independent checks
 concurrently when the host can keep each result observable.
 
 If a check is non-green after applying the isolated-failure policy below, do
-not start the landing full suite. Fix every reported formatting, lint, and type
-error in the implementation worktree, commit or amend the complete fix into its
-owning commit, run the repository's required committed-change audit, and repeat
-all affected checks against the new full commit ID. Continue only when every
-required check is green. A formatter that merely changed files has not passed
-until those changes are committed and the check-form command succeeds.
+not start the completion full suite. Fix every reported formatting, lint, and
+type error in the implementation worktree, commit or amend the complete fix
+into its owning commit, run the repository's required committed-change audit,
+and repeat all affected checks against the new full commit ID. Continue only
+when every required check is green. A formatter that merely changed files has
+not passed until those changes are committed and the check-form command
+succeeds.
 
 ## Create exact isolated state
 
-For the landing full run, create the isolated state below. Scoped checks do not
-require a new full-suite gate worktree.
+For the completion full run, create the isolated state below. Scoped checks do
+not require a new full-suite gate worktree.
 
 Use the local timestamp, source branch name, and the repository's customary
 short object-ID length to form this temporary branch:
@@ -76,9 +80,9 @@ ref equal the exact candidate. Never move the branch during the gate.
 
 ## Run and supervise the full suite
 
-At the landing stage, run the repository's normal full-suite command from the
-gate worktree. Use the host's observable long-running-process facility and
-write complete stdout and stderr logs beneath
+At the completion stage, run the repository's authoritative full-suite command
+from the gate worktree. Use the host's observable long-running-process facility
+and write complete stdout and stderr logs beneath
 `<main-checkout>/tmp/<temporary-branch>/`; retain an observation handle and a
 cancellation handle. Do not rely on an in-memory transcript or a blocking
 invocation that prevents supervision.
@@ -91,9 +95,9 @@ failures, and wait for its final exit status. Early analysis does not authorize
 editing the gate worktree or reporting a result before the complete suite
 finishes.
 
-Record the exact commit, commands, exit statuses, and log paths. A signal,
-timeout, lost process handle, truncated log, or incomplete result is not a
-passing gate.
+Record the exact commit, commands, exit statuses, result summaries, and log
+paths. A signal, timeout, lost process handle, truncated log, or incomplete
+result is not a passing gate.
 
 ## Handle an isolated failure
 
@@ -121,7 +125,11 @@ ownership and state are proven.
 
 Return one result for the chosen stage and exact candidate, identifying any
 reused results. Development is green when shared and focused checks are green.
-Landing is green when required scoped checks and the completed full run are
-green, including a documented isolated non-regression flake that qualifies
-under the policy above. Otherwise report failure or a blocked gate with the
-evidence needed to continue diagnosis.
+The completion stage is green when required scoped checks and the completed
+full run are green, including a documented isolated non-regression flake that
+qualifies under the policy above. Otherwise report failure or a blocked gate
+with the evidence needed to continue diagnosis.
+
+For the completion-stage handoff, include the candidate commit, the commits
+covered by its evidence, the exact full-suite command, exit status, and result
+summary.

@@ -12,5 +12,5 @@ Read and follow the first available skill entrypoint in this order:
    directory.
 
 Prefer the repository-local entrypoint when both exist. If neither exists, stop
-before running scoped development checks or the final landing suite. Do not use
-a copy found at any other path.
+before running scoped development checks or the full-suite completion gate. Do
+not use a copy found at any other path.

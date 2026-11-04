@@ -45,11 +45,15 @@ apply.
 - **An independent code review precedes handoff.** Once the gates are green,
   the implementing agent spawns the reviewer itself, unasked. An unreviewed
   branch is not ready to hand off as finished. See [Code review](#code-review).
-- **A green landing gate precedes every merge.** Run the full suite on the
-  settled candidate before landing, following
-  [Testing](DEVELOPMENT_SHARED.md#testing), and record which commits the
-  evidence covers. Merge approval waives no gate. Never merge first and test
-  afterward.
+- **Run the full suite before declaring work complete.** After independent
+  review and fixes, run the repository's full suite on the settled candidate
+  before a completion handoff, requesting merge or push approval, or landing,
+  even when no merge was requested. Record which commits the run covers. Shared
+  and focused checks are not a substitute. Until the result is green under
+  [Testing](DEVELOPMENT_SHARED.md#testing), report the work as incomplete. Use
+  the repository-local `.agents/skills/repo-shared-run-commit-gates/SKILL.md`
+  completion stage and its handoff evidence. Merge approval waives no gate;
+  never merge first and test later.
 - **Status reports follow the skill.** When the user asks for a development
   status report (short requests like "Status?" or "Status update?" count when
   development work is active), follow the repository-local
@@ -457,7 +461,8 @@ user request. It does not override a categorical session bar. Note at handoff
 that the review ran under this standing authorization.
 
 A live request to skip review overrides it. Say the commits are unreviewed and
-stop; further work, including merge, is the user's call.
+stop; further work, including merge, is the user's call. That is an incomplete
+status report, not a completion handoff.
 
 ### When the review will not run
 

@@ -34,8 +34,9 @@ diff alone misses regressions that only surface when the
 change is read against its callers, consumers, and
 surrounding invariants. Read the full affected file(s),
 not just the diff. The implementing agent owns the green
-shared-and-focused test gate and the final full-suite run
-before landing. Do not rerun the full local suite.
+shared-and-focused test gate and the full-suite completion
+gate required by DEVELOPMENT_SHARED_AGENT.md.
+Do not rerun the full local suite.
 You may run focused tests when needed to
 substantiate a suspected finding; report any command and
 result you rely on.

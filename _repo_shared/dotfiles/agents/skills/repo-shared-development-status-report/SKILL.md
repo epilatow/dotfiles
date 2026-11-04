@@ -52,10 +52,10 @@ after each effort's commit list.
 
 ## State fields
 
-- Use `done` when development work on a commit is complete and no further
-  development review or gate is needed. Otherwise use `WIP` for outstanding
-  reviews, gates, or amendments. A replay verification gate is the exception
-  described below.
+- Use `done` when development work on a commit is complete under "Run the full
+  suite before declaring work complete" in `DEVELOPMENT_SHARED_AGENT.md` and no
+  review or gate remains. Otherwise use `WIP` for outstanding reviews, gates,
+  or amendments. A replay verification gate is the exception described below.
 - Report all completed reviews as one count, `N reviews`. Include prior reviews
   and re-reviews in that count without distinguishing them.
 - Use at most one of `reviewing` and `review-pending`, at most one of `gating`
@@ -69,6 +69,8 @@ after each effort's commit list.
   review; otherwise show its pending or running review.
 - Evaluate every flag against the current branch, regardless of the state of
   `main`. A change to `main` alone does not change a commit's flags. After a
-  replay, a previously `done` commit remains `done` and may acquire
-  `gate-pending` for verification on the replayed branch. Substantial conflicts
-  can return it to `WIP` with reviews or updates pending as appropriate.
+  replay, a previously `done` commit may remain `done` with `gate-pending` only
+  when the Testing policy's result-reuse rules establish that its passed
+  full-suite evidence still applies. Otherwise return it to `WIP` until the
+  completion gate is green. Substantial conflicts can also require reviews or
+  updates as appropriate.
