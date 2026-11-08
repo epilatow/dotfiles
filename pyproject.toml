@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = "6b818433499c25cef4215ecb8a78094c2b867940" }
+epilatow-repo-shared = { git = "https://github.com/epilatow/repo-shared", rev = "40e0ef702e36ef90fe57d2ed9b7ee97cbdc16b2c" }
 
 [tool.mypy]
 python_version = "3.15"
