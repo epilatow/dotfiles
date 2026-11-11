@@ -68,6 +68,7 @@ uuid        = "5da77278-c34d-4167-ab27-b53af33d2a48"
 command     = "mkdir -p $TMPDIR && uv self update && uv tool upgrade --all"
 gate        = "command -v uv"
 env.TMPDIR  = "$HOME/.local/tmp"
+flags       = ["network-required"]
 platforms   = ["linux"]
 uuid        = "de84320f-63a4-4b4e-98d5-51bbc708f5bf"
 
@@ -95,6 +96,7 @@ args      = [
     "add-snapshot", "~/home/public_html/gas-prices-breakdown.html",
     "--agent", "claude", "--model", "opus",
 ]
+flags     = ["network-required"]
 hosts     = ["squee"]
 uuid = "7f5100fa-4af2-437f-8321-82aadc0a0ac1"
 
@@ -113,11 +115,13 @@ uuid = "7a3d515e-85cd-4d4b-9fa4-e0d208905547"
 [job.u-www-dpmr-cal]
 script    = "~/.local/libexec/dpmr-calendar-scrape/dpmr-calendar-scrape"
 args      = ["~/home/public_html/donner-party-mountain-runners.ics"]
+flags     = ["network-required"]
 hosts     = ["squee"]
 uuid = "d54ced11-0886-4e33-ac3d-d77974a0a75f"
 
 [job.u-www-push]
 script    = "$HOME/home/bin/publish_html.sh"
+flags     = ["network-required"]
 hosts     = ["squee"]
 uuid = "7695800b-6737-4df5-ab20-07af2cf978d2"
 
@@ -161,8 +165,9 @@ uuid = "ca506c3d-0026-4705-a09a-16ecf7881f6c"
 # schedule but no command/script of its own.
 
 [job-group.u-bins]
-jobs = ["u-bins-brew", "u-bins-npm", "u-bins-uv"]
-uuid = "ee2e73e4-f89d-4ebf-af65-6631b32b2365"
+flags = ["network-required"]
+jobs  = ["u-bins-brew", "u-bins-npm", "u-bins-uv"]
+uuid  = "ee2e73e4-f89d-4ebf-af65-6631b32b2365"
 
 [job-group.weekly]
 schedule = "Mon *-*-* 02:00"
@@ -170,13 +175,14 @@ jobs     = ["u-bins"]
 uuid     = "8c5893d7-bea0-421f-9f95-d36b30775fe2"
 
 [job-group.u-rs]
-jobs = ["u-rs-self", "u-rs-dotfiles", "u-rs-ha-bt", "u-rs-utils"]
-uuid = "aab9b864-897a-4a96-b2c5-cea58d927e1d"
+flags = ["network-required"]
+jobs  = ["u-rs-self", "u-rs-dotfiles", "u-rs-ha-bt", "u-rs-utils"]
+uuid  = "aab9b864-897a-4a96-b2c5-cea58d927e1d"
 
 [job-group.u-www]
-jobs     = ["u-www-cocktails", "u-www-recipes", "u-www-dpmr-cal", "u-www-gas-prices", "u-www-push"]
-hosts    = ["squee"]
-uuid = "4977a66e-4c17-40f4-8e67-03012dce9894"
+jobs  = ["u-www-cocktails", "u-www-recipes", "u-www-dpmr-cal", "u-www-gas-prices", "u-www-push"]
+hosts = ["squee"]
+uuid  = "4977a66e-4c17-40f4-8e67-03012dce9894"
 
 [job-group.daily-misc]
 jobs = ["darwin-fix-tz", "cleanup-codex-cli", "cleanup-uv-cache", "cleanup-var-tmp"]
@@ -185,7 +191,7 @@ uuid = "82d72cf7-de37-4de3-aaee-eb1ea63b3c56"
 [job-group.daily]
 schedule = "*-*-* 02:30"
 jobs     = ["u-rs", "u-www", "daily-misc"]
-uuid = "94593230-26d3-45f5-993b-fc4b352111df"
+uuid     = "94593230-26d3-45f5-993b-fc4b352111df"
 
 # ----------------------------------------------------------------------------
 # target sections
