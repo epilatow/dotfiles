@@ -3940,8 +3940,17 @@ def fetch_source_bytes(url: str) -> bytes:
                 f"primary source {url}: curl timed out"
             ) from exc
         if result.returncode != 0:
+            # curl's first stderr line distinguishes an HTTP refusal from a
+            # network failure, which the exit code alone may not; any lines
+            # after it are generic advice. Its "curl: (N) " prefix repeats
+            # the exit code already reported.
+            reason = f"curl exited {result.returncode}"
+            lines = result.stderr.decode(errors="replace").strip().splitlines()
+            if lines:
+                detail = re.sub(r"^curl: \(\d+\) ", "", lines[0])
+                reason = f"{reason}: {detail}"
             raise SnapshotError(
-                f"primary source {url}: curl exited {result.returncode}"
+                f"primary source {url}: {reason}"
             ) from certificate_error
         raw = result.stdout
     except RequestException as exc:

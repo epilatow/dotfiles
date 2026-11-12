@@ -229,16 +229,43 @@ def test_bundled_client_verifies_sources_against_certifi(
     curl.assert_not_called()
 
 
-@pytest.mark.parametrize("curl_fails", [False, True])
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "reason"),
+    [
+        (0, b"", None),
+        (28, b"", "curl exited 28"),
+        (
+            56,
+            b"curl: (56) The requested URL returned error: 403\n",
+            "curl exited 56: The requested URL returned error: 403",
+        ),
+        (
+            60,
+            (
+                b"curl: (60) SSL certificate problem: self signed certificate"
+                b" in certificate chain\n"
+                b"More details here: https://curl.se/docs/sslcerts.html\n\n"
+                b"curl failed to verify the legitimacy of the server and"
+                b" therefore could not\n"
+            ),
+            (
+                "curl exited 60: SSL certificate problem: self signed"
+                " certificate in certificate chain"
+            ),
+        ),
+    ],
+)
 def test_system_client_verifies_sources_when_bundled_tls_cannot(
     tmp_path: Path,
-    curl_fails: bool,
+    returncode: int,
+    stderr: bytes,
+    reason: str | None,
 ) -> None:
     url = "https://www.legislature.ohio.gov/download?key=example"
     error = CertificateVerifyError("missing issuer")
     body = b"Verified primary collection statement for this test case."
     result = subprocess.CompletedProcess(
-        ["curl"], 60 if curl_fails else 0, stdout=body, stderr=b""
+        ["curl"], returncode, stdout=body, stderr=stderr
     )
     with (
         patch.object(
@@ -248,9 +275,10 @@ def test_system_client_verifies_sources_when_bundled_tls_cannot(
             subprocess, "run", autospec=True, return_value=result
         ) as curl,
     ):
-        if curl_fails:
-            with pytest.raises(gpb.SnapshotError, match="curl exited 60"):
+        if reason is not None:
+            with pytest.raises(gpb.SnapshotError) as failure:
                 gpb.fetch_source_document(url, tmp_path)
+            assert str(failure.value) == f"primary source {url}: {reason}"
         else:
             document = gpb.fetch_source_document(url, tmp_path)
             assert document.text_path.read_bytes() == body
@@ -260,6 +288,7 @@ def test_system_client_verifies_sources_when_bundled_tls_cannot(
     argv = curl.call_args.args[0]
     assert argv[-1] == url and "--insecure" not in argv and "-k" not in argv
     assert argv[argv.index("--user-agent") + 1] == gpb.USER_AGENT
+    assert "--show-error" in argv
 
 
 @pytest.mark.parametrize("mismatch", [False, True])
