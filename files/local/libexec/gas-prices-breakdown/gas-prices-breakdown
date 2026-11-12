@@ -1,7 +1,14 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.15,<3.16"
-# dependencies = ["openpyxl", "pdfplumber", "xlrd", "pydantic>=2", "curl_cffi"]
+# dependencies = [
+#     "openpyxl",
+#     "pdfplumber",
+#     "xlrd",
+#     "pydantic>=2",
+#     "curl_cffi",
+#     "certifi",
+# ]
 # ///
 """Manage SNAPSHOTS and embedded markdown in gas-price-breakdown.html.
 
@@ -115,9 +122,11 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import TypedDict
 
+import certifi
 import openpyxl  # type: ignore[import-untyped]
 import pdfplumber
 import xlrd  # type: ignore[import-untyped]
+from curl_cffi import CurlOpt
 from curl_cffi import requests as source_requests
 from curl_cffi.requests.exceptions import (
     CertificateVerifyError,
@@ -3889,7 +3898,20 @@ def fetch_source_bytes(url: str) -> bytes:
     if urllib.parse.urlsplit(url).hostname == "api.eia.gov":
         raise SnapshotError("the EIA API is owned by the price-feed utility")
     try:
-        response = source_requests.get(url, impersonate="chrome", timeout=30)
+        # curl_cffi otherwise verifies against Python's default CA file,
+        # which on macOS lacks roots the system keychain trusts. Mozilla's
+        # current set, from certifi, includes them; roots only the system
+        # still trusts are left to the fallback below.
+        trust = certifi.where()
+        response = source_requests.get(
+            url,
+            impersonate="chrome",
+            timeout=30,
+            curl_options={
+                CurlOpt.CAINFO: trust,
+                CurlOpt.PROXY_CAINFO: trust,
+            },
+        )
     except CertificateVerifyError as certificate_error:
         # macOS's system client can build chains the bundled client cannot.
         # It still verifies TLS; a failure by both clients stops the run.

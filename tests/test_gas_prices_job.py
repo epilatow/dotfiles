@@ -11,7 +11,9 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import certifi
 import pytest
+from curl_cffi import CurlOpt
 from curl_cffi import requests as source_requests
 from curl_cffi.requests.exceptions import CertificateVerifyError
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -48,6 +50,10 @@ from gas_prices_research import (
 )
 
 TARGET = date(2026, 9, 17)
+CERTIFI_TRUST = {
+    CurlOpt.CAINFO: certifi.where(),
+    CurlOpt.PROXY_CAINFO: certifi.where(),
+}
 
 
 class ProcessIdentity(BaseModel):
@@ -202,6 +208,27 @@ def test_padding_cannot_turn_an_empty_quote_into_evidence(
         )
 
 
+def test_bundled_client_verifies_sources_against_certifi(
+    tmp_path: Path,
+) -> None:
+    url = "https://www.legislature.ohio.gov/download?key=example"
+    body = b"Verified primary collection statement for this test case."
+    response = source_requests.Response()
+    response.content = body
+    with (
+        patch.object(
+            source_requests, "get", autospec=True, return_value=response
+        ) as get,
+        patch.object(subprocess, "run", autospec=True) as curl,
+    ):
+        document = gpb.fetch_source_document(url, tmp_path)
+    assert document.text_path.read_bytes() == body
+    get.assert_called_once_with(
+        url, impersonate="chrome", timeout=30, curl_options=CERTIFI_TRUST
+    )
+    curl.assert_not_called()
+
+
 @pytest.mark.parametrize("curl_fails", [False, True])
 def test_system_client_verifies_sources_when_bundled_tls_cannot(
     tmp_path: Path,
@@ -227,7 +254,9 @@ def test_system_client_verifies_sources_when_bundled_tls_cannot(
         else:
             document = gpb.fetch_source_document(url, tmp_path)
             assert document.text_path.read_bytes() == body
-    get.assert_called_once_with(url, impersonate="chrome", timeout=30)
+    get.assert_called_once_with(
+        url, impersonate="chrome", timeout=30, curl_options=CERTIFI_TRUST
+    )
     argv = curl.call_args.args[0]
     assert argv[-1] == url and "--insecure" not in argv and "-k" not in argv
     assert argv[argv.index("--user-agent") + 1] == gpb.USER_AGENT

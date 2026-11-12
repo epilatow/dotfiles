@@ -14,6 +14,7 @@ dependencies = [
     "xlrd",
     "pydantic>=2",
     "curl_cffi",
+    "certifi",
     "beautifulsoup4",
     "icalendar>=7.0",
 ]
