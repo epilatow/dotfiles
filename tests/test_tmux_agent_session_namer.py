@@ -39,20 +39,6 @@ CLAUDE_WRAPPER = (
     / "hooks"
     / "tmux-name.sh"
 )
-MUSE_PLUGIN_MANIFEST = (
-    REPO_ROOT
-    / "files"
-    / "muse"
-    / "tmux-namer"
-    / ".muse-plugin"
-    / "plugin.json"
-)
-PI_EXTENSION = (
-    REPO_ROOT / "files" / "pi" / "agent" / "extensions" / "tmux-namer.ts"
-)
-OPENCODE_PLUGIN = (
-    REPO_ROOT / "files" / "config" / "opencode" / "plugins" / "tmux-namer.ts"
-)
 STATUS_COMMANDS = [
     "set-option status-left [#{session_name}] ",
     "set-option status-left-length 34",
@@ -79,7 +65,6 @@ REFUSED_SLOT_COMMANDS = [
 # What `agent_stub` is running once its exec has replaced the shell.
 AGENT_STUB_COMMAND = "sleep"
 PANE_COMMAND_TIMEOUT_SEC = 10.0
-CODEX_HOOKS = REPO_ROOT / "files" / "codex" / "hooks.json"
 
 
 @pytest.fixture
@@ -423,44 +408,6 @@ def read_session_option(
         capture_output=True,
         text=True,
     ).stdout.strip()
-
-
-def test_codex_session_start_hook_uses_guarded_namer() -> None:
-    config = json.loads(CODEX_HOOKS.read_text())
-
-    assert config == {
-        "hooks": {
-            "SessionStart": [
-                {
-                    "matcher": "startup|resume|clear",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": (
-                                '"${HOME}/.local/libexec/'
-                                "tmux-agent-session-namer/"
-                                'tmux-agent-session-namer" codex-hook'
-                            ),
-                        }
-                    ],
-                }
-            ],
-            "Stop": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": (
-                                '"${HOME}/.local/libexec/'
-                                "tmux-agent-session-namer/"
-                                'tmux-agent-session-namer" codex-hook'
-                            ),
-                        }
-                    ],
-                }
-            ],
-        }
-    }
 
 
 def _write_argv_logger(path: Path, label: str) -> None:
@@ -1639,28 +1586,6 @@ def test_tmuse_launcher_shape_is_helper_accepted(
     } <= accepted_start_commands()
 
 
-def test_pi_extension_routes_session_naming_through_the_helper() -> None:
-    text = PI_EXTENSION.read_text()
-
-    assert '"pi"' in text
-    assert "tmux-agent-session-namer/tmux-agent-session-namer" in text
-    assert "session_start" in text
-    assert "session_info_changed" in text
-
-
-def test_opencode_plugin_routes_session_naming_through_the_helper() -> None:
-    text = OPENCODE_PLUGIN.read_text()
-
-    assert '"opencode"' in text
-    assert "tmux-agent-session-namer/tmux-agent-session-namer" in text
-    assert "session.created" in text
-    assert "session.updated" in text
-    # Neither the placeholder timestamp title nor a subagent's session
-    # may move the tmux session's name.
-    assert "New session - " in text
-    assert "parentID" in text
-
-
 def write_muse_name_db(
     path: Path,
     claims: list[tuple[str, str, str]],
@@ -1722,16 +1647,6 @@ def write_muse_stub(bin_dir: Path, body: str) -> None:
     muse = bin_dir / "muse"
     muse.write_text(f"#!/bin/sh\n{body}\n")
     muse.chmod(0o755)
-
-
-def test_muse_plugin_registers_no_tool_interposition() -> None:
-    # Naming is the supervisor's job now: the bundle must not
-    # interpose on tool calls or prompt the model to rename.
-    config = json.loads(MUSE_PLUGIN_MANIFEST.read_text())
-
-    assert config["name"] == "tmux-namer"
-    assert config["capabilities"]["hooks"] == []
-    assert config["capabilities"]["skills"] == []
 
 
 def _watch_socket_for_tests() -> str:

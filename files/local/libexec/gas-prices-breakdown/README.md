@@ -11,8 +11,7 @@ publishes the result. Existing snapshot information is preserved. The default
 target is the most recent Thursday; an existing target exits without doing
 work. Use `gas-prices-breakdown add-snapshot --help` for available options.
 
-Linkfiles installs the executable. The scheduled command is maintained in the
-[crony configuration](../../../config/crony/config.toml).
+Linkfiles installs the executable.
 
 ## Dry runs and comparisons
 

@@ -63,3 +63,11 @@ The gas-price tools also share a module beside their libexec entries; that
 directory is included in `mypy_path` so its imports are checked too. The
 gas-price modules are registered with Ruff as local modules for consistent
 import sorting.
+
+## Configuration in tests and docs
+
+Tests and docs do not reference the configuration files under `files/` that
+other programs read, such as the crony configuration, agent settings and hook
+registrations, and plugin manifests. Tests do not read those files to check
+what they contain, and docs do not link to them or restate their settings.
+Hooks and plugins are tested by running them, if at all.

@@ -1,8 +1,8 @@
 # Temporary-cache cleanup
 
-The daily `cleanup-var-tmp` Crony job removes unused Node compilation-cache
-files and pytest temporary runs from `$TMPDIR`. There is no age threshold; the
-daily schedule supplies the cleanup window. Other temporary files and
+`cleanup-var-tmp` removes unused Node compilation-cache files and pytest
+temporary runs from `$TMPDIR`. There is no age threshold; the interval between
+scheduled runs supplies the cleanup window. Other temporary files and
 unrecognized cache layouts are left alone.
 
 Preview eligible entries and check traversal time:
@@ -12,8 +12,7 @@ Preview eligible entries and check traversal time:
 ```
 
 Pass `--apply` to delete eligible caches. `--tmpdir PATH` selects a different
-temporary directory. Requires Python 3.15, uv, and lsof. The job is enabled on
-macOS through the existing `daily-misc` group.
+temporary directory. Requires Python 3.15, uv, and lsof.
 
 Files reported in use, live pytest PID locks, uncertain locks, symlinks, and
 entries belonging to another user are preserved. Changed candidates are
