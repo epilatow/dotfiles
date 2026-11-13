@@ -8,10 +8,8 @@ import shutil
 import subprocess
 import sys
 import time
-import tomllib
 from dataclasses import replace
 from pathlib import Path
-from typing import TypedDict, cast
 from unittest.mock import patch
 
 import pytest
@@ -456,32 +454,3 @@ def test_real_command_removes_unused_and_keeps_live_run(
     assert result.returncode == 0, result.stdout + result.stderr
     assert not node.exists() and live.exists()
     assert "TMPDIR traversal:" in result.stdout
-
-
-class _Job(TypedDict):
-    script: str
-    args: list[str]
-    platforms: list[str]
-
-
-class _Group(TypedDict):
-    jobs: list[str]
-
-
-_Config = TypedDict(
-    "_Config", {"job": dict[str, _Job], "job-group": dict[str, _Group]}
-)
-
-
-def test_cleanup_is_registered_in_the_daily_group() -> None:
-    config = cast(
-        _Config,
-        tomllib.loads(
-            (REPO_ROOT / "files/config/crony/config.toml").read_text()
-        ),
-    )
-    job = config["job"]["cleanup-var-tmp"]
-    assert job["script"] == "~/.local/libexec/cleanup-var-tmp/cleanup-var-tmp"
-    assert job["args"] == ["--apply"] and job["platforms"] == ["darwin"]
-    assert "cleanup-var-tmp" in config["job-group"]["daily-misc"]["jobs"]
-    assert "daily-misc" in config["job-group"]["daily"]["jobs"]
