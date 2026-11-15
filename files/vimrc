@@ -1,6 +1,11 @@
 " Erase pre-existing autocmds.
 autocmd!
 
+" Enable mouse in all modes: normal(n), visual(c), insert(i), and command(c)
+" Copy mouse selection to the clipboard and vim unamed register
+set mouse=a
+set clipboard=autoselect,unnamed
+
 " Safer saves on FUSE/Cryptomator/Dropbox mounts
 set backup                 " keep a backup file
 set writebackup            " make a backup *during* every write
@@ -21,7 +26,7 @@ set visualbell
 set noerrorbells
 
 " Enable modeline support (ie, read vim directives from target files)
-set modeline modelines=1024
+set modeline modelines=5
 
 " set the default shell
 set shell=/bin/bash
