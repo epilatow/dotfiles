@@ -831,7 +831,6 @@ def _muse_run(args: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
-    return 1
 
 
 def _session_name(target: str | None = None) -> str:
